@@ -86,8 +86,9 @@ def pair_create(
         with conn.transaction():
             db.create_pair(conn, **values)
     except (ValueError, psycopg.Error) as exc:
-        message = db.error_message(exc) if isinstance(exc, psycopg.Error) else str(exc)
-        return _content(request, conn, "pairs/_content.html", error=message, form=values)
+        return _content(
+            request, conn, "pairs/_content.html", error=db.error_message(exc), form=values
+        )
     return _content(
         request, conn, "pairs/_content.html", notice=f"Rotation pair {values['pair_name']} created"
     )

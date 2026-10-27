@@ -138,7 +138,11 @@ def reread_after_commit(
         return None, True
 
 
-def error_message(exc: psycopg.Error) -> str:
+def error_message(exc: Exception) -> str:
+    """The message shown to the user: the primary message (and detail) of a
+    PostgreSQL error, the text of any other exception (a form ValueError)."""
+    if not isinstance(exc, psycopg.Error):
+        return str(exc)
     diag = getattr(exc, "diag", None)
     if diag is not None and diag.message_primary:
         msg = diag.message_primary
@@ -206,7 +210,9 @@ _ROLE_SELECT = (
     "       v.days_left, v.locked_until, v.failed_count, v.status,"
     "       s.locked_by, s.lock_reason, s.must_change"
     "  FROM pass_policy.v_role_status v"
-    "  LEFT JOIN pass_policy.role_state s ON s.role_name = v.role_name"
+    # by OID: role_state.role_name keeps the former name after ALTER ROLE
+    # ... RENAME until run_maintenance() or the next lock_role()
+    "  LEFT JOIN pass_policy.role_state s ON s.role_oid = v.role_oid"
 )
 
 
@@ -292,16 +298,16 @@ def session_is_superuser(request: Request, conn: Connection) -> bool:
     return cached
 
 
-# Display filter for the profile assignment form, and refusal of a forged
-# assignment: pass_policy.assign_profile() / unassign_profile() do not check
-# the target themselves (only rotate/expire/lock/unlock and the rotation
-# pairs go through _require_target_allowed()), so the web application
-# applies the same rule.  This predicate is a copy of
-# pass_policy._require_target_allowed() (not executable by pass_policy_admin):
-# SUPERUSER / REPLICATION / BYPASSRLS, predefined pg_* roles except
-# pg_database_owner, CREATEROLE on PostgreSQL <= 15, and membership, even
-# indirect, in any such role.  tests/test_integration.py checks that it
-# agrees with the extension (expire_password() as the oracle).
+# Display filter of the profile assignment form only: the privileged roles
+# are not offered when the service role is not a superuser.  Forged values
+# need no check here: every pass_policy.* function that takes a target role
+# (assign_profile() and unassign_profile() included) refuses a privileged one
+# through pass_policy._require_target_allowed(), and that error is shown.
+# This predicate is a copy of _require_target_allowed() (not executable by
+# pass_policy_admin): SUPERUSER / REPLICATION / BYPASSRLS, predefined pg_*
+# roles except pg_database_owner, CREATEROLE on PostgreSQL <= 15, and
+# membership, even indirect, in any such role.  tests/test_integration.py
+# checks that it agrees with the extension (expire_password() as the oracle).
 _PRIVILEGED_ROLE = (
     "(r.rolsuper OR r.rolreplication OR r.rolbypassrls"
     " OR (starts_with(r.rolname, 'pg_') AND r.rolname <> 'pg_database_owner')"
@@ -326,19 +332,6 @@ def login_roles(conn: Connection, superuser: bool) -> list[str]:
             (superuser,),
         )
     ]
-
-
-def privileged_target_refused(conn: Connection, role: str, superuser: bool) -> bool:
-    """True when `role` is privileged (see _PRIVILEGED_ROLE) and the service
-    role is not a superuser.  An unknown role is not refused here: the
-    extension reports it."""
-    if superuser:
-        return False
-    row = conn.execute(
-        f"SELECT {_PRIVILEGED_ROLE} AS privileged FROM pg_catalog.pg_roles r WHERE r.rolname = %s",
-        (role,),
-    ).fetchone()
-    return row is not None and bool(row["privileged"])
 
 
 # --- profiles ----------------------------------------------------------------
@@ -374,13 +367,22 @@ def profile_names(conn: Connection) -> list[str]:
     ]
 
 
+_ASSIGNMENTS_SQL = (
+    # the current name, by OID: role_profile.role_name keeps the former name
+    # after ALTER ROLE ... RENAME (until run_maintenance() or the next
+    # assignment); a dropped role (row left for the purge) keeps its stored
+    # name, which unassign_profile() matches
+    "SELECT coalesce(r.rolname::text, rp.role_name) AS role_name, p.name AS profile,"
+    "       rp.assigned_at, rp.assigned_by"
+    "  FROM pass_policy.role_profile rp"
+    "  JOIN pass_policy.profile p ON p.profile_id = rp.profile_id"
+    "  LEFT JOIN pg_catalog.pg_roles r ON r.oid = rp.role_oid"
+    " ORDER BY 1"
+)
+
+
 def assignments(conn: Connection) -> list[dict[str, Any]]:
-    return conn.execute(
-        "SELECT rp.role_name, p.name AS profile, rp.assigned_at, rp.assigned_by"
-        "  FROM pass_policy.role_profile rp"
-        "  JOIN pass_policy.profile p ON p.profile_id = rp.profile_id"
-        " ORDER BY rp.role_name"
-    ).fetchall()
+    return conn.execute(_ASSIGNMENTS_SQL).fetchall()
 
 
 def create_profile(conn: Connection, name: str, settings: dict[str, Any]) -> int:

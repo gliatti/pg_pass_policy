@@ -3,13 +3,22 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 from typing import Literal
 
 from pydantic import PrivateAttr, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _BCRYPT_PREFIXES = ("$2a$", "$2b$", "$2y$")
+_BCRYPT_COST_RE = re.compile(rb"^\$2[aby]\$([0-9]{2})\$")
 MIN_SECRET_LENGTH = 32
+
+
+def bcrypt_cost(digest: bytes) -> int | None:
+    """The cost of a bcrypt hash ($2b$12$... -> 12), None if unreadable."""
+    match = _BCRYPT_COST_RE.match(digest)
+    cost = int(match.group(1)) if match else None
+    return cost if cost is not None and 4 <= cost <= 31 else None
 
 
 class Settings(BaseSettings):
@@ -84,6 +93,17 @@ class Settings(BaseSettings):
             if not sep or not user or not digest.startswith(_BCRYPT_PREFIXES):
                 raise ValueError("PGPP_WEB_BASIC_USERS entries must be user:bcrypt-hash")
             users[user] = digest.encode("ascii")
+        # one cost for every hash: an unknown user is checked against a dummy
+        # hash of that cost (auth.dummy_hash()), a user whose hash had another
+        # cost would be told apart from an unknown one by the response time
+        costs = {bcrypt_cost(d) for d in users.values()}
+        if None in costs:
+            raise ValueError("PGPP_WEB_BASIC_USERS: unreadable bcrypt cost (expected $2b$NN$...)")
+        if len(costs) > 1:
+            raise ValueError(
+                "PGPP_WEB_BASIC_USERS: every bcrypt hash must have the same cost"
+                f" (found {', '.join(str(c) for c in sorted(costs))}): rehash with pgpp-web-hash"
+            )
         return users
 
     def _parse_trusted_networks(self) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:

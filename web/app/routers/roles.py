@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import secrets
-from typing import Any
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 import psycopg
 from fastapi import APIRouter, Depends, Form, Query, Request
@@ -15,6 +16,7 @@ from app.templating import NO_STORE, render
 
 router = APIRouter(prefix="/roles")
 log = get_logger("roles")
+T = TypeVar("T")
 
 REREAD_WARNING = (
     "The password was changed, but the role could not be read back: reload the page"
@@ -48,7 +50,6 @@ def _table_context(conn: Connection, filters: dict[str, Any]) -> dict[str, Any]:
         "truncated": len(rows) > db.MAX_ROLES,
         "filters": filters,
         "statuses": db.STATUSES,
-        "profiles": db.profile_names(conn),
     }
 
 
@@ -58,7 +59,10 @@ def roles_page(
     filters: dict[str, Any] = Depends(_filters),
     conn: Connection = db.CONN,
 ):
-    return render(request, "roles/index.html", _table_context(conn, filters))
+    # the profile filter belongs to the page, not to the table fragment that
+    # roles_table() returns on every refresh
+    context = {**_table_context(conn, filters), "profiles": db.profile_names(conn)}
+    return render(request, "roles/index.html", context)
 
 
 @router.get("/table", name="roles_table")
@@ -108,15 +112,16 @@ def _row_response(
 # "x/lock" cannot be mistaken for the lock action on "x"
 
 
-def _run(conn: Connection, action, *args: Any) -> str | None:
-    """Run one action in a savepoint; return the error message, if any."""
+def _run(conn: Connection, action: Callable[..., T], *args: Any) -> tuple[T | None, str | None]:
+    """Run one action in a savepoint and commit it: (result, None) on
+    success, (None, error message) on failure."""
     try:
         with conn.transaction():
-            action(conn, *args)
+            result = action(conn, *args)
     except psycopg.Error as exc:
-        return db.error_message(exc)
+        return None, db.error_message(exc)
     _commit(conn)
-    return None
+    return result, None
 
 
 def _commit(conn: Connection) -> None:
@@ -134,13 +139,9 @@ def rotate(
     length: int = Form(default=24, ge=8, le=128),
     conn: Connection = db.CONN,
 ):
-    password: str | None = None
-    try:
-        with conn.transaction():
-            password = db.rotate_password(conn, role, length)
-    except psycopg.Error as exc:
-        return _row_response(request, conn, role, error=db.error_message(exc))
-    _commit(conn)
+    password, error = _run(conn, db.rotate_password, role, length)
+    if error is not None:
+        return _row_response(request, conn, role, error=error)
     # the password exists only in this response (no-store), never in a log or a URL
     return _row_response(request, conn, role, password=password)
 
@@ -153,14 +154,14 @@ def lock(
     reason: str = Form(default="", max_length=500),
     conn: Connection = db.CONN,
 ):
-    error = _run(conn, db.lock_role, role, duration.strip(), reason.strip())
+    _, error = _run(conn, db.lock_role, role, duration.strip(), reason.strip())
     notice = None if error else ("Role locked" + (" until unlock" if not duration.strip() else ""))
     return _row_response(request, conn, role, error=error, notice=notice)
 
 
 @router.post("/{role:path}/unlock", name="role_unlock")
 def unlock(request: Request, role: str, conn: Connection = db.CONN):
-    error = _run(conn, db.unlock_role, role)
+    _, error = _run(conn, db.unlock_role, role)
     return _row_response(
         request, conn, role, error=error, notice=None if error else "Role unlocked"
     )
@@ -168,7 +169,7 @@ def unlock(request: Request, role: str, conn: Connection = db.CONN):
 
 @router.post("/{role:path}/expire", name="role_expire")
 def expire(request: Request, role: str, conn: Connection = db.CONN):
-    error = _run(conn, db.expire_password, role)
+    _, error = _run(conn, db.expire_password, role)
     return _row_response(
         request, conn, role, error=error, notice=None if error else "Password expired"
     )

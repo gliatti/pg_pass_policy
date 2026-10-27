@@ -5,9 +5,10 @@ from __future__ import annotations
 from typing import Any
 
 import psycopg
-from fastapi import APIRouter, Form, Request
+from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import Response
 from psycopg import Connection
+from starlette.datastructures import FormData
 
 from app import db
 from app.templating import redirect_to, render
@@ -72,6 +73,16 @@ def settings_from_form(form: Any) -> dict[str, Any]:
         else:  # interval_null
             settings[key] = value or None
     return settings
+
+
+async def _read_form(request: Request) -> FormData:
+    """The posted form, read by an async dependency so that the endpoints
+    using it stay synchronous: FastAPI runs a `def` endpoint in its thread
+    pool, where the blocking psycopg calls do not stall the event loop."""
+    return await request.form()
+
+
+FORM: Any = Depends(_read_form)
 
 
 def _page(request: Request, conn: Connection, **extra: Any) -> Response:
@@ -141,8 +152,7 @@ def profile_new(request: Request, conn: Connection = db.CONN):
 
 
 @router.post("", name="profile_create")
-async def profile_create(request: Request, conn: Connection = db.CONN):
-    form = await request.form()
+def profile_create(request: Request, form: FormData = FORM, conn: Connection = db.CONN):
     name = str(form.get("name", "")).strip()
     values = {k: form.get(k) for k, _ in db.PROFILE_FIELDS}
     values["name"] = name
@@ -155,16 +165,8 @@ async def profile_create(request: Request, conn: Connection = db.CONN):
         with conn.transaction():
             db.create_profile(conn, name, settings)
     except (ValueError, psycopg.Error) as exc:
-        message = db.error_message(exc) if isinstance(exc, psycopg.Error) else str(exc)
-        return _form_response(request, None, values, error=message)
+        return _form_response(request, None, values, error=db.error_message(exc))
     return redirect_to(request, "profiles")
-
-
-# same wording as pass_policy._require_target_allowed(): the dropdown already
-# hides privileged roles, but the form value is user-controlled (and
-# assign_profile() / unassign_profile() do not check the target, see
-# db._PRIVILEGED_ROLE)
-_PRIVILEGED = 'only a superuser can manage privileged role "{}"'
 
 
 # declared before the /{name} routes so that they are not captured by them
@@ -176,8 +178,8 @@ def profile_assign(
     conn: Connection = db.CONN,
 ):
     role, profile = role.strip(), profile.strip()
-    if db.privileged_target_refused(conn, role, db.session_is_superuser(request, conn)):
-        return _assignments_fragment(request, conn, error=_PRIVILEGED.format(role))
+    # a forged privileged target is refused by the extension itself
+    # (_require_target_allowed()), its message is shown as is
     try:
         with conn.transaction():
             db.assign_profile(conn, role, profile)
@@ -191,8 +193,6 @@ def profile_unassign(
     request: Request, role: str = Form(max_length=128), conn: Connection = db.CONN
 ):
     role = role.strip()
-    if db.privileged_target_refused(conn, role, db.session_is_superuser(request, conn)):
-        return _assignments_fragment(request, conn, error=_PRIVILEGED.format(role))
     try:
         with conn.transaction():
             db.unassign_profile(conn, role)
@@ -220,11 +220,12 @@ def profile_edit(request: Request, name: str, conn: Connection = db.CONN):
 
 
 @router.post("/{name}", name="profile_update")
-async def profile_update(request: Request, name: str, conn: Connection = db.CONN):
-    form = await request.form()
+def profile_update(request: Request, name: str, form: FormData = FORM, conn: Connection = db.CONN):
     profile = db.get_profile(conn, name)
     if profile is None:
-        return render(request, "_alert.html", {"error": "Profile not found"}, 404)
+        # the generic error response: a page, or for htmx an alert retargeted
+        # to #alerts (the form stays in place)
+        raise HTTPException(status_code=404, detail="Profile not found")
     values = {k: form.get(k) for k, _ in db.PROFILE_FIELDS}
     values["name"] = name
     error = notice = None
@@ -237,7 +238,7 @@ async def profile_update(request: Request, name: str, conn: Connection = db.CONN
         notice = "Profile updated"
         values = db.get_profile(conn, name) or values
     except (ValueError, psycopg.Error) as exc:
-        error = db.error_message(exc) if isinstance(exc, psycopg.Error) else str(exc)
+        error = db.error_message(exc)
     return _form_response(request, profile, values, error=error, notice=notice)
 
 

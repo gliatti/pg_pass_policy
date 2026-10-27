@@ -64,7 +64,7 @@ Tout passe par des variables d'environnement préfixées `PGPP_WEB_`.
 | `PGPP_WEB_DATABASE_URL` | *(vide)* | chaîne de connexion libpq (`postgresql://pgpp_web@hôte:5432/postgres`). Vide : les variables `PGHOST`, `PGPORT`, `PGUSER`, `PGDATABASE`, `PGPASSFILE`… de libpq s'appliquent |
 | `PGPP_WEB_SECRET` | **obligatoire** | clé de signature du cookie de session (jeton CSRF), 32 caractères minimum : `python3 -c 'import secrets; print(secrets.token_urlsafe(48))'` |
 | `PGPP_WEB_AUTH` | `basic` | `basic` (HTTP basic) ou `proxy` (en-tête posé par un reverse proxy) |
-| `PGPP_WEB_BASIC_USERS` | *(vide)* | mode `basic` : `user:hash-bcrypt,user2:hash-bcrypt` |
+| `PGPP_WEB_BASIC_USERS` | *(vide)* | mode `basic` : `user:hash-bcrypt,user2:hash-bcrypt`, toutes les empreintes du même coût bcrypt |
 | `PGPP_WEB_PROXY_HEADER` | `X-Remote-User` | mode `proxy` : en-tête portant l'utilisateur authentifié (`REMOTE_USER` est accepté et correspond à `Remote-User`) |
 | `PGPP_WEB_TRUSTED_PROXIES` | `127.0.0.1,::1` | mode `proxy` : adresses ou réseaux (CIDR) autorisés à poser l'en-tête ; `unix` pour un socket Unix ; `*` pour tout accepter (déconseillé) |
 | `PGPP_WEB_SESSION_HTTPS_ONLY` | `false` | marque le cookie de session `Secure` et le nomme `__Host-pgpp_session` : **obligatoire derrière HTTPS** (voir Sécurité) |
@@ -151,7 +151,7 @@ qu'aucune autre origine du même site (autre sous-domaine, autre port, réponse
 en HTTP clair) ne peut écraser.
 
 Limitation de débit : l'application ne freine pas elle-même les tentatives
-HTTP basic (bcrypt coût 12 ralentit chaque essai, mais rien n'arrête un
+HTTP basic (bcrypt, coût 12 avec `pgpp-web-hash`, ralentit chaque essai, mais rien n'arrête un
 dictionnaire patient). Chaque échec est journalisé en `WARNING` avec le nom
 d'utilisateur et l'adresse du pair (`basic authentication failed for user
 alice from 10.0.0.9`), jamais le mot de passe. Le reverse proxy doit limiter
@@ -205,9 +205,12 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
   quel que soit le logger (y compris ceux d'uvicorn). L'application elle-même
   ne journalise jamais de mot de passe ; le filtre est un filet de sécurité.
 - **Authentification** : bcrypt pour HTTP basic (comparaison à coût constant,
-  même pour un utilisateur inconnu), chaque échec journalisé avec le pair et
-  le nom d'utilisateur (assaini), jamais le mot de passe ; la limitation de
-  débit revient au reverse proxy (voir plus haut). En mode proxy, l'en-tête
+  même pour un utilisateur inconnu : il est comparé à une empreinte factice du
+  même coût que celles de `PGPP_WEB_BASIC_USERS`, qui doivent donc toutes
+  avoir le même coût, faute de quoi l'application refuse de démarrer), chaque
+  échec journalisé avec le pair et le nom d'utilisateur (assaini), jamais le
+  mot de passe ; la limitation de débit revient au reverse proxy (voir plus
+  haut). En mode proxy, l'en-tête
   n'est accepté que depuis un pair de confiance. Aucune route de documentation
   OpenAPI n'est exposée.
 - **Erreurs** : les messages de l'extension (`pg_pass_policy: …`, `PPP-0xx`)
@@ -235,19 +238,23 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
   de modifier un profil portant l'un d'eux (422, message explicite) ; un tel
   profil se gère en SQL.
 - **Droits** : le rôle de service est seulement membre de `pass_policy_admin` ;
-  les fonctions `SECURITY DEFINER` de rotation, d'expiration, de verrouillage
-  et des paires refusent de toucher aux rôles privilégiés
-  (`_require_target_allowed()`), et l'erreur est affichée telle quelle.
-  `assign_profile()` et `unassign_profile()` ne font pas ce contrôle :
-  l'application l'applique donc elle-même pour l'assignation de profil. Si le
-  rôle de service n'est pas superutilisateur, les rôles privilégiés sont absents
-  du formulaire d'assignation et toute assignation ou désassignation forgée sur
-  l'un d'eux est refusée (422). La règle (`db._PRIVILEGED_ROLE`) reprend celle
-  de l'extension, qui n'est pas exécutable par `pass_policy_admin` :
-  `SUPERUSER`, `REPLICATION`, `BYPASSRLS`, rôles `pg_*` sauf
-  `pg_database_owner`, `CREATEROLE` jusqu'à PostgreSQL 15, appartenance même
-  indirecte (`pg_has_role`) à l'un de ces rôles. Un test d'intégration vérifie
-  qu'elle donne le même verdict que l'extension sur un jeu de rôles.
+  les fonctions `SECURITY DEFINER` qui visent un rôle (rotation, expiration,
+  verrouillage, paires, `assign_profile()` et `unassign_profile()`) refusent
+  de toucher aux rôles privilégiés (`_require_target_allowed()`), et l'erreur
+  est affichée telle quelle (422) : l'application ne refait pas ce contrôle.
+  Si le rôle de service n'est pas superutilisateur, les rôles privilégiés sont
+  simplement absents du formulaire d'assignation ; ce filtre d'affichage
+  (`db._PRIVILEGED_ROLE`) reprend la règle de l'extension, qui n'est pas
+  exécutable par `pass_policy_admin` : `SUPERUSER`, `REPLICATION`,
+  `BYPASSRLS`, rôles `pg_*` sauf `pg_database_owner`, `CREATEROLE` jusqu'à
+  PostgreSQL 15, appartenance même indirecte (`pg_has_role`) à l'un de ces
+  rôles. Un test d'intégration vérifie qu'il donne le même verdict que
+  l'extension sur un jeu de rôles.
+- **Rôles renommés** : après `ALTER ROLE … RENAME`, les colonnes `role_name` de
+  `role_state` et `role_profile` gardent l'ancien nom jusqu'au passage suivant
+  de `run_maintenance()`. L'application les joint par OID (`role_oid`) : le
+  tableau des rôles (motif de verrouillage) et la liste des assignations
+  affichent toujours le nom courant.
 - **Transactions** : chaque requête utilise une connexion du pool dans une
   transaction validée quand la fonction de la route se termine, **avant**
   l'envoi de la réponse (dépendance déclarée avec `scope="function"` : depuis
@@ -284,7 +291,7 @@ sans ce marqueur est refusé, à `start` comme à `stop` :
 
 ```sh
 eval "$(scripts/test-instance.sh start /tmp/pgpp-web-test 54332)"
-pytest                     # 152 tests : unitaires + intégration
+pytest                     # 168 tests : unitaires + intégration
 scripts/test-instance.sh stop /tmp/pgpp-web-test
 ```
 
@@ -296,7 +303,8 @@ figure dans la réponse et nulle part ailleurs : ni dans les journaux capturés,
 ni dans l'audit, et il permet réellement de se connecter), lock / unlock /
 expire, les profils (création visible dès la requête suivante, modification,
 assignation, suppression, noms réservés, refus d'assignation sur un rôle
-privilégié, règle des rôles privilégiés identique à celle de l'extension),
+privilégié, règle des rôles privilégiés identique à celle de l'extension,
+rôle renommé),
 l'audit (filtres, pagination), les
 paires de rotation, la maintenance et le refus CSRF.
 

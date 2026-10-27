@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import base64
 import binascii
+import functools
 import ipaddress
 import re
 
 import bcrypt
 from fastapi import HTTPException, Request, status
 
-from app.config import Settings
+from app.config import Settings, bcrypt_cost
 from app.hashpw import BCRYPT_MAX_BYTES
 from app.logfilter import get_logger
 from app.security import route_path
@@ -20,9 +21,26 @@ log = get_logger("auth")
 # paths served without authentication (liveness probe for the reverse proxy)
 PUBLIC_PATHS = frozenset({"/healthz"})
 
-# a valid bcrypt hash of a random value: used when the user is unknown so that
-# the response time does not reveal whether the user exists
-_DUMMY_HASH = bcrypt.hashpw(b"pgpp-web dummy", bcrypt.gensalt(rounds=12))
+# cost of the dummy hash when no user is configured (proxy mode never uses it)
+DEFAULT_COST = 12
+
+
+@functools.cache
+def _dummy_hash_of_cost(cost: int) -> bytes:
+    return bcrypt.hashpw(b"pgpp-web dummy", bcrypt.gensalt(rounds=cost))
+
+
+def dummy_hash(users: dict[str, bytes]) -> bytes:
+    """A valid bcrypt hash of a fixed value, compared against when the user is
+    unknown so that the response time does not reveal whether the user
+    exists.  Its cost is that of the first configured hash: config.Settings
+    requires every hash of PGPP_WEB_BASIC_USERS to share it, a dummy of
+    another cost would answer faster or slower than a real check.  Computed
+    once per cost (create_app() computes it at startup)."""
+    first = next(iter(users.values()), None)
+    cost = bcrypt_cost(first) if first is not None else None
+    return _dummy_hash_of_cost(cost or DEFAULT_COST)
+
 
 _USER_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,128}$")
 
@@ -82,7 +100,7 @@ def verify_basic(authorization: str | None, users: dict[str, bytes]) -> str | No
     digest = users.get(user)
     # always run bcrypt (constant work), compare against a dummy hash if unknown
     try:
-        valid = bcrypt.checkpw(password_b, digest or _DUMMY_HASH)
+        valid = bcrypt.checkpw(password_b, digest or dummy_hash(users))
     except ValueError:
         valid = False
     if digest is None or not valid:

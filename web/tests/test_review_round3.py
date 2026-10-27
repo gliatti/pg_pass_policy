@@ -349,14 +349,6 @@ def test_session_superuser_is_cached():
     assert len(queries) == 1
 
 
-def test_privileged_check_skips_the_query_for_a_superuser():
-    class Conn:
-        def execute(self, *args):
-            raise AssertionError("no query expected")
-
-    assert db.privileged_target_refused(Conn(), "postgres", superuser=True) is False
-
-
 # --- 10: shared helpers ----------------------------------------------------------------
 
 

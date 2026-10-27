@@ -15,7 +15,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.sessions import SessionMiddleware
 
 from app import __version__
-from app.auth import require_user
+from app.auth import dummy_hash, require_user
 from app.config import Settings
 from app.csrf import verify_csrf
 from app.db import make_pool
@@ -53,6 +53,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         openapi_url=None,
     )
     app.state.settings = settings
+    if settings.auth == "basic":
+        # computed now rather than on the first unknown user (one bcrypt run)
+        dummy_hash(settings.basic_user_hashes())
     # outermost first: security headers wrap everything, the session sits inside
     app.add_middleware(
         SessionMiddleware,

@@ -282,7 +282,8 @@ def test_privileged_role_cannot_be_assigned_by_non_superuser(client, super_conn,
     page = client.get("/profiles")
     assert f'<option value="{superuser}">' not in page.text
     assert '<option value="web_t_alpha">' in page.text
-    # ...and refused when the form value is forged
+    # ...and refused by the extension itself (_require_target_allowed()) when
+    # the form value is forged: the web application no longer checks it
     for path, data in (
         ("/profiles/assign", {"role": superuser, "profile": T_PROFILE}),
         ("/profiles/unassign", {"role": superuser}),
@@ -632,7 +633,7 @@ EXPECTED_REFUSED = {
 
 
 def test_privileged_rule_agrees_with_the_extension(client, super_conn, test_url):
-    """db._PRIVILEGED_ROLE (assignment form and refusal) must agree with
+    """db._PRIVILEGED_ROLE (filter of the assignment form) must agree with
     pass_policy._require_target_allowed(): expire_password() is the oracle,
     called by the service role in a transaction that is rolled back."""
     from psycopg import sql
@@ -674,7 +675,10 @@ def test_privileged_rule_agrees_with_the_extension(client, super_conn, test_url)
                     extension_refuses = False
                 except psycopg.errors.InsufficientPrivilege:
                     extension_refuses = True
-                web_refuses = db.privileged_target_refused(conn, role, superuser=False)
+                web_refuses = conn.execute(
+                    f"SELECT {db._PRIVILEGED_ROLE} AS p FROM pg_roles r WHERE r.rolname = %s",
+                    (role,),
+                ).fetchone()["p"]
                 assert web_refuses is extension_refuses, role
                 login = super_conn.execute(
                     "SELECT rolcanlogin FROM pg_roles WHERE rolname = %s", (role,)
@@ -694,3 +698,75 @@ def test_privileged_rule_agrees_with_the_extension(client, super_conn, test_url)
             "DELETE FROM pass_policy.role_profile WHERE role_name LIKE 'web_t_priv_%'"
         )
         drop_all()
+
+
+def test_renamed_role_keeps_its_state_and_assignment(client, super_conn):
+    """role_state and role_profile are joined by OID: after ALTER ROLE ...
+    RENAME their role_name column keeps the former name until
+    run_maintenance() (the worker, every 2 s here) re-maps it; the roles
+    table and the assignment list must show the current name meanwhile."""
+    from psycopg import sql
+
+    old, new = "web_t_ren_old", "web_t_ren_new"
+
+    def drop():
+        super_conn.execute(
+            "DELETE FROM pass_policy.role_profile WHERE role_name IN (%s, %s)", (old, new)
+        )
+        for role in (old, new):
+            super_conn.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(role)))
+
+    drop()
+    try:
+        super_conn.execute(sql.SQL("CREATE ROLE {} LOGIN").format(sql.Identifier(old)))
+        super_conn.execute("SELECT pass_policy.assign_profile(%s, %s)", (old, T_PROFILE))
+        token = csrf_token(client, "/roles")
+        response = client.post(
+            f"/roles/{old}/lock",
+            data={"duration": "1 hour", "reason": "rename-test"},
+            headers={"X-CSRF-Token": token},
+        )
+        assert response.status_code == 200, response.text
+        super_conn.execute(
+            sql.SQL("ALTER ROLE {} RENAME TO {}").format(sql.Identifier(old), sql.Identifier(new))
+        )
+        # the stale names the worker would leave until its next run (forced
+        # here so that the test does not depend on its timing)
+        super_conn.execute(
+            "UPDATE pass_policy.role_state SET role_name = %s"
+            " WHERE role_oid = (SELECT oid FROM pg_roles WHERE rolname = %s)",
+            (old, new),
+        )
+        super_conn.execute(
+            "UPDATE pass_policy.role_profile SET role_name = %s"
+            " WHERE role_oid = (SELECT oid FROM pg_roles WHERE rolname = %s)",
+            (old, new),
+        )
+
+        table = client.get("/roles/table", params={"q": "web_t_ren_"}).text
+        assert f"<strong>{new}</strong>" in table
+        assert "rename-test" in table  # role_state.lock_reason, joined by OID
+        assert old not in table
+
+        page = client.get("/profiles").text
+        assert f"<td>{new}</td><td>{T_PROFILE}</td>" in page
+        assert f"<td>{old}</td>" not in page
+        assert f'name="role" value="{new}"' in page
+
+        # the posted (current) name is the one the extension expects
+        response = client.post(
+            "/profiles/unassign",
+            data={"role": new},
+            headers={"X-CSRF-Token": token, "HX-Request": "true"},
+        )
+        assert response.status_code == 200, response.text
+        assert (
+            super_conn.execute(
+                "SELECT count(*) FROM pass_policy.role_profile"
+                " WHERE role_oid = (SELECT oid FROM pg_roles WHERE rolname = %s)",
+                (new,),
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        drop()
