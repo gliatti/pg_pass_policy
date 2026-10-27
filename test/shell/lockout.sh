@@ -536,7 +536,9 @@ check_eq "démarrage : le rôle exempté se connecte" "regress_exempt" "$out"
 
 # Fenêtre tenue ouverte de façon déterministe : role_state renommée, le
 # rechargement du worker échoue (WARNING) et la fenêtre reste fermée.
-psql_admin "ALTER SYSTEM RESET pg_pass_policy.worker_interval" >/dev/null
+# worker_interval reste à 0 : le rechargement doit être retenté sans SIGHUP
+# (revue finale 7, constat 1).
+psql_admin "CREATE ROLE regress_su SUPERUSER LOGIN PASSWORD '$GOOD'" >/dev/null
 psql_admin "ALTER TABLE pass_policy.role_state RENAME TO role_state_hidden" >/dev/null
 log0=$(wc -l <"$PPP_TMP/server.log")
 restart_server
@@ -545,32 +547,75 @@ check_contains "fenêtre : bon mot de passe refusé (57P03 lock state not loaded
 out=$(psql_as regress_lock "$BAD" "SELECT current_user") || true
 check_contains "fenêtre : mauvais mot de passe, même réponse (pas d'oracle)" "FATAL: +pg_pass_policy: lock state not loaded yet, retry" "$out"
 psql_admin "CREATE ROLE regress_window LOGIN PASSWORD '$GOOD'" >/dev/null
-for i in 1 2 3 4 5; do psql_as regress_window "$GOOD" >/dev/null || true; done
+# 4 mauvais + bon + mauvais : l'entrée n'est pas modifiée pendant la fenêtre
+# (ni échec compté, ni remise à zéro par le succès), toujours 57P03
+res=""
+for pwd in "$BAD" "$BAD" "$BAD" "$BAD" "$GOOD" "$BAD"; do
+	out=$(psql_as regress_window "$pwd" "SELECT current_user") || true
+	if printf '%s' "$out" | grep -q 'lock state not loaded yet'; then res="${res}R"; else res="${res}?"; fi
+done
+check_eq "fenêtre : 4 mauvais + bon + mauvais, toujours 57P03 (jamais locked)" "RRRRRR" "$res"
+out=$(psql_admin "SELECT count(*) FROM pass_policy.failed_attempts() WHERE role_name IN ('regress_window', 'regress_lock')")
+check_eq "fenêtre : aucun échec compté (failed_attempts vide)" "0" "$out"
 out=$(psql_as regress_window "$GOOD" "SELECT current_user") || true
 check_contains "fenêtre : rôle non verrouillé et non exempté refusé aussi" "lock state not loaded yet" "$out"
 out=$(psql_as regress_exempt "$GOOD" "SELECT current_user") || true
 check_eq "fenêtre : le rôle exempté se connecte" "regress_exempt" "$out"
+out=$(psql_as regress_su "$GOOD" "SELECT current_user") || true
+check_eq "fenêtre : un superutilisateur non exempté se connecte (constat 7)" "regress_su" "$out"
+out=$(psql_as regress_su "$BAD" "SELECT current_user") || true
+check_contains "fenêtre : superutilisateur, mauvais mot de passe : refus normal" "password authentication failed" "$out"
 out=$(psql_admin "SELECT last_reload IS NULL FROM pass_policy.worker_status()")
 check_eq "fenêtre : aucun rechargement réussi (role_state introuvable)" "t" "$out"
 n=$(tail -n "+$((log0 + 1))" "$PPP_TMP/server.log" | grep -c 'refusing connections until the background worker has loaded the lock state' || true)
-if [ "$n" -ge 1 ] && [ "$n" -lt 8 ]; then
-	ok "fenêtre : LOG limité ($n ligne(s) pour 8 refus)"
+if [ "$n" -ge 1 ] && [ "$n" -lt 9 ]; then
+	ok "fenêtre : LOG limité ($n ligne(s) pour 9 refus)"
 else
-	fail "fenêtre : LOG attendu entre 1 et 7 fois, obtenu $n"
+	fail "fenêtre : LOG attendu entre 1 et 8 fois, obtenu $n"
 fi
 psql_admin "ALTER TABLE pass_policy.role_state_hidden RENAME TO role_state" >/dev/null
 if wait_for 30 "SELECT last_reload IS NOT NULL FROM pass_policy.worker_status()"; then
-	ok "fenêtre : le worker recharge au tour suivant"
+	ok "fenêtre, worker_interval = 0 : le rechargement est retenté sans SIGHUP"
 else
-	fail "fenêtre : pas de rechargement après le retour de role_state"
+	fail "fenêtre, worker_interval = 0 : pas de rechargement après le retour de role_state"
 fi
 out=$(psql_as regress_lock "$GOOD" "SELECT current_user") || true
 check_contains "fenêtre fermée : refus « locked »" "is locked by pg_pass_policy" "$out"
 out=$(psql_as regress_window "$GOOD" "SELECT current_user") || true
-check_eq "fenêtre fermée : rôle non verrouillé accepté" "regress_window" "$out"
+check_eq "fenêtre fermée : rôle non verrouillé accepté (échecs de la fenêtre non comptés)" "regress_window" "$out"
 psql_admin "SELECT pass_policy.unlock_role('regress_lock')" >/dev/null
 out=$(psql_as regress_lock "$GOOD" "SELECT current_user") || true
 check_eq "fenêtre fermée : unlock_role, connexion acceptée" "regress_lock" "$out"
+psql_admin "ALTER SYSTEM RESET pg_pass_policy.worker_interval" >/dev/null
+
+# --- worker qui ne démarre jamais (revue finale 7, constat 7) -----------------
+# pg_pass_policy.database inexistante : le worker échoue à la connexion et ne
+# publie jamais son PID. La fenêtre reste fermée pour les rôles ordinaires ;
+# un superutilisateur non exempté se connecte toujours, mais reste soumis à un
+# verrou posé en shmem ; le hook émet un WARNING au plus une fois par minute.
+psql_admin "ALTER SYSTEM SET pg_pass_policy.database = 'ppp_no_such_db'" >/dev/null
+log0=$(wc -l <"$PPP_TMP/server.log")
+restart_server
+out=$(psql_as regress_su "$GOOD" "SELECT current_user") || true
+check_eq "worker absent : un superutilisateur non exempté se connecte" "regress_su" "$out"
+out=$(psql_as regress_window "$GOOD" "SELECT current_user") || true
+check_contains "worker absent : un rôle ordinaire reçoit 57P03" "FATAL: +pg_pass_policy: lock state not loaded yet, retry" "$out"
+warn='pg_pass_policy worker has not loaded the lock state yet \(worker_pid = 0\)'
+deadline=$((SECONDS + 25))
+while [ "$SECONDS" -lt "$deadline" ]; do
+	psql_as regress_window "$GOOD" >/dev/null || true
+	tail -n "+$((log0 + 1))" "$PPP_TMP/server.log" | grep -qE "$warn" && break
+	sleep 1
+done
+for i in 1 2 3; do psql_as regress_window "$GOOD" >/dev/null || true; done
+n=$(tail -n "+$((log0 + 1))" "$PPP_TMP/server.log" | grep -cE "WARNING: +$warn" || true)
+check_eq "worker absent : WARNING worker_pid = 0 émis une fois (limité à 1 par minute)" "1" "$n"
+out=$(tail -n "+$((log0 + 1))" "$PPP_TMP/server.log" | grep -A2 -E "$warn" | head -3)
+check_contains "worker absent : le WARNING cite max_worker_processes et pg_pass_policy.database" "max_worker_processes and pg_pass_policy.database" "$out"
+for i in 1 2 3 4 5; do psql_as regress_su "$BAD" >/dev/null || true; done
+out=$(psql_as regress_su "$GOOD" "SELECT current_user") || true
+check_contains "worker absent : superutilisateur verrouillé en shmem après 5 échecs, refusé" "is locked by pg_pass_policy" "$out"
+psql_admin "ALTER SYSTEM RESET pg_pass_policy.database" >/dev/null
 
 # --- bibliothèque retirée de shared_preload_libraries : lock_role échoue -----
 # Sans préchargement, shmem_lock_role() ne peut pas écrire en mémoire partagée

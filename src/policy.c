@@ -1553,11 +1553,31 @@ ppp_generate_password(PG_FUNCTION_ARGS)
 
 			if (ppp_validate("", buf, &genprof, &code))
 				break;
+			/*
+			 * Length and class minima are checked above and the class
+			 * composition is guaranteed by construction; the special
+			 * alphabet has no space (PPP-020).  The only rule random draws
+			 * can keep breaking is max_repeat (PPP-019): a profile whose
+			 * class minima force many characters from a small class (for
+			 * instance min_digit close to the length) with a low max_repeat
+			 * is practically infeasible.  That is a profile problem
+			 * (22023); any other code would be a bug of the generator.
+			 */
 			if (tries >= PPP_GEN_MAX_TRIES)
+			{
+				if (strcmp(code, "PPP-019") == 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							 errmsg("pg_pass_policy: could not generate a password compliant with profile \"%s\" (%s)",
+									prof.name, code),
+							 errdetail("After %d attempts, max_repeat = %d could still not be met with the character class minima of the profile.",
+									   PPP_GEN_MAX_TRIES, prof.max_repeat),
+							 errhint("Raise max_repeat, lower the class minima or use another length.")));
 				ereport(ERROR,
 						(errcode(ERRCODE_INTERNAL_ERROR),
 						 errmsg("pg_pass_policy: could not generate a password compliant with profile \"%s\" (%s)",
 								prof.name, code)));
+			}
 		}
 
 		/* the result must survive SPI_finish() */

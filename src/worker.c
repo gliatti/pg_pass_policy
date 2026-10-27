@@ -82,6 +82,12 @@
 #define PPP_PURGE_AFTER_SECS	(24 * 60 * 60)
 
 /*
+ * Delay before a new attempt while a reload is pending or the fail-closed
+ * start-up window is still open (SPEC 6.3), whatever worker_interval.
+ */
+#define PPP_RETRY_SECS			5
+
+/*
  * Profile durations converted to whole seconds for the shared memory (see
  * ppp_sync_reload): clamped to [1, INT_MAX], 0 = no window, -1 = manual
  * unlock only.  GREATEST() ignores NULLs, hence the explicit CASE.
@@ -108,6 +114,7 @@ typedef struct pppPendingRow
 	uint32		audit_lock_seq; /* its episode number */
 	uint32		lost_episodes;	/* earlier episodes overwritten unaudited */
 	uint64		lock_seq;		/* entry->lock_seq when copied */
+	bool		locked_now;		/* ppp_is_locked() when copied */
 	bool		state_written;	/* role_state upserted with locked_until */
 	bool		role_missing;	/* non-existent user name (authentication hook) */
 } pppPendingRow;
@@ -133,10 +140,13 @@ typedef struct pppLockRow
 static MemoryContext ppp_worker_cxt = NULL;
 
 /*
- * A reload was requested and has not been carried out yet (extension not
- * installed yet, or error).  Kept locally instead of re-setting
- * ppp_shared->reload_requested, which would make the main loop run again
- * immediately, in a busy loop.  Retried on the next timed cycle.
+ * A reload was requested and has not been carried out yet (error, or
+ * persisted locks that did not all fit in shared memory).  Kept locally
+ * instead of re-setting ppp_shared->reload_requested, which would make the
+ * main loop run again immediately, in a busy loop.  Retried on the next
+ * timed cycle, at most PPP_RETRY_SECS later even with worker_interval = 0
+ * (see ppp_worker_main).  Cleared when the extension is not installed:
+ * nothing to reload.
  */
 static bool ppp_reload_pending = false;
 
@@ -229,14 +239,24 @@ ppp_run_in_xact(const char *what, void (*step) (void))
 			 * No extension, no persisted lock to re-inject: the start-up
 			 * window of the authentication hook can be closed (otherwise
 			 * every non-exempt role would be refused until CREATE
-			 * EXTENSION).  An installed but untrusted extension keeps it
-			 * open: role_state exists but cannot be read safely.
+			 * EXTENSION), and there is nothing to reload: the pending
+			 * request and the "synchronise first" step are dropped, so that
+			 * the following cycles do not run them again, in an extra
+			 * transaction, until the extension is created (run_maintenance()
+			 * then requests a reload).  An installed but untrusted extension
+			 * keeps the window closed: role_state exists but cannot be read
+			 * safely.
 			 */
-			if (ext_state == PPP_EXT_ABSENT && !ppp_shared->locks_loaded)
+			if (ext_state == PPP_EXT_ABSENT)
 			{
-				LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
-				ppp_shared->locks_loaded = true;
-				LWLockRelease(ppp_shared->lock);
+				ppp_reload_pending = false;
+				ppp_sync_first = false;
+				if (!ppp_shared->locks_loaded)
+				{
+					LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
+					ppp_shared->locks_loaded = true;
+					LWLockRelease(ppp_shared->lock);
+				}
 			}
 		}
 
@@ -308,6 +328,8 @@ ppp_sync_pending(void)
 	int			ghost_locks = 0;
 	TimestampTz ghost_last = 0;
 
+	TimestampTz now = GetCurrentTimestamp();
+
 	Assert(ppp_pending_rows == NULL);
 	/* read only: a shared lock is enough (the acknowledgement is separate) */
 	rows = (pppPendingRow *) ppp_alloc_hash_copy(ppp_worker_cxt,
@@ -339,6 +361,7 @@ ppp_sync_pending(void)
 			rows[nrows].lost_episodes = entry->audit_lock_seq -
 				entry->audit_acked_seq - 1;
 		rows[nrows].lock_seq = entry->lock_seq;
+		rows[nrows].locked_now = ppp_is_locked(entry, now);
 		rows[nrows].state_written = false;
 		rows[nrows].role_missing = entry->role_missing;
 		nrows++;
@@ -391,22 +414,28 @@ ppp_sync_pending(void)
 
 		if (r->lock_pending_audit && r->audit_locked_until != 0)
 		{
-			Oid			argtypes[5] = {TEXTOID, TIMESTAMPTZOID, INT4OID, BOOLOID, INT8OID};
-			Datum		values[5];
-			char		nulls[5] = {' ', ' ', ' ', ' ', ' '};
+			Oid			argtypes[6] = {TEXTOID, TIMESTAMPTZOID, INT4OID, BOOLOID, INT8OID, BOOLOID};
+			Datum		values[6];
+			char		nulls[6] = {' ', ' ', ' ', ' ', ' ', ' '};
 
 			/*
-			 * The lock was lifted (unlock_role()) or replaced (lock_role())
-			 * before this cycle: it is audited all the same, but role_state
-			 * must not be locked again with it.
+			 * The lock was lifted (unlock_role(): the entry is no longer
+			 * locked, lifted_before_audit) or replaced (lock_role(), or a
+			 * lock re-injected from role_state: the entry is still locked,
+			 * with another locked_until, replaced_by_manual) before this
+			 * cycle.  It is audited all the same, but role_state must not be
+			 * locked again with it.  Another automatic lock would have
+			 * overwritten audit_locked_until as well (lost_episodes).
 			 */
 			bool		still_locked = (r->locked_until == r->audit_locked_until);
+			bool		replaced = !still_locked && r->locked_now;
 
 			values[0] = CStringGetTextDatum(r->rolename);
 			values[1] = TimestampTzGetDatum(r->audit_locked_until); /* DT_NOEND = infinity */
 			values[2] = Int32GetDatum(r->failed_count);
-			values[3] = BoolGetDatum(!still_locked);
+			values[3] = BoolGetDatum(!still_locked && !replaced);
 			values[4] = Int64GetDatum((int64) r->lost_episodes);
+			values[5] = BoolGetDatum(replaced);
 
 			/*
 			 * lost_episodes: earlier automatic locks of the role whose own
@@ -421,10 +450,13 @@ ppp_sync_pending(void)
 										"OPERATOR(pg_catalog.||) CASE WHEN $4 THEN "
 										"pg_catalog.jsonb_build_object('lifted_before_audit', true) "
 										"ELSE '{}'::pg_catalog.jsonb END "
+										"OPERATOR(pg_catalog.||) CASE WHEN $6 THEN "
+										"pg_catalog.jsonb_build_object('replaced_by_manual', true) "
+										"ELSE '{}'::pg_catalog.jsonb END "
 										"OPERATOR(pg_catalog.||) CASE WHEN $5 OPERATOR(pg_catalog.>) 0 THEN "
 										"pg_catalog.jsonb_build_object('lost_episodes', $5) "
 										"ELSE '{}'::pg_catalog.jsonb END)",
-										5, argtypes, values, nulls, false, 0);
+										6, argtypes, values, nulls, false, 0);
 			if (ret != SPI_OK_SELECT)
 				elog(ERROR, "audit('role_locked') returned SPI code %d", ret);
 		}
@@ -688,7 +720,12 @@ ppp_count_eviction(const pppEviction *ev, int *n_evicted, int *lost_failed,
 		(*lost_lock_audits)++;
 }
 
-static void
+/*
+ * Returns false when some persisted locks could not be re-injected (hash full
+ * of entries that cannot be evicted): the reload must be retried, and the
+ * start-up window of the hook is not closed by it.
+ */
+static bool
 ppp_sync_reload(void)
 {
 	int			ret;
@@ -704,6 +741,7 @@ ppp_sync_reload(void)
 	HASH_SEQ_STATUS seq;
 	pppRoleEntry *entry;
 	int			not_tracked = 0;
+	int			locks_not_tracked = 0;
 	int			n_evicted = 0;
 	int			lost_failed = 0;
 	int			lost_pending = 0;
@@ -712,6 +750,7 @@ ppp_sync_reload(void)
 	TimestampTz now;
 	uint64		seq_snap;
 	bool		in_recovery;
+	bool		start_window_kept = false;
 
 	/*
 	 * Durations (PPP_SQL_WINDOW_SECS, PPP_SQL_LOCK_SECS) are clamped to
@@ -865,6 +904,7 @@ ppp_sync_reload(void)
 		if (entry == NULL)
 		{
 			not_tracked++;
+			locks_not_tracked++;
 			continue;
 		}
 		entry->reload_lock_seen = true;
@@ -946,10 +986,26 @@ ppp_sync_reload(void)
 	}
 
 	ppp_shared->worker_last_reload = GetCurrentTimestamp();
-	/* closes the fail-closed start-up window of the hook */
-	ppp_shared->locks_loaded = true;
+
+	/*
+	 * Closes the fail-closed start-up window of the hook, unless a persisted
+	 * lock could not be loaded: the hook would let that role in.  A profile
+	 * that could not be loaded does not keep the window closed (the role is
+	 * counted with the default parameters, as before the window).
+	 */
+	if (locks_not_tracked == 0)
+		ppp_shared->locks_loaded = true;
+	else
+		start_window_kept = !ppp_shared->locks_loaded;
 
 	LWLockRelease(ppp_shared->lock);
+
+	if (start_window_kept)
+		ereport(LOG,
+				(errmsg(PPP_LOG_PREFIX "%d persisted locks could not be loaded in shared memory: connections stay refused",
+						locks_not_tracked),
+				 errdetail("Until every lock of role_state is loaded, roles authenticating with a password or a secret are refused (57P03), except superusers and pg_pass_policy.exempt_roles; the reload is retried at the next cycle."),
+				 errhint("Increase pg_pass_policy.max_tracked_roles.")));
 
 	if (not_tracked > 0)
 		ereport(LOG,
@@ -971,17 +1027,17 @@ ppp_sync_reload(void)
 
 	elog(DEBUG1, PPP_LOG_PREFIX "reloaded lockout parameters: " UINT64_FORMAT " role profiles, " UINT64_FORMAT " locks",
 		 nprofiles, nlocks);
+
+	return locks_not_tracked == 0;
 }
 
 static void
 ppp_step_sync(void)
 {
 	ppp_sync_cleanup();
-	if (ppp_reload_pending)
-	{
-		ppp_sync_reload();
+	/* kept pending when some persisted locks could not be loaded */
+	if (ppp_reload_pending && ppp_sync_reload())
 		ppp_reload_pending = false;
-	}
 }
 
 /*
@@ -998,8 +1054,10 @@ ppp_worker_cycle(bool run_full)
 	 * re-inject the persisted locks before anything else (see
 	 * ppp_sync_first).  The request is consumed here: run_maintenance()
 	 * makes a new one, served by the synchronisation step at the end of this
-	 * cycle.  On failure (error, extension not installed yet),
-	 * ppp_reload_pending stays set and the next cycle starts over.
+	 * cycle.  On failure (error, persisted locks that do not all fit in
+	 * shared memory), ppp_reload_pending stays set and the next cycle starts
+	 * over.  An extension that is not installed leaves nothing to reload
+	 * (see ppp_run_in_xact).
 	 */
 	if (ppp_sync_first)
 	{
@@ -1161,6 +1219,7 @@ ppp_worker_main(Datum main_arg)
 		long		timeout;
 		int			events;
 		int			rc;
+		bool		retry;
 
 		CHECK_FOR_INTERRUPTS();
 
@@ -1203,10 +1262,23 @@ ppp_worker_main(Datum main_arg)
 		 * interval = 0: sleep until signalled.  On a standby nothing signals
 		 * the changes replicated from the primary: always poll, every
 		 * worker_interval (60 s when it is 0), which also detects promotion.
+		 *
+		 * While the start-up window is open (!locks_loaded), retry at most
+		 * PPP_RETRY_SECS later whatever worker_interval: every role
+		 * authenticating with a password is refused meanwhile.  With
+		 * worker_interval = 0, a pending reload (failed, nothing would wake
+		 * the worker up again) is retried that way too.  Suspended
+		 * (enabled = off): the hook does nothing, no need to retry.
 		 */
 		events = WL_LATCH_SET | WL_EXIT_ON_PM_DEATH;
+		retry = ppp_enabled &&
+			(!ppp_shared->locks_loaded ||
+			 (ppp_reload_pending && ppp_worker_interval == 0));
 		if (RecoveryInProgress())
 			timeout = (ppp_worker_interval > 0 ? ppp_worker_interval : 60) * 1000L;
+		else if (retry)
+			timeout = Min(ppp_worker_interval > 0 ? ppp_worker_interval : PPP_RETRY_SECS,
+						  PPP_RETRY_SECS) * 1000L;
 		else if (ppp_worker_interval > 0)
 			timeout = ppp_worker_interval * 1000L;
 		else

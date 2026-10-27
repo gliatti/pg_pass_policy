@@ -9,8 +9,9 @@
  * GetTransactionSnapshot() have run, PG 13 to 17 at least): syscache lookups
  * work there, as get_role_password() itself does SearchSysCache1(AUTHNAME).
  * The hook only uses one (AUTHNAME), to know whether the user name is an
- * existing role and whether its rolvaliduntil has passed; no SPI.  Everything else lives in shared memory (ppp_role_hash), which is
- * filled by the background worker (profile parameters, persisted locks) and
+ * existing role, whether its rolvaliduntil has passed and, during the
+ * start-up window, whether it is a superuser; no SPI.  Everything else
+ * lives in shared memory (ppp_role_hash), which is filled by the background worker (profile parameters, persisted locks) and
  * read back by the worker to write audit rows and role_state (worker.c).
  *
  * This file also provides the C functions exposed in SQL:
@@ -480,15 +481,15 @@ ppp_lockout_init(void)
 
 /*
  * Look a user name up in pg_authid: *missing when no role has that name,
- * *expired when its rolvaliduntil is in the past.  The hook runs inside the
- * transaction started by InitPostgres() for authentication, with catalog
- * caches available (see the file header); the lookup is skipped (role
- * assumed to exist and valid, the conservative answer) if that ever stops
- * being true.
+ * *expired when its rolvaliduntil is in the past, *superuser when it has
+ * rolsuper.  The hook runs inside the transaction started by InitPostgres()
+ * for authentication, with catalog caches available (see the file header);
+ * the lookup is skipped (role assumed to exist, valid and not superuser, the
+ * conservative answer) if that ever stops being true.
  */
 static void
 ppp_role_lookup(const char *rolename, TimestampTz now,
-				bool *missing, bool *expired)
+				bool *missing, bool *expired, bool *superuser)
 {
 	HeapTuple	tup;
 	Datum		datum;
@@ -496,6 +497,7 @@ ppp_role_lookup(const char *rolename, TimestampTz now,
 
 	*missing = false;
 	*expired = false;
+	*superuser = false;
 	if (!IsTransactionState())
 		return;
 
@@ -509,6 +511,7 @@ ppp_role_lookup(const char *rolename, TimestampTz now,
 							&isnull);
 	if (!isnull && DatumGetTimestampTz(datum) < now)
 		*expired = true;
+	*superuser = ((Form_pg_authid) GETSTRUCT(tup))->rolsuper;
 	ReleaseSysCache(tup);
 }
 
@@ -598,7 +601,12 @@ ppp_auth_method_checks_secret(const Port *port)
  * - until the worker has loaded the persisted locks after the shared memory
  *   initialisation (ppp_shared->locks_loaded), the methods that check a
  *   secret are refused with FATAL 57P03 "lock state not loaded yet",
- *   whatever the status (SPEC 6.3, "Démarrage").
+ *   whatever the status, and their failures are not counted (the answer is
+ *   "retry" whatever the password).  Superusers are not refused that way
+ *   (they get the real answer and their failures are counted), so that an
+ *   installation whose worker never starts can still be administered; a
+ *   lock present in shared memory still applies to them (SPEC 6.3,
+ *   "Démarrage").
  */
 static void
 ppp_client_auth_hook(Port *port, int status)
@@ -609,6 +617,9 @@ ppp_client_auth_hook(Port *port, int status)
 	bool		refuse = false;
 	bool		not_loaded = false;
 	bool		log_not_loaded = false;
+	bool		log_worker_missing = false;
+	bool		check_window;
+	bool		is_superuser = false;
 	bool		just_locked = false;
 	bool		hash_full = false;
 	bool		role_missing = false;
@@ -636,18 +647,68 @@ ppp_client_auth_hook(Port *port, int status)
 
 	now = GetCurrentTimestamp();
 
+	/*
+	 * Start-up window still open?  Read without the lock: locks_loaded only
+	 * goes from false to true (the shared memory initialisation, which sets
+	 * it back to false, restarts every backend), so "loaded" here is final;
+	 * "not loaded" is checked again under the lock below.
+	 */
+	check_window = !ppp_shared->locks_loaded &&
+		ppp_auth_method_checks_secret(port);
+
 	/* catalog lookup and recovery state before taking the LWLock */
-	if (count_failure)
+	if (count_failure || check_window)
 	{
 		bool		expired;
 
-		ppp_role_lookup(key.rolename, now, &role_missing, &expired);
-		if (expired && ppp_auth_method_checks_valid_until(port))
+		ppp_role_lookup(key.rolename, now, &role_missing, &expired,
+						&is_superuser);
+		if (count_failure && expired &&
+			ppp_auth_method_checks_valid_until(port))
 			count_failure = false;
 	}
 	in_recovery = RecoveryInProgress();
 
 	LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
+
+	/*
+	 * Fail-closed start-up window: until the worker has re-injected the
+	 * persisted locks, a role locked in role_state (manual "infinity" lock
+	 * of a compromised account included) is not known here.  The methods
+	 * that check a secret are refused whatever the status (after the
+	 * refusal of a lock already in shared memory, below), so that the answer
+	 * does not tell a right password from a wrong one; such a failure is not
+	 * counted either, since the client is told to retry whatever the
+	 * password it sent, and a success does not reset the counter (see
+	 * below).  Superusers are let through (real answer, failures
+	 * counted): with exempt_roles empty, a worker that never starts would
+	 * otherwise lock every password login out, postgres included.  The
+	 * exempt roles (above) never reach this point.
+	 */
+	if (check_window && !ppp_shared->locks_loaded && !is_superuser)
+	{
+		not_loaded = true;
+		count_failure = false;
+	}
+
+	/*
+	 * No worker has published its PID long after the shared memory was
+	 * initialised: it was probably never started (max_worker_processes
+	 * exhausted: RegisterBackgroundWorker() does not report it) or cannot
+	 * connect (pg_pass_policy.database does not exist).  Warn, at most once
+	 * per PPP_WORKER_MISSING_LOG_SECS for the whole instance.
+	 */
+	if (check_window && !ppp_shared->locks_loaded &&
+		ppp_shared->worker_pid == 0 &&
+		TimestampDifferenceExceeds(ppp_shared->shmem_init_at, now,
+								   PPP_WORKER_MISSING_GRACE_SECS * 1000) &&
+		(ppp_shared->worker_missing_logged_at == 0 ||
+		 TimestampDifferenceExceeds(ppp_shared->worker_missing_logged_at, now,
+									PPP_WORKER_MISSING_LOG_SECS * 1000)))
+	{
+		ppp_shared->worker_missing_logged_at = now;
+		log_worker_missing = true;
+	}
 
 	memset(&ev, 0, sizeof(ev));
 	entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key, HASH_FIND, NULL);
@@ -663,7 +724,22 @@ ppp_client_auth_hook(Port *port, int status)
 			hash_full = !ev.scan_skipped;
 	}
 
-	if (entry != NULL)
+	if (entry != NULL && ppp_is_locked(entry, now))
+	{
+		/* a lock already in shared memory wins over the start-up window */
+		refuse = true;
+		locked_until = entry->locked_until;
+		not_loaded = false;
+	}
+
+	/*
+	 * During the start-up window (not_loaded), the entry is left strictly
+	 * unchanged: neither a failure counted nor a counter reset by a success.
+	 * A reset would be an oracle: four wrong passwords, a candidate, then a
+	 * wrong one would end in "locked" after the window only if the candidate
+	 * were wrong.
+	 */
+	if (entry != NULL && !not_loaded)
 	{
 		/*
 		 * Refreshed at every failure: a role created after its name was
@@ -675,12 +751,7 @@ ppp_client_auth_hook(Port *port, int status)
 		else if (status == STATUS_OK)
 			entry->role_missing = false;
 
-		if (ppp_is_locked(entry, now))
-		{
-			refuse = true;
-			locked_until = entry->locked_until;
-		}
-		else
+		if (!refuse)
 		{
 			/* expired lock, if any (ppp_sync_cleanup does the same) */
 			(void) ppp_expire_lock(entry, now, false);
@@ -734,18 +805,8 @@ ppp_client_auth_hook(Port *port, int status)
 		}
 	}
 
-	/*
-	 * Fail-closed start-up window: until the worker has re-injected the
-	 * persisted locks, a role locked in role_state (manual "infinity" lock
-	 * of a compromised account included) is not known here.  Refuse the
-	 * methods that check a secret whatever the status, so that the answer
-	 * does not tell a right password from a wrong one; the exempt roles
-	 * (above) are the documented way in for the administrator.
-	 */
-	if (!refuse && !ppp_shared->locks_loaded &&
-		ppp_auth_method_checks_secret(port))
+	if (not_loaded)
 	{
-		not_loaded = true;
 		if (ppp_shared->not_loaded_logged_at == 0 ||
 			TimestampDifferenceExceeds(ppp_shared->not_loaded_logged_at,
 									   now, 1000))
@@ -758,6 +819,12 @@ ppp_client_auth_hook(Port *port, int status)
 	LWLockRelease(ppp_shared->lock);
 
 	ppp_log_eviction(&ev);
+	if (log_worker_missing)
+		ereport(WARNING,
+				(errmsg("pg_pass_policy worker has not loaded the lock state yet (worker_pid = 0)"),
+				 errdetail("No pg_pass_policy background worker is running %d seconds after the shared memory initialisation; roles authenticating with a password or a secret are refused meanwhile (at most one message per minute).",
+						   PPP_WORKER_MISSING_GRACE_SECS),
+				 errhint("Check max_worker_processes and pg_pass_policy.database; superusers and roles listed in pg_pass_policy.exempt_roles can still connect.")));
 	if (hash_full)
 		ereport(LOG,
 				(errmsg(PPP_LOG_PREFIX "cannot track authentication failures of role \"%s\": too many tracked roles",
@@ -800,7 +867,7 @@ ppp_client_auth_hook(Port *port, int status)
 			ereport(LOG,
 					(errmsg(PPP_LOG_PREFIX "refusing connections until the background worker has loaded the lock state"),
 					 errdetail("Roles authenticating with a password or a secret are refused until the persisted locks are re-injected from role_state (at most one message per second)."),
-					 errhint("Check that the pg_pass_policy background worker is running (pass_policy.worker_status()); roles listed in pg_pass_policy.exempt_roles can still connect.")));
+					 errhint("Check that the pg_pass_policy background worker is running (pass_policy.worker_status()); superusers and roles listed in pg_pass_policy.exempt_roles can still connect.")));
 		ereport(FATAL,
 				(errcode(ERRCODE_CANNOT_CONNECT_NOW),
 				 errmsg(PPP_LOG_PREFIX "lock state not loaded yet, retry"),

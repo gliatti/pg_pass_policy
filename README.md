@@ -55,10 +55,16 @@ Puis, connecté en superutilisateur **à la base désignée** :
 CREATE EXTENSION pg_pass_policy;
 ```
 
+Au démarrage, seuls les superutilisateurs et les rôles de `exempt_roles`
+passent tant que le worker n'a pas chargé les verrous (les autres
+connexions par mot de passe reçoivent `57P03`, voir « Verrouillage et
+déverrouillage »). Le worker occupe une place de `max_worker_processes` : si
+aucune n'est libre, ou si `pg_pass_policy.database` n'existe pas, il ne
+démarre pas et le log porte, au plus une fois par minute, le WARNING
+`pg_pass_policy worker has not loaded the lock state yet (worker_pid = 0)`.
+
 Recommandé : `pg_pass_policy.exempt_roles = 'postgres'` (ou votre compte
-d'administration), pour ne jamais être bloqué par un profil trop strict ni
-par la courte fenêtre de démarrage pendant laquelle les autres rôles sont
-refusés (voir « Verrouillage et déverrouillage »).
+d'administration), pour ne jamais être bloqué par un profil trop strict.
 
 `CREATE EXTENSION` crée le schéma `pass_policy`, les tables, les fonctions, les
 vues, le profil `default`, charge le dictionnaire de mots de passe courants et
@@ -170,19 +176,24 @@ enregistrés dans `role_state` (dont les verrous manuels sans fin) n'y sont
 réinjectés que par le premier tour du worker, qui commence par là. Pour
 qu'aucun rôle verrouillé ne se glisse dans cette fenêtre, les connexions par
 mot de passe ou secret (`password`, `md5`, `scram-sha-256`, `ldap`, `pam`,
-`radius`, `bsd`) des rôles non exemptés sont refusées tant que l'état n'est
-pas chargé, bon ou mauvais mot de passe :
+`radius`, `bsd`) des rôles non exemptés et non superutilisateurs sont
+refusées tant que l'état n'est pas chargé, bon ou mauvais mot de passe :
 `FATAL: pg_pass_policy: lock state not loaded yet, retry` (SQLSTATE `57P03`,
-comme « the database system is starting up » : il suffit de réessayer). La
-fenêtre dure normalement une fraction de seconde. Si le worker ne peut pas
-charger l'état (base `pg_pass_policy.database` inexistante, table illisible),
-elle reste fermée et le log l'indique (au plus une ligne par seconde) ;
-`pass_policy.worker_status()` montre alors `last_reload` à NULL. Les rôles de
-`pg_pass_policy.exempt_roles` et les connexions sans secret (`peer`, `cert`…)
-passent toujours : gardez un compte d'administration exempté (typiquement
-`exempt_roles = 'postgres'`) ou un accès local `peer` pour intervenir. Avec
-`enabled = off`, rien n'est bloqué ; avec `worker_interval = 0`, le worker
-fait quand même ce premier chargement au démarrage.
+comme « the database system is starting up » : il suffit de réessayer). Ces
+tentatives ne modifient pas le compteur d'échecs : ni échec compté, ni
+remise à zéro. La fenêtre dure normalement une fraction de seconde. Si le
+worker ne peut pas charger l'état (base `pg_pass_policy.database`
+inexistante, `max_worker_processes` épuisé, table illisible, verrous de
+`role_state` plus nombreux que `max_tracked_roles`), elle reste fermée et le
+log l'indique (au plus une ligne par seconde, plus le WARNING `worker_pid =
+0` si le worker n'a jamais démarré) ; le worker réessaie toutes les 5
+secondes, et `pass_policy.worker_status()` montre `last_reload` à NULL. Les
+superutilisateurs, les rôles de `pg_pass_policy.exempt_roles` et les
+connexions sans secret (`peer`, `cert`…) passent toujours (un
+superutilisateur reste refusé si un verrou est déjà en mémoire partagée) :
+c'est le filet de sécurité de l'administrateur. Avec `enabled = off`, rien
+n'est bloqué ; avec `worker_interval = 0`, le worker fait quand même ce
+premier chargement au démarrage.
 
 ```sql
 SELECT pass_policy.lock_role('app_user');                              -- manuel, sans fin : renvoie infinity
@@ -194,7 +205,8 @@ SELECT pass_policy.unlock_role('app_user');                            -- remet 
 moins une seconde : la mémoire partagée les reçoit en secondes entières.
 Un verrou automatique levé par `unlock_role()` avant le passage du worker est
 tout de même journalisé (`role_locked`, `details.lifted_before_audit = true`),
-sans être recopié dans `role_state`. À l'inverse, un nouveau verrou automatique
+sans être recopié dans `role_state` ; s'il est remplacé par un `lock_role()`,
+sa ligne porte `details.replaced_by_manual = true`. À l'inverse, un nouveau verrou automatique
 posé juste avant ou pendant un `unlock_role()` ou un `run_maintenance()` (qui
 lève les verrous expirés) n'est pas levé par eux, et un verrou automatique
 expiré avant le passage du worker est journalisé normalement (sans

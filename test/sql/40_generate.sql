@@ -70,6 +70,14 @@ SELECT bool_and(length(regexp_replace(pwd, '[^a-z]', '', 'g')) >= 3) AS lower_ok
        count(*) FILTER (WHERE pass_policy.check_password('regress_gen', pwd) IS NOT NULL) AS non_compliant
   FROM gen2;
 
+-- Profil irréalisable en pratique : 200 chiffres sur 203 caractères avec
+-- max_repeat = 1 (deux chiffres voisins identiques presque à coup sûr) :
+-- 22023 (paramètre invalide), et non XX000 (erreur interne)
+SELECT pass_policy.create_profile('p_gen_norepeat',
+  '{"min_length": 8, "max_length": 512, "min_digit": 200, "max_repeat": 1}') > 0 AS created;
+SELECT ppp_test.try($$SELECT pass_policy.generate_password(203, 'p_gen_norepeat')$$) AS infeasible_profile;
+SELECT pass_policy.drop_profile('p_gen_norepeat');
+
 -- generate_password n'écrit rien dans l'audit ni l'historique
 SELECT count(*) AS gen_events FROM pass_policy.audit_log
  WHERE role_name = 'regress_gen'

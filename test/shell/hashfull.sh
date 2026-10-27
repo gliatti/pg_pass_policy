@@ -79,6 +79,22 @@ check_eq "role_state : le verrou levé n'est pas recopié" "0" "$out"
 out=$(psql_as regress_e3 "$GOOD" "SELECT current_user") || true
 check_eq "regress_e3 se connecte après le tour du worker" "regress_e3" "$out"
 
+# --- verrou automatique remplacé par lock_role() avant le passage du worker --
+# (revue finale 7, constat 4) : l'entrée est encore verrouillée (verrou
+# manuel) ; la ligne role_locked du verrou automatique porte
+# replaced_by_manual, et non lifted_before_audit.
+psql_admin "CREATE ROLE regress_e4r LOGIN PASSWORD '$GOOD'"
+for i in 1 2 3 4 5; do psql_as regress_e4r "$BAD" >/dev/null || true; done
+psql_admin "SELECT pass_policy.lock_role('regress_e4r', NULL, 'replace')" >/dev/null
+kick || fail "pas de tour du worker après lock_role(regress_e4r)"
+out=$(psql_admin "SELECT coalesce(details->>'replaced_by_manual', 'absent') || ':' || coalesce(details->>'lifted_before_audit', 'absent')
+                    FROM pass_policy.audit_log
+                   WHERE role_name = 'regress_e4r' AND event_type = 'role_locked' AND details->>'locked_by' = 'auto'")
+check_eq "verrou auto remplacé : replaced_by_manual, sans lifted_before_audit" "true:absent" "$out"
+out=$(psql_admin "SELECT locked_by || ':' || (locked_until = 'infinity') FROM pass_policy.role_state WHERE role_name = 'regress_e4r'")
+check_eq "role_state garde le verrou manuel" "manual:true" "$out"
+psql_admin "SELECT pass_policy.unlock_role('regress_e4r')" >/dev/null
+
 # --- un nom inexistant est « verrouillé » comme un vrai rôle -----------------
 flood ghost_b 24
 for i in 1 2 3 4 5; do psql_as phantom "$BAD" >/dev/null || true; done
@@ -272,6 +288,33 @@ n1=$(($(n_log 'cannot track authentication failures') - n0))
 check_eq "H3 : hash plein non évincable : LOG « cannot track » une fois le hash parcouru ($n1 en $t_ms ms)" "1" \
 	"$( [ "$n1" -ge 1 ] && [ "$n1" -le $((t_ms / 1000 + 1)) ] && echo 1 || echo 0)"
 check_eq "H3 : le serveur répond" "1" "$(psql_admin "SELECT 1")"
+
+# --- verrous persistés plus nombreux que les places (revue finale 7, constat 2)
+# 599 verrous dans role_state, max_tracked_roles = 16 : le rechargement ne
+# peut pas tout réinjecter ; la fenêtre de démarrage reste fermée (LOG
+# explicite) et le rechargement est retenté (au plus 5 s plus tard, malgré
+# worker_interval = 3600) jusqu'à ce que les verrous tiennent.
+psql_admin "ALTER SYSTEM SET pg_pass_policy.max_tracked_roles = 16" >/dev/null
+n0=$(n_log 'persisted locks could not be loaded in shared memory: connections stay refused')
+"$PPP_BINDIR/pg_ctl" -D "$PPP_TMP/data" -l "$PPP_TMP/server.log" -o "-p $PPP_PORT" -w -t 60 restart >/dev/null
+if wait_for 30 "SELECT last_reload IS NOT NULL FROM pass_policy.worker_status()"; then
+	ok "constat 2 : rechargement effectué (incomplet)"
+else
+	fail "constat 2 : aucun rechargement"
+fi
+sleep 6
+n1=$(($(n_log 'persisted locks could not be loaded in shared memory: connections stay refused') - n0))
+check_eq "constat 2 : LOG « persisted locks could not be loaded », rechargement retenté ($n1)" "1" "$( [ "$n1" -ge 2 ] && echo 1 || echo 0)"
+out=$(psql_as regress_h3 "$GOOD" "SELECT current_user") || true
+check_contains "constat 2 : verrous non chargés, la fenêtre reste fermée (57P03)" "lock state not loaded yet" "$out"
+psql_admin "UPDATE pass_policy.role_state SET locked_until = NULL WHERE role_name LIKE 'regress_h1%'" >/dev/null
+if wait_for 30 "SELECT count(*) < 16 FROM pass_policy.failed_attempts() WHERE locked_until IS NOT NULL"; then
+	ok "constat 2 : verrous levés dans role_state, rechargement complet sans SIGHUP"
+else
+	fail "constat 2 : pas de rechargement complet"
+fi
+out=$(psql_as regress_h3 "$GOOD" "SELECT current_user") || true
+check_eq "constat 2 : fenêtre fermée, connexion acceptée" "regress_h3" "$out"
 
 check_eq "aucun échec de cycle du worker dans le log" "0" "$(n_log 'pg_pass_policy: worker .* failed')"
 

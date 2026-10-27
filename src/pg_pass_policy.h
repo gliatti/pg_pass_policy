@@ -41,6 +41,15 @@ extern bool  ppp_enforce_database;
 #define PPP_DEFAULT_FAILURE_WINDOW_SECS	(15 * 60)
 #define PPP_DEFAULT_LOCK_DURATION_SECS	(30 * 60)
 
+/*
+ * Fail-closed start-up window (SPEC 6.3, "Démarrage"): once the shared
+ * memory has been initialised for that long without any worker having
+ * published its PID, the authentication hook warns (at most once per
+ * PPP_WORKER_MISSING_LOG_SECS) that the worker is probably not running.
+ */
+#define PPP_WORKER_MISSING_GRACE_SECS	10
+#define PPP_WORKER_MISSING_LOG_SECS		60
+
 /* ---- Mémoire partagée (remplie par le worker, lue par le hook auth) ------- */
 typedef struct pppRoleKey
 {
@@ -201,12 +210,20 @@ typedef struct pppSharedState
 	 * shared memory initialisation until the worker has re-injected the
 	 * persisted locks (ppp_sync_reload), or found that the extension is not
 	 * installed in pg_pass_policy.database (nothing to re-inject).  Until
-	 * then the authentication hook refuses the non-exempt roles that
-	 * authenticate with a secret (57P03).  not_loaded_logged_at limits its
-	 * LOG to one per second across all backends.
+	 * then the authentication hook refuses the non-exempt, non-superuser
+	 * roles that authenticate with a secret (57P03), and does not count
+	 * their failures.  not_loaded_logged_at limits its LOG to one per second
+	 * across all backends.  shmem_init_at is the time of the shared memory
+	 * initialisation; worker_missing_logged_at limits to one per minute the
+	 * WARNING of the hook when no worker has published its PID
+	 * (worker_pid = 0) PPP_WORKER_MISSING_GRACE_SECS after it: the worker
+	 * was never started (max_worker_processes exhausted) or cannot connect
+	 * (pg_pass_policy.database does not exist).
 	 */
 	bool		locks_loaded;
 	TimestampTz not_loaded_logged_at;
+	TimestampTz shmem_init_at;
+	TimestampTz worker_missing_logged_at;
 
 	/*
 	 * Last time an eviction scan in PPP_ENTER_COUNT mode found nothing to
@@ -247,19 +264,18 @@ extern HTAB *ppp_role_hash;
 extern Size ppp_shmem_size(void);
 extern bool ppp_role_is_exempt(const char *rolename);
 /*
- * True only if the pg_pass_policy extension is installed in the current
- * database, its objects live in schema PPP_SCHEMA and that schema is owned by
- * a superuser.  Any SPI call executed with elevated privileges must be gated
- * by this check: a look-alike schema created by an unprivileged user must
- * never be trusted.  Requires a transaction and catalog access.
- */
-extern bool ppp_extension_installed(void);
-
-/*
- * Three-state variant used by the password hook and the SQL functions of
- * policy.c: an extension that is installed but not trusted must make them
- * fail (PPP-004) instead of silently applying no policy.  *nspowner
- * (optional) receives the owner of schema PPP_SCHEMA, InvalidOid if none.
+ * State of the pg_pass_policy extension in the current database.  Trusted
+ * only if it is installed, its objects live in schema PPP_SCHEMA and that
+ * schema is owned by a superuser: any SPI call executed with elevated
+ * privileges must be gated by this check, a look-alike schema created by an
+ * unprivileged user must never be trusted.  The password hook and the SQL
+ * functions of policy.c go through ppp_require_extension() (policy.c), which
+ * raises PPP-004 for an installed but untrusted extension instead of
+ * silently applying no policy; the background worker calls
+ * ppp_extension_state() itself (an absent extension closes the start-up
+ * window, an untrusted one does not).  *nspowner (optional) receives the
+ * owner of schema PPP_SCHEMA, InvalidOid if none.  Requires a transaction
+ * and catalog access.
  */
 typedef enum pppExtensionState
 {
