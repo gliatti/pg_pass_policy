@@ -1,0 +1,162 @@
+--
+-- 70_maintenance — run_maintenance() : expiration, alertes, VALID UNTIL, purge,
+-- réconciliation (SPEC §3.3, §4 run_maintenance, §6.4)
+--
+-- Le worker est désactivé dans la configuration de test (worker_interval = 0) :
+-- seules les invocations explicites de run_maintenance() agissent.
+-- Le résultat de run_maintenance() n'est jamais affiché tel quel (il dépend de
+-- l'état laissé par les tests précédents) : on filtre sur les rôles du test.
+--
+\set VERBOSITY terse
+SET client_min_messages = warning;
+
+-- Statuts de v_role_status selon le profil
+SELECT pass_policy.create_profile('p_short',
+         '{"max_age": "1 second", "grace_period": "1 second",
+           "warn_before": "1 second", "min_age": "0"}') > 0 AS created;
+SELECT pass_policy.create_profile('p_grace',
+         '{"max_age": "1 second", "grace_period": "1 hour",
+           "warn_before": "1 second", "min_age": "0"}') > 0 AS created;
+SELECT pass_policy.create_profile('p_warn',
+         '{"max_age": "1 day", "warn_before": "2 days", "min_age": "0"}') > 0 AS created;
+SELECT pass_policy.create_profile('p_never', '{"max_age": null, "min_age": "0"}') > 0 AS created;
+
+CREATE ROLE regress_maint LOGIN;
+CREATE ROLE regress_maint_grace LOGIN;
+CREATE ROLE regress_maint_warn LOGIN;
+CREATE ROLE regress_maint_never LOGIN;
+SELECT pass_policy.assign_profile('regress_maint', 'p_short');
+SELECT pass_policy.assign_profile('regress_maint_grace', 'p_grace');
+SELECT pass_policy.assign_profile('regress_maint_warn', 'p_warn');
+SELECT pass_policy.assign_profile('regress_maint_never', 'p_never');
+
+INSERT INTO ppp_test.secrets VALUES
+  ('maint1', 'Maintenance-Pw#01'), ('maint2', 'Maintenance-Pw#02'),
+  ('maint3', 'Maintenance-Pw#03'), ('maint4', 'Maintenance-Pw#04');
+ALTER ROLE regress_maint PASSWORD 'Maintenance-Pw#01';
+-- Tout de suite : expires_at − now() < warn_before → alerte
+CREATE TEMP TABLE m1 AS SELECT * FROM pass_policy.run_maintenance();
+SELECT count(*) > 0 AS warned
+  FROM pass_policy.audit_log
+ WHERE event_type = 'expiry_warning' AND role_name = 'regress_maint';
+SELECT last_warned_at IS NOT NULL AS last_warned_set
+  FROM pass_policy.role_state WHERE role_name = 'regress_maint';
+
+ALTER ROLE regress_maint_grace PASSWORD 'Maintenance-Pw#02';
+ALTER ROLE regress_maint_warn PASSWORD 'Maintenance-Pw#03';
+ALTER ROLE regress_maint_never PASSWORD 'Maintenance-Pw#04';
+
+-- expires_at / grace_until calculés au changement
+SELECT role_name,
+       expires_at - password_changed_at AS lifetime,
+       grace_until - expires_at AS grace
+  FROM pass_policy.role_state
+ WHERE role_name IN ('regress_maint', 'regress_maint_grace')
+ ORDER BY role_name;
+SELECT expires_at IS NULL AS no_expiry, grace_until IS NULL AS no_grace
+  FROM pass_policy.role_state WHERE role_name = 'regress_maint_never';
+
+SELECT pg_sleep(2.5);
+CREATE TEMP TABLE m2 AS SELECT * FROM pass_policy.run_maintenance();
+
+SELECT role_name, status
+  FROM pass_policy.v_role_status
+ WHERE role_name IN ('regress_maint', 'regress_maint_grace',
+                     'regress_maint_warn', 'regress_maint_never')
+ ORDER BY role_name;
+SELECT role_name, status FROM pass_policy.v_expiring
+ WHERE role_name LIKE 'regress\_maint%' ORDER BY role_name;
+SELECT days_left IS NULL AS never_days_left_null
+  FROM pass_policy.v_role_status WHERE role_name = 'regress_maint_never';
+
+-- VALID UNTIL synchronisé = grace_until (manage_valid_until = on)
+SELECT r.rolname,
+       abs(extract(epoch FROM r.rolvaliduntil - s.grace_until)) < 2 AS synced,
+       abs(extract(epoch FROM s.valid_until_synced - s.grace_until)) < 2 AS recorded
+  FROM pg_roles r JOIN pass_policy.role_state s ON s.role_name = r.rolname
+ WHERE r.rolname IN ('regress_maint', 'regress_maint_grace', 'regress_maint_warn')
+ ORDER BY 1;
+SELECT rolvaliduntil < now() AS past FROM pg_roles WHERE rolname = 'regress_maint';
+
+-- Audit : password_expired pour regress_maint (une seule fois même après 2 passes)
+CREATE TEMP TABLE m3 AS SELECT * FROM pass_policy.run_maintenance();
+SELECT count(*) AS expired_events FROM pass_policy.audit_log
+ WHERE event_type = 'password_expired' AND role_name = 'regress_maint';
+SELECT count(*) AS expired_events_grace FROM pass_policy.audit_log
+ WHERE event_type = 'password_expired' AND role_name = 'regress_maint_grace';
+-- La valeur de retour décrit les actions (colonnes action, role_name, details)
+SELECT count(*) > 0 AS reported
+  FROM (SELECT * FROM m1 UNION ALL SELECT * FROM m2) m
+ WHERE m.role_name LIKE 'regress\_maint%';
+-- Les actions retournées ne contiennent ni mot de passe ni vérificateur
+SELECT count(*) AS leaking_actions
+  FROM (SELECT * FROM m1 UNION ALL SELECT * FROM m2 UNION ALL SELECT * FROM m3) m
+ WHERE m.details::text LIKE '%SCRAM-SHA-256$%'
+    OR EXISTS (SELECT 1 FROM ppp_test.secrets s
+                WHERE length(s.pwd) >= 10 AND strpos(m.details::text, s.pwd) > 0);
+
+-- Changement de profil : la synchronisation suit le nouveau max_age
+SELECT pass_policy.alter_profile('p_short', '{"max_age": "10 days", "grace_period": "1 day"}');
+CREATE TEMP TABLE m4 AS SELECT * FROM pass_policy.run_maintenance();
+SELECT status FROM pass_policy.v_role_status WHERE role_name = 'regress_maint';
+SELECT rolvaliduntil > now() + interval '10 days' AS resynced
+  FROM pg_roles WHERE rolname = 'regress_maint';
+
+-- Rôle supprimé : purge de role_state, role_profile et password_history
+CREATE ROLE regress_gone LOGIN;
+SELECT pass_policy.assign_profile('regress_gone', 'p_never');
+ALTER ROLE regress_gone PASSWORD 'Gone-Soon#2024xy';
+INSERT INTO ppp_test.secrets VALUES ('gone', 'Gone-Soon#2024xy');
+DROP ROLE regress_gone;
+CREATE TEMP TABLE m5 AS SELECT * FROM pass_policy.run_maintenance();
+SELECT (SELECT count(*) FROM pass_policy.role_state WHERE role_name = 'regress_gone') AS state_rows,
+       (SELECT count(*) FROM pass_policy.role_profile WHERE role_name = 'regress_gone') AS profile_rows,
+       (SELECT count(*) FROM pass_policy.password_history WHERE role_name = 'regress_gone') AS history_rows;
+
+-- Réconciliation 1 : rôle dont le mot de passe a été posé avant CREATE EXTENSION
+-- (regress_legacy, créé dans 00_setup, statut unknown vérifié dans 00_setup).
+-- Des run_maintenance() ont eu lieu depuis (20, 60, ici) : l'historique
+-- contient son vérificateur.
+CREATE TEMP TABLE m6 AS SELECT * FROM pass_policy.run_maintenance();
+SELECT count(*) AS history_after,
+       bool_and(verifier LIKE 'SCRAM-SHA-256$%') AS scram
+  FROM pass_policy.password_history WHERE role_name = 'regress_legacy';
+-- Le mot de passe historique est désormais détecté comme réutilisation
+SELECT ppp_test.code(pass_policy.check_password('regress_legacy', 'Legacy-Passw0rd#2019')) AS reuse;
+-- Une seconde passe ne duplique pas l'historique
+CREATE TEMP TABLE m7 AS SELECT * FROM pass_policy.run_maintenance();
+SELECT count(*) AS history_after_2nd_run FROM pass_policy.password_history
+ WHERE role_name = 'regress_legacy';
+
+-- Réconciliation 2 : mot de passe changé pendant que pg_pass_policy.enabled = off.
+-- enabled est de contexte SIGHUP : SET est impossible, on passe par ALTER SYSTEM.
+SELECT ppp_test.try($$SET pg_pass_policy.enabled = off$$) <> 'ok' AS set_refused;
+CREATE ROLE regress_recon LOGIN;
+ALTER SYSTEM SET pg_pass_policy.enabled = off;
+SELECT pg_reload_conf();
+SELECT pg_sleep(0.5);
+SHOW pg_pass_policy.enabled;
+-- Mot de passe faible accepté : la politique est désactivée, rien n'est enregistré
+ALTER ROLE regress_recon PASSWORD 'recon-weak-password';
+ALTER ROLE regress_recon PASSWORD 'Recon-Disabled#01';
+INSERT INTO ppp_test.secrets VALUES ('recon_weak', 'recon-weak-password'),
+                                    ('recon', 'Recon-Disabled#01');
+ALTER SYSTEM RESET pg_pass_policy.enabled;
+SELECT pg_reload_conf();
+SELECT pg_sleep(0.5);
+SHOW pg_pass_policy.enabled;
+SELECT count(*) AS history_before FROM pass_policy.password_history
+ WHERE role_name = 'regress_recon';
+CREATE TEMP TABLE m8 AS SELECT * FROM pass_policy.run_maintenance();
+SELECT count(*) AS history_after FROM pass_policy.password_history
+ WHERE role_name = 'regress_recon';
+SELECT ppp_test.code(pass_policy.check_password('regress_recon', 'Recon-Disabled#01')) AS reuse;
+
+SELECT ppp_test.leaks();
+
+-- Nettoyage des profils (les rôles sont supprimés dans 99_teardown)
+SELECT pass_policy.unassign_profile(r)
+  FROM unnest(ARRAY['regress_maint', 'regress_maint_grace',
+                    'regress_maint_warn', 'regress_maint_never']) r;
+SELECT pass_policy.drop_profile(p)
+  FROM unnest(ARRAY['p_short', 'p_grace', 'p_warn', 'p_never']) p;

@@ -1,0 +1,331 @@
+--
+-- 90_privileges — droits : utilisateur ordinaire, pass_policy_viewer,
+-- pass_policy_admin (SPEC §3, §8.4)
+--
+-- SET SESSION AUTHORIZATION change session_user : c'est lui que vérifient les
+-- fonctions SECURITY DEFINER (pg_has_role(session_user, …) OR rolsuper).
+-- Refus attendu : SQLSTATE 42501 (insufficient_privilege), que le refus vienne
+-- du REVOKE EXECUTE ou du contrôle interne.
+--
+\set VERBOSITY terse
+SET client_min_messages = warning;
+CREATE ROLE regress_user LOGIN;
+CREATE ROLE regress_viewer LOGIN IN ROLE pass_policy_viewer;
+CREATE ROLE regress_admin LOGIN IN ROLE pass_policy_admin;
+CREATE ROLE regress_target LOGIN;
+CREATE ROLE regress_super LOGIN SUPERUSER;
+-- Utilisateur ordinaire --------------------------------------------------
+SET SESSION AUTHORIZATION regress_user;
+SELECT ppp_test.try($$SELECT pass_policy.rotate_password('regress_target')$$) AS rotate;
+ rotate 
+--------
+ 42501
+(1 row)
+
+SELECT ppp_test.try($$SELECT pass_policy.expire_password('regress_target')$$) AS expire;
+ expire 
+--------
+ 42501
+(1 row)
+
+SELECT ppp_test.try($$SELECT pass_policy.lock_role('regress_target')$$) AS lock;
+ lock  
+-------
+ 42501
+(1 row)
+
+SELECT ppp_test.try($$SELECT pass_policy.unlock_role('regress_target')$$) AS unlock;
+ unlock 
+--------
+ 42501
+(1 row)
+
+SELECT ppp_test.try($$SELECT pass_policy.create_profile('p_hack')$$) AS create_profile;
+ create_profile 
+----------------
+ 42501
+(1 row)
+
+SELECT ppp_test.try($$SELECT pass_policy.alter_profile('default', '{"min_length": 1}')$$) AS alter_profile;
+ alter_profile 
+---------------
+ 42501
+(1 row)
+
+SELECT ppp_test.try($$SELECT pass_policy.assign_profile('regress_user', 'default')$$) AS assign_profile;
+ assign_profile 
+----------------
+ 42501
+(1 row)
+
+SELECT ppp_test.try($$SELECT pass_policy.load_dictionary(ARRAY['x'])$$) AS load_dictionary;
+ load_dictionary 
+-----------------
+ 42501
+(1 row)
+
+SELECT ppp_test.try($$SELECT * FROM pass_policy.run_maintenance()$$) AS run_maintenance;
+ run_maintenance 
+-----------------
+ 42501
+(1 row)
+
+SELECT ppp_test.try($$SELECT pass_policy.purge_audit()$$) AS purge_audit;
+ purge_audit 
+-------------
+ 42501
+(1 row)
+
+SELECT ppp_test.try($$SELECT pass_policy.audit('maintenance', 'regress_user')$$) AS forge_audit;
+ forge_audit 
+-------------
+ 42501
+(1 row)
+
+SELECT ppp_test.try($$SELECT pass_policy.shmem_unlock_role('regress_target')$$) AS shmem_unlock;
+ shmem_unlock 
+--------------
+ 42501
+(1 row)
+
+SELECT ppp_test.try($$SELECT pass_policy.shmem_lock_role('regress_target', NULL)$$) AS shmem_lock;
+ shmem_lock 
+------------
+ 42501
+(1 row)
+
+SELECT ppp_test.try($$SELECT * FROM pass_policy.switch_rotation_pair('app')$$) AS switch_pair;
+ switch_pair 
+-------------
+ 42501
+(1 row)
+
+-- record_password_change : refusé pour un autre rôle ET pour soi-même : un appel
+-- direct permettrait de falsifier l'historique ou de repousser l'expiration sans
+-- changer de mot de passe. Seul le hook (contexte privilégié) l'appelle.
+SELECT ppp_test.try($$SELECT pass_policy.record_password_change('regress_target', 'SCRAM-SHA-256$4096:haqxM21W2X4JN2z5mNIhgQ==$6wQyAb1jy/PwU6taBTaUoM8DCeQcK961IfQ80mS4Iwk=:nYBdZfaOxx6o2q0ioUkoxD3rmW1Nff4RWaNnPPYCZiw=')$$) AS record_other;
+ record_other 
+--------------
+ 42501
+(1 row)
+
+SELECT ppp_test.try($$SELECT pass_policy.record_password_change('regress_user', 'SCRAM-SHA-256$4096:haqxM21W2X4JN2z5mNIhgQ==$6wQyAb1jy/PwU6taBTaUoM8DCeQcK961IfQ80mS4Iwk=:nYBdZfaOxx6o2q0ioUkoxD3rmW1Nff4RWaNnPPYCZiw=')$$) AS record_self;
+ record_self 
+-------------
+ 42501
+(1 row)
+
+-- Lecture directe des tables et vues : refusée
+SELECT ppp_test.try($$SELECT * FROM pass_policy.profile$$) AS sel_profile;
+ sel_profile 
+-------------
+ 42501
+(1 row)
+
+SELECT ppp_test.try($$SELECT * FROM pass_policy.password_history$$) AS sel_history;
+ sel_history 
+-------------
+ 42501
+(1 row)
+
+SELECT ppp_test.try($$SELECT * FROM pass_policy.audit_log$$) AS sel_audit;
+ sel_audit 
+-----------
+ 42501
+(1 row)
+
+SELECT ppp_test.try($$SELECT * FROM pass_policy.role_state$$) AS sel_state;
+ sel_state 
+-----------
+ 42501
+(1 row)
+
+SELECT ppp_test.try($$SELECT * FROM pass_policy.v_role_status$$) AS sel_status;
+ sel_status 
+------------
+ 42501
+(1 row)
+
+SELECT ppp_test.try($$SELECT * FROM pass_policy.failed_attempts()$$) AS failed_attempts;
+ failed_attempts 
+-----------------
+ 42501
+(1 row)
+
+-- Écriture directe : refusée
+SELECT ppp_test.try($$DELETE FROM pass_policy.password_history$$) AS del_history;
+ del_history 
+-------------
+ 42501
+(1 row)
+
+SELECT ppp_test.try($$UPDATE pass_policy.role_state SET locked_until = NULL$$) AS upd_state;
+ upd_state 
+-----------
+ 42501
+(1 row)
+
+RESET SESSION AUTHORIZATION;
+-- L'appel record_self n'a pas laissé de vérificateur visible dans l'audit
+SELECT ppp_test.leaks();
+ leaks 
+-------
+     0
+(1 row)
+
+-- Viewer -----------------------------------------------------------------
+SET SESSION AUTHORIZATION regress_viewer;
+SELECT ppp_test.try($$SELECT * FROM pass_policy.v_role_status$$) AS sel_status;
+ sel_status 
+------------
+ ok
+(1 row)
+
+SELECT ppp_test.try($$SELECT * FROM pass_policy.v_expiring$$) AS sel_expiring;
+ sel_expiring 
+--------------
+ ok
+(1 row)
+
+SELECT ppp_test.try($$SELECT * FROM pass_policy.v_locked$$) AS sel_locked;
+ sel_locked 
+------------
+ ok
+(1 row)
+
+SELECT ppp_test.try($$SELECT * FROM pass_policy.v_recent_audit$$) AS sel_recent_audit;
+ sel_recent_audit 
+------------------
+ ok
+(1 row)
+
+SELECT ppp_test.try($$SELECT * FROM pass_policy.profile$$) AS sel_profile;
+ sel_profile 
+-------------
+ ok
+(1 row)
+
+SELECT count(*) > 0 AS sees_roles FROM pass_policy.v_role_status;
+ sees_roles 
+------------
+ t
+(1 row)
+
+SELECT ppp_test.try($$SELECT pass_policy.rotate_password('regress_target')$$) AS rotate;
+ rotate 
+--------
+ 42501
+(1 row)
+
+SELECT ppp_test.try($$SELECT pass_policy.lock_role('regress_target')$$) AS lock;
+ lock  
+-------
+ 42501
+(1 row)
+
+SELECT ppp_test.try($$UPDATE pass_policy.profile SET min_length = 1$$) AS upd_profile;
+ upd_profile 
+-------------
+ 42501
+(1 row)
+
+RESET SESSION AUTHORIZATION;
+-- Admin (membre de pass_policy_admin, non superutilisateur) ---------------
+SET SESSION AUTHORIZATION regress_admin;
+SELECT rolsuper FROM pg_roles WHERE rolname = session_user;
+ rolsuper 
+----------
+ f
+(1 row)
+
+INSERT INTO ppp_test.secrets
+  SELECT 'admin_rot', pass_policy.rotate_password('regress_target');
+SELECT ppp_test.try($$SELECT pass_policy.lock_role('regress_target', interval '1 hour', 'admin test')$$) AS lock;
+ lock 
+------
+ ok
+(1 row)
+
+SELECT ppp_test.try($$SELECT pass_policy.unlock_role('regress_target')$$) AS unlock;
+ unlock 
+--------
+ ok
+(1 row)
+
+SELECT ppp_test.try($$SELECT pass_policy.create_profile('p_admin', '{"min_length": 14}')$$) AS create_profile;
+ create_profile 
+----------------
+ ok
+(1 row)
+
+SELECT ppp_test.try($$SELECT pass_policy.assign_profile('regress_target', 'p_admin')$$) AS assign_profile;
+ assign_profile 
+----------------
+ ok
+(1 row)
+
+SELECT ppp_test.try($$SELECT pass_policy.unassign_profile('regress_target')$$) AS unassign_profile;
+ unassign_profile 
+------------------
+ ok
+(1 row)
+
+SELECT ppp_test.try($$SELECT pass_policy.drop_profile('p_admin')$$) AS drop_profile;
+ drop_profile 
+--------------
+ ok
+(1 row)
+
+SELECT ppp_test.try($$SELECT count(*) FROM pass_policy.run_maintenance()$$) AS run_maintenance;
+ run_maintenance 
+-----------------
+ ok
+(1 row)
+
+SELECT ppp_test.try($$SELECT * FROM pass_policy.v_role_status$$) AS sel_status;
+ sel_status 
+------------
+ ok
+(1 row)
+
+-- Exigence de sécurité (proposée) : un admin non superutilisateur ne peut pas
+-- changer le mot de passe d'un superutilisateur (prise de contrôle)
+SELECT ppp_test.try($$SELECT pass_policy.rotate_password('regress_super')$$) AS rotate_superuser;
+ rotate_superuser 
+------------------
+ 42501
+(1 row)
+
+SELECT ppp_test.try($$SELECT pass_policy.lock_role('regress_super')$$) AS lock_superuser;
+ lock_superuser 
+----------------
+ 42501
+(1 row)
+
+RESET SESSION AUTHORIZATION;
+SELECT length(pwd) AS admin_rot_len FROM ppp_test.secrets WHERE label = 'admin_rot';
+ admin_rot_len 
+---------------
+            24
+(1 row)
+
+SELECT actor FROM pass_policy.audit_log
+ WHERE event_type = 'password_rotated' AND role_name = 'regress_target'
+ ORDER BY id DESC LIMIT 1;
+     actor     
+---------------
+ regress_admin
+(1 row)
+
+SELECT ppp_test.try($$SELECT pass_policy.unlock_role('regress_super')$$) AS cleanup_unlock_super;
+ cleanup_unlock_super 
+----------------------
+ ok
+(1 row)
+
+SELECT ppp_test.leaks();
+ leaks 
+-------
+     0
+(1 row)
+

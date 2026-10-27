@@ -1,0 +1,170 @@
+# Tests de pg_pass_policy
+
+Trois niveaux de tests :
+
+| niveau | où | quoi |
+|---|---|---|
+| pg_regress | `test/sql/*.sql`, `test/expected/*.out` | API SQL, hook de complexité, historique, rotation, maintenance, droits |
+| shell | `test/shell/*.sh` | vraies connexions TCP/SCRAM : verrouillage, expiration, NOTIFY, worker |
+| matrice Docker | `docker/` | les deux niveaux précédents sur PostgreSQL 14, 15, 16, 17 et 18 |
+
+## 1. pg_regress
+
+### Pourquoi pas `make check` ni `make installcheck` « nu »
+
+`pg_pass_policy` doit être chargée par `shared_preload_libraries` : les tests
+exigent donc une instance démarrée avec `test/pg_pass_policy.conf`, jamais
+l'instance de développement courante.
+
+- `make check` **n'est pas pris en charge par PGXS** : il affiche
+  `"make check" is not supported` et **renvoie 0** (aucun test n'est lancé).
+- `make installcheck` seul se connecte à l'instance qui écoute sur le port par
+  défaut (celle du poste) : refusé ici, cette instance n'a pas la bibliothèque
+  préchargée et on ne veut pas y créer de rôles de test.
+- La bonne commande est `make installcheck` **avec `--temp-instance`** :
+  pg_regress crée alors une instance jetable (initdb, `--temp-config`, port libre,
+  socket dans un répertoire temporaire) avec les binaires du `PG_CONFIG` choisi.
+
+```sh
+make PG_CONFIG=/chemin/vers/pg_config
+make PG_CONFIG=/chemin/vers/pg_config install
+make PG_CONFIG=/chemin/vers/pg_config installcheck \
+     EXTRA_REGRESS_OPTS=--temp-instance=test/tmp_check
+# en cas d'échec :
+less test/regression.diffs
+```
+
+`EXTRA_REGRESS_OPTS` évite de modifier le Makefile. Il est proposé d'ajouter
+`--temp-instance=test/tmp_check` à `REGRESS_OPTS` (et `test/tmp_check` à
+`EXTRA_CLEAN`) pour que `make installcheck` suffise.
+
+La base de test s'appelle `contrib_regression` (ajoutée par PGXS) : c'est la
+valeur de `pg_pass_policy.database` dans `test/pg_pass_policy.conf`.
+
+### Configuration de test
+
+`test/pg_pass_policy.conf` fixe `pg_pass_policy.worker_interval = 0` : le worker
+est démarré mais ne fait aucun tour périodique, si bien que seules les
+invocations explicites de `run_maintenance()` agissent et que les sorties sont
+reproductibles. Le comportement du worker est vérifié par les tests shell.
+
+Remarque : `run_maintenance()` appelle `shmem_reload()`, qui peut réveiller le
+worker pour un tour. Les tests ne dépendent que de l'état final (pas du nombre
+exact d'actions renvoyées par `run_maintenance()`).
+
+### Conventions des scénarios
+
+- rôles de test préfixés `regress_` (convention pg_regress), supprimés dans
+  `99_teardown` ;
+- `\set VERBOSITY terse` en tête de chaque fichier ;
+- les mots de passe n'apparaissent que dans le texte des commandes : les
+  résultats ne montrent que des booléens, longueurs et codes `PPP-xxx` ;
+- les mots de passe générés (`rotate_password`, `switch_rotation_pair`) sont
+  capturés par `INSERT INTO ppp_test.secrets SELECT …` : ils ne sont ni
+  affichés ni présents dans le texte d'une requête ;
+- aucun horodatage affiché (pg_regress impose `PGTZ=PST8PDT` et
+  `DateStyle=Postgres`) ; les durées sont comparées avec une tolérance ;
+- schéma utilitaire `ppp_test` (créé dans `00_setup`) :
+  - `ppp_test.try(sql)` : exécute et renvoie `ok` ou `SQLSTATE [PPP-xxx]`,
+    pour ne pas dépendre du libellé exact des messages ;
+  - `ppp_test.code(motif)` : extrait `PPP-xxx` d'un résultat de `check_password` ;
+  - `ppp_test.secrets` : tous les mots de passe connus des tests ;
+  - `ppp_test.leaks()` : nombre de lignes d'audit/historique contenant un secret
+    connu (≥ 10 caractères) ou un vérificateur ; appelée à la fin de presque
+    chaque fichier, doit valoir 0.
+- `SET SESSION AUTHORIZATION` (et non `SET ROLE`) pour jouer un autre rôle :
+  les fonctions d'administration contrôlent `session_user`.
+
+### Liste des tests
+
+| fichier | couvre |
+|---|---|
+| `00_setup` | `CREATE EXTENSION`, tables/vues/colonnes, fonctions (langage, `SECURITY DEFINER`), aucun droit `PUBLIC`, rôles `pass_policy_admin`/`pass_policy_viewer`, profil `default` (valeurs SPEC §3.1), dictionnaire, tous les GUC et leur contexte, `worker_status()`, rôle `regress_legacy` créé avant l'extension (statut `unknown`) |
+| `10_profile` | `create/alter/drop_profile`, clés jsonb inconnues ou techniques, valeur invalide, tentative d'injection dans une clé, `assign/unassign_profile`, `effective_profile` (default par défaut, rôle inconnu), audit `profile_assigned`, refus de supprimer `default` ou un profil affecté |
+| `20_complexity` | chaque code `PPP-001`, `PPP-010` → `PPP-020` via `check_password` puis via de vrais `ALTER ROLE` (SQLSTATE 28P01), cas limites acceptés (12 et 128 caractères, 3 répétitions, espace interne), `check_password` sans effet de bord, `CREATE ROLE … PASSWORD` (refus et acceptation, OID complété après maintenance), `load_dictionary` insensible à la casse, profil assoupli, pré-haché SCRAM accepté si `reject_prehashed = false`, `require_scram` (MD5 pré-haché, `password_encryption = md5`), `enforce_database` (`\c postgres`, code `PPP-003`) |
+| `30_history` | `history_count = 3` (troncature, réutilisation `PPP-031`, sortie de l'historique), `history_count = 0`, `history_days`, `min_age` (`PPP-030`) pour un non-superutilisateur qui change son propre mot de passe, contournement par superutilisateur, complexité appliquée au changement par soi-même, historique 100 % SCRAM bien formé et sans clair |
+| `40_generate` | longueurs (défaut 24, 8 et 512 avec un profil large), bornes absolues (< 8, > 512) et bornes du profil, 200 tirages : 4 classes, aucun caractère ambigu `0O1lI|`, ASCII imprimable sans espace, tous distincts, conformes (`check_password` NULL) ; minima par classe d'un profil exigeant ; aucune écriture d'audit |
+| `50_rotation` | `rotate_password` : longueur, classes, mot de passe effectivement en place (réutilisation détectée), `role_state` (+30 j, +7 j), `rolvaliduntil = grace_until`, audit `password_rotated` sans le mot de passe, acteur ; longueur 32 ; erreurs ; nom de rôle à guillemets ; `expire_password` (must_change, VALID UNTIL, statut `expired`, `v_expiring`, audit) puis rotation qui remet en état |
+| `55_pair` | `create_rotation_pair` (groupe inexistant, rôle existant/créé, LOGIN, INHERIT, membres, doublon), trois `switch_rotation_pair` (alternance, `previous_valid_until` borné par `grace_period`, appliqué à `rolvaliduntil`, `rotation_pair` à jour), audit `pair_switched`, paire inconnue |
+| `60_lock_unlock` | `lock_role` manuel (`infinity`, `manual`, raison, `v_locked`, statut `locked`, shmem via `failed_attempts()`, audit), re-verrouillage, `unlock_role` (role_state, vue, shmem, audit), verrou de 1 s levé par `run_maintenance`, rôles inconnus, fonctions `shmem_*` |
+| `70_maintenance` | `expiry_warning` + `last_warned_at`, `expires_at`/`grace_until`, statuts `expired`/`grace`/`warning`/`never_expires`, `v_expiring`, `rolvaliduntil` et `valid_until_synced`, `password_expired` non dupliqué, valeur de retour sans secret, resynchronisation après `alter_profile`, purge d'un rôle supprimé, réconciliation du rôle antérieur à l'extension et d'un changement fait avec `enabled = off` (via `ALTER SYSTEM` + `pg_reload_conf()` : `enabled` est de contexte SIGHUP, `SET` est refusé) |
+| `80_audit` | `audit()` (acteur, base, détails, défaut `{}`, rôle NULL, type inconnu refusé), `v_recent_audit` limitée à 1000, `purge_audit` (défaut 365 j, seuil personnalisé), types d'événements ⊂ SPEC §3.6, aucun `PASSWORD `, `ALTER ROLE`, secret ni vérificateur dans l'audit |
+| `90_privileges` | utilisateur ordinaire : toutes les fonctions d'administration, `audit()`, `shmem_*`, `record_password_change` (autre rôle et soi-même), lecture/écriture des tables et vues → 42501 ; viewer : vues et tables en lecture, aucune écriture ni administration ; admin non superutilisateur : administration OK, mais pas sur un superutilisateur |
+| `99_teardown` | `DROP EXTENSION` (schéma supprimé, rôles admin/viewer conservés), suppression des rôles `regress_%`, réinstallation avec rôles déjà présents |
+
+LISTEN/NOTIFY n'est pas testable en pg_regress (psql affiche le PID émetteur et
+un horodatage) : voir `test/shell/notify.sh`.
+
+### Régénérer les fichiers attendus
+
+Les fichiers `test/expected/*.out` ont été produits sur PostgreSQL 16.4 avec
+l'état du code au moment de l'écriture des tests, puis relus. **Ils doivent être
+revus à chaque changement de comportement** :
+
+```sh
+make PG_CONFIG=… installcheck EXTRA_REGRESS_OPTS=--temp-instance=test/tmp_check
+less test/regression.diffs          # relire chaque différence
+cp test/results/*.out test/expected/   # seulement après revue
+```
+
+Ne jamais copier les résultats sans lire le diff : un `f` à la place d'un `t`
+ou un code PPP différent est un bogue, pas une mise à jour.
+
+Exception connue : `99_teardown.out` attend `schema = 0` après `DROP EXTENSION`
+(comportement voulu) ; tant que le schéma `pass_policy` créé par la clé
+`schema` du fichier `.control` survit à `DROP EXTENSION`, ce test échoue.
+
+## 2. Tests shell
+
+Chaque script démarre sa propre instance temporaire (`test/shell/common.sh`) :
+`initdb` dans `mktemp -d`, port TCP libre, `listen_addresses = 127.0.0.1`, pas
+de socket Unix, configuration = `test/pg_pass_policy.conf` + surcharges
+(`pg_pass_policy.database = postgres`, `worker_interval = 2`,
+`log_connections = on`), `pg_hba.conf` : superutilisateur de test en `trust`,
+tous les autres rôles en `scram-sha-256`. L'instance est arrêtée par un `trap
+EXIT` (y compris sur échec ou Ctrl-C) ; le log serveur est affiché en cas
+d'échec.
+
+```sh
+make PG_CONFIG=… install                 # préalable, non fait par les scripts
+PG_CONFIG=… test/shell/run-all.sh        # tous les scripts, récapitulatif
+PG_CONFIG=… test/shell/lockout.sh        # un seul script
+PPP_KEEP_TMP=1 PG_CONFIG=… test/shell/expiry.sh   # conserve données + log
+```
+
+| script | couvre |
+|---|---|
+| `lockout.sh` | rechargement shmem par le worker après `assign_profile`, 5 échecs puis refus « locked » même avec le bon mot de passe, `failed_attempts()`, audit `role_locked`/`auth_failed` écrit par le worker, déverrouillage automatique après `lock_duration = 5 s`, remise à zéro du compteur après un succès, `failure_window`, `lock_role`/`unlock_role` manuels persistants après un tour du worker, `exempt_roles`, échecs sur rôle inexistant |
+| `expiry.sh` | `max_age = 1 s` : le worker pose `rolvaliduntil = grace_until`, connexion refusée (côté client « password authentication failed », côté serveur « has an expired password »), audit `password_expired`, `v_role_status`/`v_expiring`, connexion avec le mot de passe de `rotate_password`, **absence du mot de passe généré dans le log serveur**, `expire_password` non annulé par le worker |
+| `notify.sh` | NOTIFY dans la même session (déterministe) et dans une autre session (écouteur en `pg_sleep`), charge utile JSON `event`/`role`/`at`/`details`, absence de mot de passe et de vérificateur, absence du mot de passe dans le log serveur, canal personnalisé `notify_channel` |
+
+Le mauvais mot de passe est toujours fourni explicitement (`PGPASSWORD`) : une
+connexion abandonnée avant l'envoi du mot de passe n'est pas comptée comme un
+échec (SPEC §11). PostgreSQL n'indique jamais au client que le mot de passe a
+expiré : `expiry.sh` le vérifie dans le log serveur.
+
+## 3. Matrice Docker (PostgreSQL 14 → 18)
+
+`docker/Dockerfile` (`ARG PG_MAJOR`, `ARG DEBIAN_SUITE=bookworm`) part de
+`postgres:${PG_MAJOR}-bookworm`, installe `build-essential` et
+`postgresql-server-dev-${PG_MAJOR}`, compile et installe l'extension en root
+puis lance `docker/test-in-container.sh` en utilisateur `postgres` :
+`make installcheck EXTRA_REGRESS_OPTS=--temp-instance=/tmp/ppp_regress` puis
+`test/shell/run-all.sh`. Pas de volume : `/tmp` est un tmpfs jeté à la fin.
+
+Les tags `postgres:14-bookworm` … `postgres:18-bookworm` existent (vérifié par
+`docker manifest inspect` en octobre 2026 ; `18-trixie` existe aussi :
+`DEBIAN_SUITE=trixie` pour l'utiliser).
+
+```sh
+docker compose -f docker/compose.yml config        # validation
+docker compose -f docker/compose.yml build pg17
+docker compose -f docker/compose.yml run --rm pg17
+docker/run-all.sh                 # 14 → 18 séquentiel, récapitulatif PASS/FAIL
+docker/run-all.sh -j              # en parallèle
+docker/run-all.sh 16 18           # sous-ensemble
+```
+
+Journaux par version dans `docker/logs/pgNN.log` ; code retour non nul si une
+version échoue. `docker/Dockerfile.dockerignore` exclut les objets compilés,
+les résultats de test et les répertoires `cli/target`, `web/.venv`.

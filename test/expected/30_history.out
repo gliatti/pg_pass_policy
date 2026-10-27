@@ -1,0 +1,212 @@
+--
+-- 30_history — historique anti-réutilisation (PPP-031) et min_age (PPP-030), SPEC §3.4, §6.2
+--
+\set VERBOSITY terse
+SET client_min_messages = warning;
+CREATE ROLE regress_hist LOGIN;
+SELECT pass_policy.create_profile('p_hist',
+         '{"history_count": 3, "history_days": 365, "min_age": "0"}') > 0 AS created;
+ created 
+---------
+ t
+(1 row)
+
+SELECT pass_policy.assign_profile('regress_hist', 'p_hist');
+ assign_profile 
+----------------
+ 
+(1 row)
+
+INSERT INTO ppp_test.secrets VALUES
+  ('hist1', 'History-One#2024'),
+  ('hist2', 'History-Two#2024'),
+  ('hist3', 'History-Three#2024'),
+  ('hist4', 'History-Four#2024'),
+  ('hist5', 'History-Five#2024');
+-- Quatre changements successifs
+ALTER ROLE regress_hist PASSWORD 'History-One#2024';
+ALTER ROLE regress_hist PASSWORD 'History-Two#2024';
+ALTER ROLE regress_hist PASSWORD 'History-Three#2024';
+ALTER ROLE regress_hist PASSWORD 'History-Four#2024';
+-- Historique tronqué à history_count, uniquement des vérificateurs SCRAM
+SELECT count(*) AS history_rows,
+       bool_and(verifier LIKE 'SCRAM-SHA-256$%') AS all_scram,
+       count(DISTINCT verifier) AS distinct_verifiers
+  FROM pass_policy.password_history WHERE role_name = 'regress_hist';
+ history_rows | all_scram | distinct_verifiers 
+--------------+-----------+--------------------
+            3 | t         |                  3
+(1 row)
+
+-- Le dernier vérificateur de l'historique correspond au mot de passe actuel :
+-- même schéma SCRAM (le sel peut différer de pg_authid, donc pas d'égalité stricte)
+SELECT count(*) AS changed_events FROM pass_policy.audit_log
+ WHERE role_name = 'regress_hist' AND event_type = 'password_changed';
+ changed_events 
+----------------
+              4
+(1 row)
+
+-- Réutilisation : les 3 derniers sont refusés, le 1er (sorti de l'historique) est accepté
+SELECT ppp_test.code(pass_policy.check_password('regress_hist', 'History-Four#2024')) AS reuse_4,
+       ppp_test.code(pass_policy.check_password('regress_hist', 'History-Three#2024')) AS reuse_3,
+       ppp_test.code(pass_policy.check_password('regress_hist', 'History-Two#2024')) AS reuse_2,
+       ppp_test.code(pass_policy.check_password('regress_hist', 'History-One#2024')) AS reuse_1;
+ reuse_4 | reuse_3 | reuse_2 | reuse_1 
+---------+---------+---------+---------
+ PPP-031 | PPP-031 | PPP-031 | 
+(1 row)
+
+ALTER ROLE regress_hist PASSWORD 'History-Four#2024';
+ERROR:  PPP-031: password was used recently
+SELECT ppp_test.try($$ALTER ROLE regress_hist PASSWORD 'History-Two#2024'$$) AS reuse_2;
+    reuse_2    
+---------------
+ 28P01 PPP-031
+(1 row)
+
+SELECT ppp_test.try($$ALTER ROLE regress_hist PASSWORD 'History-One#2024'$$) AS reuse_1;
+ reuse_1 
+---------
+ ok
+(1 row)
+
+-- Maintenant : historique = Three, Four, One → Two redevient utilisable
+SELECT ppp_test.code(pass_policy.check_password('regress_hist', 'History-Two#2024')) AS reuse_2,
+       ppp_test.code(pass_policy.check_password('regress_hist', 'History-One#2024')) AS reuse_1;
+ reuse_2 | reuse_1 
+---------+---------
+         | PPP-031
+(1 row)
+
+SELECT count(*) AS history_rows FROM pass_policy.password_history
+ WHERE role_name = 'regress_hist';
+ history_rows 
+--------------
+            3
+(1 row)
+
+-- history_count = 0 : historique désactivé, réutilisation permise
+SELECT pass_policy.alter_profile('p_hist', '{"history_count": 0}');
+ alter_profile 
+---------------
+ 
+(1 row)
+
+SELECT ppp_test.code(pass_policy.check_password('regress_hist', 'History-One#2024')) AS reuse_disabled;
+ reuse_disabled 
+----------------
+ 
+(1 row)
+
+SELECT pass_policy.alter_profile('p_hist', '{"history_count": 3}');
+ alter_profile 
+---------------
+ 
+(1 row)
+
+-- history_days : une entrée plus ancienne que history_days n'est plus comparée
+UPDATE pass_policy.password_history
+   SET changed_at = now() - interval '400 days'
+ WHERE role_name = 'regress_hist'
+   AND changed_at = (SELECT min(changed_at) FROM pass_policy.password_history
+                      WHERE role_name = 'regress_hist');
+SELECT ppp_test.code(pass_policy.check_password('regress_hist', 'History-Three#2024')) AS old_entry_ignored;
+ old_entry_ignored 
+-------------------
+ 
+(1 row)
+
+-- min_age : un non-superutilisateur ne peut pas changer deux fois dans l'intervalle.
+-- SET SESSION AUTHORIZATION : session_user et current_user deviennent regress_hist.
+SELECT pass_policy.alter_profile('p_hist', '{"min_age": "1 hour"}');
+ alter_profile 
+---------------
+ 
+(1 row)
+
+SET SESSION AUTHORIZATION regress_hist;
+SELECT current_user, session_user;
+ current_user | session_user 
+--------------+--------------
+ regress_hist | regress_hist
+(1 row)
+
+SELECT ppp_test.try($$ALTER ROLE regress_hist PASSWORD 'History-Five#2024'$$) AS min_age_user;
+ min_age_user  
+---------------
+ 28P01 PPP-030
+(1 row)
+
+ALTER ROLE regress_hist PASSWORD 'History-Five#2024';
+ERROR:  PPP-030: password was changed too recently
+RESET SESSION AUTHORIZATION;
+SELECT current_user = session_user AS back_to_superuser;
+ back_to_superuser 
+-------------------
+ t
+(1 row)
+
+-- check_password appelé par un superutilisateur : min_age ne s'applique pas
+SELECT ppp_test.code(pass_policy.check_password('regress_hist', 'History-Five#2024')) AS min_age_superuser_check;
+ min_age_superuser_check 
+-------------------------
+ 
+(1 row)
+
+-- Le superutilisateur contourne min_age
+SELECT ppp_test.try($$ALTER ROLE regress_hist PASSWORD 'History-Five#2024'$$) AS min_age_superuser;
+ min_age_superuser 
+-------------------
+ ok
+(1 row)
+
+-- min_age écoulé : le rôle peut changer lui-même son mot de passe
+UPDATE pass_policy.role_state
+   SET password_changed_at = now() - interval '2 hours'
+ WHERE role_name = 'regress_hist';
+SET SESSION AUTHORIZATION regress_hist;
+SELECT ppp_test.try($$ALTER ROLE regress_hist PASSWORD 'History-Six#2024x'$$) AS min_age_elapsed;
+ min_age_elapsed 
+-----------------
+ ok
+(1 row)
+
+RESET SESSION AUTHORIZATION;
+INSERT INTO ppp_test.secrets VALUES ('hist6', 'History-Six#2024x');
+-- … et la complexité s'applique aussi au rôle lui-même
+SET SESSION AUTHORIZATION regress_hist;
+SELECT ppp_test.try($$ALTER ROLE regress_hist PASSWORD 'weak'$$) AS self_weak;
+   self_weak   
+---------------
+ 28P01 PPP-010
+(1 row)
+
+RESET SESSION AUTHORIZATION;
+-- Jamais de clair : aucun vérificateur ne contient un mot de passe de test
+SELECT bool_and(verifier LIKE 'SCRAM-SHA-256$%') AS all_scram,
+       count(*) FILTER (WHERE verifier !~ '^SCRAM-SHA-256\$[0-9]+:[A-Za-z0-9+/=]+\$[A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+$') AS malformed
+  FROM pass_policy.password_history;
+ all_scram | malformed 
+-----------+-----------
+ t         |         0
+(1 row)
+
+SELECT ppp_test.leaks();
+ leaks 
+-------
+     0
+(1 row)
+
+SELECT pass_policy.unassign_profile('regress_hist');
+ unassign_profile 
+------------------
+ 
+(1 row)
+
+SELECT pass_policy.drop_profile('p_hist');
+ drop_profile 
+--------------
+ 
+(1 row)
+

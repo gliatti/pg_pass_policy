@@ -1,0 +1,13 @@
+# Lu par BuildKit pour docker/Dockerfile (contexte = racine du dépôt)
+.git
+**/*.o
+**/*.so
+**/*.bc
+test/results
+test/regression.diffs
+test/regression.out
+test/tmp_check
+docker/logs
+cli/target
+web/.venv
+web/**/__pycache__

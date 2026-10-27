@@ -1,0 +1,150 @@
+--
+-- 40_generate — generate_password() (SPEC §4, §8.6)
+--
+\set VERBOSITY terse
+SET client_min_messages = warning;
+CREATE ROLE regress_gen LOGIN;
+-- Profil large : min_length 8, max_length 512 (bornes absolues de generate_password)
+SELECT pass_policy.create_profile('p_gen_wide', '{"min_length": 8, "max_length": 512}') > 0 AS created;
+ created 
+---------
+ t
+(1 row)
+
+-- Longueurs
+SELECT length(pass_policy.generate_password()) AS default_len,
+       length(pass_policy.generate_password(12)) AS len_12,
+       length(pass_policy.generate_password(128)) AS len_128,
+       length(pass_policy.generate_password(8, 'p_gen_wide')) AS len_8,
+       length(pass_policy.generate_password(512, 'p_gen_wide')) AS len_512;
+ default_len | len_12 | len_128 | len_8 | len_512 
+-------------+--------+---------+-------+---------
+          24 |     12 |     128 |     8 |     512
+(1 row)
+
+-- Bornes absolues : length < 8 et > 512 refusés quel que soit le profil
+SELECT ppp_test.try($$SELECT pass_policy.generate_password(7, 'p_gen_wide')$$) <> 'ok' AS len_7_refused,
+       ppp_test.try($$SELECT pass_policy.generate_password(0)$$) <> 'ok' AS len_0_refused,
+       ppp_test.try($$SELECT pass_policy.generate_password(-1)$$) <> 'ok' AS len_neg_refused,
+       ppp_test.try($$SELECT pass_policy.generate_password(513, 'p_gen_wide')$$) <> 'ok' AS len_513_refused;
+ len_7_refused | len_0_refused | len_neg_refused | len_513_refused 
+---------------+---------------+-----------------+-----------------
+ t             | t             | t               | t
+(1 row)
+
+-- Longueur hors des bornes du profil (default : 12 → 128) : refusée, le
+-- mot de passe ne serait pas conforme
+SELECT ppp_test.try($$SELECT pass_policy.generate_password(8)$$) <> 'ok' AS below_profile_refused,
+       ppp_test.try($$SELECT pass_policy.generate_password(200)$$) <> 'ok' AS above_profile_refused;
+ below_profile_refused | above_profile_refused 
+-----------------------+-----------------------
+ t                     | t
+(1 row)
+
+-- Profil inconnu refusé
+SELECT ppp_test.try($$SELECT pass_policy.generate_password(24, 'no_such_profile')$$) <> 'ok' AS unknown_profile_refused;
+ unknown_profile_refused 
+-------------------------
+ t
+(1 row)
+
+-- 200 tirages : classes présentes, aucun caractère ambigu, uniquement imprimables,
+-- pas d'espace, tous différents
+CREATE TEMP TABLE gen AS
+  SELECT g, pass_policy.generate_password() AS pwd
+    FROM generate_series(1, 200) g;
+SELECT count(*) AS n,
+       count(DISTINCT pwd) AS distinct_n,
+       bool_and(length(pwd) = 24) AS all_len_24,
+       bool_and(pwd ~ '[a-z]') AS has_lower,
+       bool_and(pwd ~ '[A-Z]') AS has_upper,
+       bool_and(pwd ~ '[0-9]') AS has_digit,
+       bool_and(pwd ~ '[^a-zA-Z0-9]') AS has_special,
+       bool_and(pwd !~ '[0O1lI|]') AS no_ambiguous,
+       bool_and(pwd ~ '^[!-~]+$') AS printable_ascii_no_space
+  FROM gen;
+  n  | distinct_n | all_len_24 | has_lower | has_upper | has_digit | has_special | no_ambiguous | printable_ascii_no_space 
+-----+------------+------------+-----------+-----------+-----------+-------------+--------------+--------------------------
+ 200 |        200 | t          | t         | t         | t         | t           | t            | t
+(1 row)
+
+-- Deux appels successifs diffèrent
+SELECT pass_policy.generate_password() <> pass_policy.generate_password() AS differ;
+ differ 
+--------
+ t
+(1 row)
+
+-- Longueur minimale : les 4 classes tiennent dans 8 caractères
+SELECT bool_and(p ~ '[a-z]' AND p ~ '[A-Z]' AND p ~ '[0-9]' AND p ~ '[^a-zA-Z0-9]') AS classes_in_8
+  FROM (SELECT pass_policy.generate_password(8, 'p_gen_wide') AS p FROM generate_series(1, 100)) s;
+ classes_in_8 
+--------------
+ t
+(1 row)
+
+-- Conformité au profil default (check_password = NULL), y compris répétitions
+SELECT count(*) AS non_compliant
+  FROM gen WHERE pass_policy.check_password('regress_gen', pwd) IS NOT NULL;
+ non_compliant 
+---------------
+             0
+(1 row)
+
+-- Conformité à un profil exigeant (minima par classe)
+SELECT pass_policy.create_profile('p_gen',
+         '{"min_length": 20, "min_lower": 3, "min_upper": 3, "min_digit": 3,
+           "min_special": 3, "min_classes": 4}') > 0 AS created;
+ created 
+---------
+ t
+(1 row)
+
+SELECT pass_policy.assign_profile('regress_gen', 'p_gen');
+ assign_profile 
+----------------
+ 
+(1 row)
+
+CREATE TEMP TABLE gen2 AS
+  SELECT pass_policy.generate_password(20, 'p_gen') AS pwd
+    FROM generate_series(1, 100);
+SELECT bool_and(length(regexp_replace(pwd, '[^a-z]', '', 'g')) >= 3) AS lower_ok,
+       bool_and(length(regexp_replace(pwd, '[^A-Z]', '', 'g')) >= 3) AS upper_ok,
+       bool_and(length(regexp_replace(pwd, '[^0-9]', '', 'g')) >= 3) AS digit_ok,
+       bool_and(length(regexp_replace(pwd, '[a-zA-Z0-9]', '', 'g')) >= 3) AS special_ok,
+       count(*) FILTER (WHERE pass_policy.check_password('regress_gen', pwd) IS NOT NULL) AS non_compliant
+  FROM gen2;
+ lower_ok | upper_ok | digit_ok | special_ok | non_compliant 
+----------+----------+----------+------------+---------------
+ t        | t        | t        | t          |             0
+(1 row)
+
+-- generate_password n'écrit rien dans l'audit ni l'historique
+SELECT count(*) AS gen_events FROM pass_policy.audit_log
+ WHERE role_name = 'regress_gen'
+   AND event_type IN ('password_changed', 'password_rotated');
+ gen_events 
+------------
+          0
+(1 row)
+
+SELECT pass_policy.unassign_profile('regress_gen');
+ unassign_profile 
+------------------
+ 
+(1 row)
+
+SELECT pass_policy.drop_profile('p_gen');
+ drop_profile 
+--------------
+ 
+(1 row)
+
+SELECT pass_policy.drop_profile('p_gen_wide');
+ drop_profile 
+--------------
+ 
+(1 row)
+
+DROP TABLE gen, gen2;

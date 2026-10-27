@@ -20,3 +20,6 @@ cli/target/
 # divers
 *.swp
 .env
+test/results/
+test/tmp_check/
+docker/logs/

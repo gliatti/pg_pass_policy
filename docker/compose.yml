@@ -1,0 +1,56 @@
+# Matrice de test pg_pass_policy : PostgreSQL 14 → 18.
+#   docker compose -f docker/compose.yml build pg17
+#   docker compose -f docker/compose.yml run --rm pg17
+# ou docker/run-all.sh pour toute la matrice.
+# Aucun volume : chaque exécution part d'une instance temporaire jetable.
+name: pg_pass_policy_tests
+
+x-test: &test
+  user: postgres
+  command: ["bash", "docker/test-in-container.sh"]
+  shm_size: 256m
+  tmpfs:
+    - /tmp
+
+services:
+  pg14:
+    <<: *test
+    image: pg_pass_policy-test:14
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        PG_MAJOR: "14"
+  pg15:
+    <<: *test
+    image: pg_pass_policy-test:15
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        PG_MAJOR: "15"
+  pg16:
+    <<: *test
+    image: pg_pass_policy-test:16
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        PG_MAJOR: "16"
+  pg17:
+    <<: *test
+    image: pg_pass_policy-test:17
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        PG_MAJOR: "17"
+  pg18:
+    <<: *test
+    image: pg_pass_policy-test:18
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        PG_MAJOR: "18"
+        DEBIAN_SUITE: bookworm
