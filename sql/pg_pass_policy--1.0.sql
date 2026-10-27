@@ -359,10 +359,11 @@ LANGUAGE C STRICT VOLATILE;
 COMMENT ON FUNCTION shmem_reset_failures(text) IS 'Resets the shared-memory failure counter of a role';
 
 CREATE FUNCTION worker_status()
-RETURNS TABLE (pid int, last_run timestamptz, last_reload timestamptz, tracked_roles int)
+RETURNS TABLE (pid int, last_run timestamptz, last_reload timestamptz, tracked_roles int,
+               locks_loaded bool)
 AS 'MODULE_PATHNAME', 'ppp_worker_status'
 LANGUAGE C VOLATILE PARALLEL SAFE;
-COMMENT ON FUNCTION worker_status() IS 'State of the pg_pass_policy background worker';
+COMMENT ON FUNCTION worker_status() IS 'State of the pg_pass_policy background worker (locks_loaded: false while the start-up window refuses connections)';
 
 /*
  * Addition to SPEC §4: true only while this backend is executing the

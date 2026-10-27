@@ -140,6 +140,48 @@ fi
 out=$(sb_as regress_sb "$GOOD" "SELECT current_user") || true
 check_eq "standby : connexion initiale acceptée" "regress_sb" "$out"
 
+# --- standby : relance du premier rechargement (revue finale 8, constat 3) ---
+# role_state renommée sur le primaire (rejoué par le standby), standby
+# redémarré avec worker_interval = 3600 : son premier rechargement échoue et
+# la fenêtre de démarrage reste fermée. Une fois role_state rétablie, le
+# rechargement doit être retenté au plus 5 s plus tard (PPP_RETRY_SECS), et
+# non au bout de worker_interval.
+psql_admin "ALTER TABLE pass_policy.role_state RENAME TO role_state_hidden" >/dev/null
+sb_catch_up || fail "constat 3 : le standby n'a pas rejoué le renommage"
+echo "pg_pass_policy.worker_interval = 3600" >>"$SB_DATA/postgresql.conf"
+sb_log0=$(wc -l <"$PPP_TMP/standby.log")
+"$PPP_BINDIR/pg_ctl" -D "$SB_DATA" -l "$PPP_TMP/standby.log" -o "-p $SB_PORT" -w -t 60 restart >/dev/null
+sb_wait_worker 30 || fail "constat 3 : pas de worker sur le standby redémarré"
+deadline=$((SECONDS + 30))
+while [ "$SECONDS" -lt "$deadline" ]; do
+	tail -n "+$((sb_log0 + 1))" "$PPP_TMP/standby.log" | grep -q 'worker standby synchronisation failed' && break
+	sleep 0.5
+done
+check_eq "constat 3 : premier rechargement du standby en échec (locks_loaded = false)" "f" \
+	"$(sb_admin "SELECT locks_loaded FROM pass_policy.worker_status()")"
+out=$(sb_as regress_sb "$GOOD" "SELECT current_user") || true
+check_contains "constat 3 : fenêtre fermée sur le standby (57P03)" "lock state not loaded yet" "$out"
+psql_admin "ALTER TABLE pass_policy.role_state_hidden RENAME TO role_state" >/dev/null
+sb_catch_up || fail "constat 3 : le standby n'a pas rejoué le retour de role_state"
+t_start=$SECONDS
+deadline=$((SECONDS + 15))
+loaded=f
+while [ "$SECONDS" -lt "$deadline" ]; do
+	loaded=$(sb_admin "SELECT locks_loaded AND last_reload IS NOT NULL FROM pass_policy.worker_status()" 2>/dev/null || echo f)
+	[ "$loaded" = t ] && break
+	sleep 0.5
+done
+check_eq "constat 3 : rechargement retenté en moins de 10 s malgré worker_interval = 3600 ($((SECONDS - t_start)) s)" "t" \
+	"$( [ "$loaded" = t ] && [ $((SECONDS - t_start)) -lt 10 ] && echo t || echo f)"
+out=$(sb_as regress_sb "$GOOD" "SELECT current_user") || true
+check_eq "constat 3 : connexion acceptée sur le standby après le rechargement" "regress_sb" "$out"
+# retour à worker_interval = 2 (dernière ligne prioritaire) ; les échecs
+# provoqués ci-dessus ne comptent pas dans les vérifications suivantes
+echo "pg_pass_policy.worker_interval = 2" >>"$SB_DATA/postgresql.conf"
+sb_admin "SELECT pg_reload_conf()" >/dev/null
+sb_log0=$(wc -l <"$PPP_TMP/standby.log")
+pr_log0=$(wc -l <"$PPP_TMP/server.log")
+
 # --- verrou posé sur le primaire -> refusé sur le standby ---------------------
 psql_admin "SELECT pass_policy.lock_role('regress_sb', NULL, 'standby test')" >/dev/null
 sb_catch_up || fail "le standby n'a pas rejoué le verrou"
@@ -234,9 +276,9 @@ check_eq "F3 : perte d'audit journalisée (LOG)" "1" "$( [ "$n" -ge 1 ] && echo 
 psql_admin "SELECT pass_policy.alter_profile('default', '{\"max_failures\": 5, \"lock_duration\": \"30 minutes\"}')" >/dev/null
 
 # --- lecture seule : aucune erreur d'écriture du worker du standby -----------
-n=$(grep -cE 'pg_pass_policy: worker .* failed|read-only transaction' "$PPP_TMP/standby.log" || true)
+n=$(tail -n "+$((sb_log0 + 1))" "$PPP_TMP/standby.log" | grep -cE 'pg_pass_policy: worker .* failed|read-only transaction' || true)
 check_eq "standby : aucun échec de cycle du worker (aucune écriture tentée)" "0" "$n"
-n=$(grep -c 'pg_pass_policy: worker .* failed' "$PPP_TMP/server.log" || true)
+n=$(tail -n "+$((pr_log0 + 1))" "$PPP_TMP/server.log" | grep -c 'pg_pass_policy: worker .* failed' || true)
 check_eq "primaire : aucun échec de cycle du worker" "0" "$n"
 
 # --- promotion : les verrous locaux du standby sont audités ------------------
@@ -272,7 +314,7 @@ out=$(sb_admin "SELECT coalesce(sum((details->>'count')::int), 0) >= 2 FROM pass
 check_eq "nouveau primaire : échecs comptés sur le standby audités (auth_failed)" "t" "$out"
 out=$(sb_as regress_sb_auto "$GOOD") || true
 check_contains "nouveau primaire : le rôle reste verrouillé" "is locked by pg_pass_policy" "$out"
-n=$(grep -c 'pg_pass_policy: worker .* failed' "$PPP_TMP/standby.log" || true)
+n=$(tail -n "+$((sb_log0 + 1))" "$PPP_TMP/standby.log" | grep -c 'pg_pass_policy: worker .* failed' || true)
 check_eq "nouveau primaire : aucun échec de cycle du worker" "0" "$n"
 
 ppp_finish

@@ -602,9 +602,11 @@ ppp_auth_method_checks_secret(const Port *port)
  *   initialisation (ppp_shared->locks_loaded), the methods that check a
  *   secret are refused with FATAL 57P03 "lock state not loaded yet",
  *   whatever the status, and their failures are not counted (the answer is
- *   "retry" whatever the password).  Superusers are not refused that way
- *   (they get the real answer and their failures are counted), so that an
- *   installation whose worker never starts can still be administered; a
+ *   "retry" whatever the password).  Superusers are refused that way too,
+ *   unless the worker is demonstrably missing (no PID published
+ *   PPP_WORKER_MISSING_GRACE_SECS after the shared memory initialisation):
+ *   they then get the real answer and their failures are counted, so that
+ *   an installation whose worker never starts can still be administered; a
  *   lock present in shared memory still applies to them (SPEC 6.3,
  *   "Démarrage").
  */
@@ -619,6 +621,7 @@ ppp_client_auth_hook(Port *port, int status)
 	bool		log_not_loaded = false;
 	bool		log_worker_missing = false;
 	bool		check_window;
+	bool		worker_missing = false;
 	bool		is_superuser = false;
 	bool		just_locked = false;
 	bool		hash_full = false;
@@ -680,34 +683,35 @@ ppp_client_auth_hook(Port *port, int status)
 	 * does not tell a right password from a wrong one; such a failure is not
 	 * counted either, since the client is told to retry whatever the
 	 * password it sent, and a success does not reset the counter (see
-	 * below).  Superusers are let through (real answer, failures
-	 * counted): with exempt_roles empty, a worker that never starts would
-	 * otherwise lock every password login out, postgres included.  The
-	 * exempt roles (above) never reach this point.
+	 * below).  The exempt roles (above) never reach this point.
+	 *
+	 * Superusers are refused the same way during a normal start-up (worker
+	 * running, reload in progress or failing): a superuser locked by hand in
+	 * role_state stays out, and the answer does not tell a superuser name
+	 * from another one.  They are let through (real answer, failures
+	 * counted) only when no worker has published its PID long after the
+	 * shared memory was initialised: it was probably never started
+	 * (max_worker_processes exhausted: RegisterBackgroundWorker() does not
+	 * report it) or cannot connect (pg_pass_policy.database does not
+	 * exist).  With exempt_roles empty, such an installation would otherwise
+	 * lock every password login out, postgres included.  That situation is
+	 * logged at most once per PPP_WORKER_MISSING_LOG_SECS for the whole
+	 * instance.
 	 */
-	if (check_window && !ppp_shared->locks_loaded && !is_superuser)
+	if (check_window && !ppp_shared->locks_loaded)
 	{
-		not_loaded = true;
-		count_failure = false;
-	}
-
-	/*
-	 * No worker has published its PID long after the shared memory was
-	 * initialised: it was probably never started (max_worker_processes
-	 * exhausted: RegisterBackgroundWorker() does not report it) or cannot
-	 * connect (pg_pass_policy.database does not exist).  Warn, at most once
-	 * per PPP_WORKER_MISSING_LOG_SECS for the whole instance.
-	 */
-	if (check_window && !ppp_shared->locks_loaded &&
-		ppp_shared->worker_pid == 0 &&
-		TimestampDifferenceExceeds(ppp_shared->shmem_init_at, now,
-								   PPP_WORKER_MISSING_GRACE_SECS * 1000) &&
-		(ppp_shared->worker_missing_logged_at == 0 ||
-		 TimestampDifferenceExceeds(ppp_shared->worker_missing_logged_at, now,
-									PPP_WORKER_MISSING_LOG_SECS * 1000)))
-	{
-		ppp_shared->worker_missing_logged_at = now;
-		log_worker_missing = true;
+		worker_missing = (ppp_shared->worker_pid == 0 &&
+						  TimestampDifferenceExceeds(ppp_shared->shmem_init_at, now,
+													 PPP_WORKER_MISSING_GRACE_SECS * 1000));
+		if (!(is_superuser && worker_missing))
+		{
+			not_loaded = true;
+			count_failure = false;
+		}
+		if (worker_missing)
+			log_worker_missing = ppp_log_due(&ppp_shared->worker_missing_logged_at,
+											 now,
+											 PPP_WORKER_MISSING_LOG_SECS * 1000);
 	}
 
 	memset(&ev, 0, sizeof(ev));
@@ -806,22 +810,22 @@ ppp_client_auth_hook(Port *port, int status)
 	}
 
 	if (not_loaded)
-	{
-		if (ppp_shared->not_loaded_logged_at == 0 ||
-			TimestampDifferenceExceeds(ppp_shared->not_loaded_logged_at,
-									   now, 1000))
-		{
-			ppp_shared->not_loaded_logged_at = now;
-			log_not_loaded = true;
-		}
-	}
+		log_not_loaded = ppp_log_due(&ppp_shared->not_loaded_logged_at, now,
+									 1000);
 
 	LWLockRelease(ppp_shared->lock);
 
+	/*
+	 * Every message of this hook is LOG (server log only), except the FATAL
+	 * refusals below: they must not tell an unauthenticated client anything
+	 * about the internal state.  PostgreSQL itself only sends ERROR and
+	 * above to the client during authentication (ClientAuthInProgress), but
+	 * a WARNING would reach it should that ever change.
+	 */
 	ppp_log_eviction(&ev);
 	if (log_worker_missing)
-		ereport(WARNING,
-				(errmsg("pg_pass_policy worker has not loaded the lock state yet (worker_pid = 0)"),
+		ereport(LOG,
+				(errmsg(PPP_LOG_PREFIX "worker has not loaded the lock state yet (worker_pid = 0)"),
 				 errdetail("No pg_pass_policy background worker is running %d seconds after the shared memory initialisation; roles authenticating with a password or a secret are refused meanwhile (at most one message per minute).",
 						   PPP_WORKER_MISSING_GRACE_SECS),
 				 errhint("Check max_worker_processes and pg_pass_policy.database; superusers and roles listed in pg_pass_policy.exempt_roles can still connect.")));
@@ -867,11 +871,12 @@ ppp_client_auth_hook(Port *port, int status)
 			ereport(LOG,
 					(errmsg(PPP_LOG_PREFIX "refusing connections until the background worker has loaded the lock state"),
 					 errdetail("Roles authenticating with a password or a secret are refused until the persisted locks are re-injected from role_state (at most one message per second)."),
-					 errhint("Check that the pg_pass_policy background worker is running (pass_policy.worker_status()); superusers and roles listed in pg_pass_policy.exempt_roles can still connect.")));
+					 errhint("Check that the pg_pass_policy background worker is running (pass_policy.worker_status()); roles listed in pg_pass_policy.exempt_roles can still connect, superusers too once no worker has started for %d seconds.",
+							 PPP_WORKER_MISSING_GRACE_SECS)));
 		ereport(FATAL,
 				(errcode(ERRCODE_CANNOT_CONNECT_NOW),
 				 errmsg(PPP_LOG_PREFIX "lock state not loaded yet, retry"),
-				 errdetail("The server has just started and the pg_pass_policy background worker has not loaded the persisted locks yet.")));
+				 errdetail("The server has just started; retry in a few seconds.")));
 	}
 }
 

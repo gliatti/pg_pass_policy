@@ -230,19 +230,7 @@ ppp_rethrow_hidden(MemoryContext cxt)
 static void
 ppp_untrusted_error(Oid nspowner)
 {
-	char	   *detail;
-
-	if (!OidIsValid(nspowner))
-		detail = pstrdup("Schema \"" PPP_SCHEMA "\" does not exist or does not hold the objects of extension pg_pass_policy.");
-	else if (!superuser_arg(nspowner))
-	{
-		const char *owner = GetUserNameFromId(nspowner, true);
-
-		detail = psprintf("Schema \"" PPP_SCHEMA "\" is owned by role \"%s\", which is not a superuser.",
-						  owner ? owner : "?");
-	}
-	else
-		detail = pstrdup("The objects of extension pg_pass_policy are not in schema \"" PPP_SCHEMA "\".");
+	char	   *detail = ppp_untrusted_detail(nspowner);
 
 	ereport(ERROR,
 			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),

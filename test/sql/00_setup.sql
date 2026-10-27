@@ -121,6 +121,9 @@ SELECT name, context FROM pg_settings
 
 -- Worker : une seule ligne, le pid peut être NULL selon le timing de démarrage
 SELECT count(*) AS worker_rows FROM pass_policy.worker_status();
+-- Colonnes de worker_status() : locks_loaded indique si la fenêtre de
+-- démarrage est fermée (revue finale 8)
+SELECT pg_get_function_result('pass_policy.worker_status()'::regprocedure) AS worker_status_columns;
 -- Le worker démarre dès l'état cohérent, avant que pg_regress ait créé
 -- contrib_regression : ce premier démarrage échoue (FATAL « database does not
 -- exist ») et il revient après bgw_restart_time (10 s, plus sous charge).

@@ -12,6 +12,7 @@
 #include "port/atomics.h"
 #include "storage/lwlock.h"
 #include "utils/hsearch.h"
+#include "utils/timestamp.h"
 #include "utils/tuplestore.h"
 
 #define PPP_SCHEMA        "pass_policy"
@@ -44,8 +45,9 @@ extern bool  ppp_enforce_database;
 /*
  * Fail-closed start-up window (SPEC 6.3, "Démarrage"): once the shared
  * memory has been initialised for that long without any worker having
- * published its PID, the authentication hook warns (at most once per
- * PPP_WORKER_MISSING_LOG_SECS) that the worker is probably not running.
+ * published its PID, the worker is considered missing: the authentication
+ * hook logs it (at most once per PPP_WORKER_MISSING_LOG_SECS) and lets the
+ * superusers through (the other non-exempt roles stay refused).
  */
 #define PPP_WORKER_MISSING_GRACE_SECS	10
 #define PPP_WORKER_MISSING_LOG_SECS		60
@@ -210,12 +212,14 @@ typedef struct pppSharedState
 	 * shared memory initialisation until the worker has re-injected the
 	 * persisted locks (ppp_sync_reload), or found that the extension is not
 	 * installed in pg_pass_policy.database (nothing to re-inject).  Until
-	 * then the authentication hook refuses the non-exempt, non-superuser
-	 * roles that authenticate with a secret (57P03), and does not count
-	 * their failures.  not_loaded_logged_at limits its LOG to one per second
+	 * then the authentication hook refuses the non-exempt roles that
+	 * authenticate with a secret (57P03), and does not count their
+	 * failures; superusers are let through only while the worker is
+	 * demonstrably missing (worker_pid = 0 PPP_WORKER_MISSING_GRACE_SECS
+	 * after shmem_init_at).  not_loaded_logged_at limits its LOG to one per second
 	 * across all backends.  shmem_init_at is the time of the shared memory
 	 * initialisation; worker_missing_logged_at limits to one per minute the
-	 * WARNING of the hook when no worker has published its PID
+	 * LOG of the hook when no worker has published its PID
 	 * (worker_pid = 0) PPP_WORKER_MISSING_GRACE_SECS after it: the worker
 	 * was never started (max_worker_processes exhausted) or cannot connect
 	 * (pg_pass_policy.database does not exist).
@@ -286,6 +290,11 @@ typedef enum pppExtensionState
 } pppExtensionState;
 
 extern pppExtensionState ppp_extension_state(Oid *nspowner);
+/*
+ * Why an installed extension is not trusted, for an errdetail (palloc'd):
+ * nspowner as returned by ppp_extension_state().  Requires a transaction.
+ */
+extern char *ppp_untrusted_detail(Oid nspowner);
 
 /*
  * Common start of a materialize-mode set-returning function: checks the
@@ -352,6 +361,20 @@ ppp_is_locked(const pppRoleEntry *entry, TimestampTz now)
 	if (entry->locked_until == DT_NOEND)
 		return true;
 	return entry->locked_until > now;
+}
+
+/*
+ * Rate limiter of a message: true (and *last set to now) when no message was
+ * emitted yet (*last = 0) or the last one is at least msec old.  The caller
+ * serialises the access to *last (ppp_shared->lock for the shared ones).
+ */
+static inline bool
+ppp_log_due(TimestampTz *last, TimestampTz now, int msec)
+{
+	if (*last != 0 && !TimestampDifferenceExceeds(*last, now, msec))
+		return false;
+	*last = now;
+	return true;
 }
 
 /* ---- worker.c ---------------------------------------------------------- */

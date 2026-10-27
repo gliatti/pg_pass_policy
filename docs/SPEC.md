@@ -176,7 +176,7 @@ dans `format('%I')` / `quote_ident()` : aucune concaténation brute.
 | `shmem_lock_role(role text, until timestamptz)` | void | **C** — `until` NULL = manuel (DT_NOEND) ; écriture shmem différée au COMMIT (annulée par ROLLBACK / ROLLBACK TO SAVEPOINT) |
 | `shmem_unlock_role(role text, expired_only boolean DEFAULT false)` | void | **C** — différée au COMMIT ; ne lève pas un verrou automatique posé après la demande ; `expired_only` : ne lève qu'un verrou expiré (étape f de `run_maintenance()`) |
 | `shmem_reset_failures(role text)` | void | **C** — différée au COMMIT |
-| `worker_status()` | TABLE(pid int, last_run timestamptz, last_reload timestamptz, tracked_roles int) | **C** |
+| `worker_status()` | TABLE(pid int, last_run timestamptz, last_reload timestamptz, tracked_roles int, locks_loaded bool) | **C** — `locks_loaded` : faux tant que la fenêtre de démarrage refuse les connexions (§6.3, « Démarrage ») |
 
 Règles communes à l'API :
 
@@ -315,7 +315,7 @@ static void ppp_client_auth_hook(Port *port, int status);
 5. si `locked_until > now` (ou `DT_NOEND`) → `ereport(FATAL, (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION), errmsg("role \"%s\" is locked by pg_pass_policy"), errdetail("locked until %s")))` — **même si status == STATUS_OK** ;
 6. si `status == STATUS_OK` → `failed_count = 0` ;
 7. sinon (`STATUS_ERROR` d'une méthode qui vérifie un mot de passe ou un secret uniquement, voir « Méthodes comptées » ci-dessous et §11) : si la fenêtre est écoulée (`ppp_window_elapsed()`) → repartir à 0 ; incrémenter ; si `failed_count >= max_failures` et `max_failures > 0` → `locked_until = now + lock_duration` (ou `DT_NOEND`), `lock_pending_audit = true`, `audit_locked_until = locked_until`, `audit_lock_seq++` (numéro d'épisode ; `audit_acked_seq` rattrapé s'il n'y avait rien en attente), `ereport(LOG, "pg_pass_policy: role \"%s\" locked after %d failed attempts")` ;
-8. si le rôle n'est pas refusé à l'étape 5, que `ppp_shared->locks_loaded` est faux, que la méthode vérifie un secret (`ppp_auth_method_checks_secret()`) et que le rôle n'est pas superutilisateur (`rolsuper`) → refus « état non chargé », **quel que soit le statut**, et les étapes 6 et 7 sont sautées : l'entrée n'est pas modifiée (voir « Démarrage » ci-dessous) ; `LWLockRelease` ; le FATAL `57P03` est levé après le hook précédent, comme celui de l'étape 5.
+8. si le rôle n'est pas refusé à l'étape 5, que `ppp_shared->locks_loaded` est faux, que la méthode vérifie un secret (`ppp_auth_method_checks_secret()`) et que le rôle n'est pas un superutilisateur (`rolsuper`) alors que le worker est démontrablement absent (voir « Démarrage ») → refus « état non chargé », **quel que soit le statut**, et les étapes 6 et 7 sont sautées : l'entrée n'est pas modifiée (voir « Démarrage » ci-dessous) ; `LWLockRelease` ; le FATAL `57P03` est levé après le hook précédent, comme celui de l'étape 5.
 
 **Méthodes comptées.** Seuls les échecs des méthodes où le client présente
 un mot de passe ou un secret sont comptés : `password`, `md5`,
@@ -498,10 +498,12 @@ worker), rien n'est acquitté et le tour suivant repart de valeurs fraîches. Le
 remplacé (`lock_role()`) avant le passage du worker : ni `PPP_OP_UNLOCK`, ni
 `PPP_OP_LOCK`, ni le rechargement n'effacent `lock_pending_audit` ; la copie
 vers `role_state` n'est faite que si `locked_until = audit_locked_until`
-(sinon `details.lifted_before_audit = true` si l'entrée n'est plus
-verrouillée, ou `details.replaced_by_manual = true` si elle porte un autre
-verrou actif : `lock_role()` ou verrou réinjecté depuis `role_state`, d'après
-`ppp_is_locked()` lors de la copie). Les entrées `role_missing` ne
+(sinon `details.lifted_before_audit = true` si le verrou a été levé,
+`locked_until` effacé, ou `details.replaced_by_manual = true` si l'entrée
+porte un autre verrou : `lock_role()` ou verrou réinjecté depuis
+`role_state`, d'après `locked_until` non nul lors de la copie, que ce
+verrou soit encore actif ou déjà expiré ; un verrou expiré est conservé
+dans l'entrée tant que l'audit est en attente, `ppp_expire_lock()`). Les entrées `role_missing` ne
 produisent pas une ligne par nom : une seule ligne `auth_failed` par tour,
 `role_name` NULL, `details = {"unknown_roles": n, "attempts": total,
 "pseudo_locks": k, "last_failure_at": …, "source": "auth_hook"}` (un seul
@@ -540,8 +542,8 @@ réinjection. D'où deux mesures :
   attente éventuelle du verrou consultatif tenu par pg_cron) et l'étape
   d'audit ;
 - tant que `ppp_shared->locks_loaded` est faux, le hook refuse les rôles non
-  exemptés et non superutilisateurs authentifiés par une méthode à secret
-  (étape 8) :
+  exemptés authentifiés par une méthode à secret, superutilisateurs compris
+  sauf worker absent (étape 8 et point suivant) :
   `ereport(FATAL, (errcode(ERRCODE_CANNOT_CONNECT_NOW), errmsg("pg_pass_policy: lock state not loaded yet, retry")))`
   (SQLSTATE `57P03`, celui de « the database system is starting up » : les
   clients et les pools le traitent comme un refus temporaire). Le refus vaut
@@ -555,24 +557,36 @@ réinjection. D'où deux mesures :
   mauvais » révélerait, par le « locked » qui suit la fenêtre, si le
   candidat était le bon mot de passe). Un verrou déjà présent en shmem (posé
   par le hook) garde la priorité : FATAL « locked » de l'étape 5 ;
-- les **superutilisateurs** ne reçoivent jamais le `57P03` : ils obtiennent
-  la vraie réponse, leurs échecs sont comptés et ils restent soumis au FATAL
-  « locked » d'un verrou présent en shmem. Sans cela, avec `exempt_roles`
-  vide (défaut), une installation dont le worker ne démarre jamais refuserait
-  toutes les connexions par mot de passe, `postgres` compris. Contrepartie
-  acceptée (§12) : pendant la fenêtre, la réponse distingue un nom de
-  superutilisateur d'un autre nom ;
-- `RegisterBackgroundWorker()` ne signale pas un refus (`max_worker_processes`
-  épuisé), et `_PG_init` ne peut pas savoir s'il restera une place. Le hook
-  émet donc, tant que `locks_loaded` est faux et qu'aucun worker n'a publié
-  son PID (`worker_pid = 0`) plus de `PPP_WORKER_MISSING_GRACE_SECS` (10 s)
-  après l'initialisation de la shmem (`ppp_shared->shmem_init_at`), un
-  `WARNING` « pg_pass_policy worker has not loaded the lock state yet
+- **worker absent** : `RegisterBackgroundWorker()` ne signale pas un refus
+  (`max_worker_processes` épuisé), et `_PG_init` ne peut pas savoir s'il
+  restera une place. Le worker est tenu pour absent quand aucun worker n'a
+  publié son PID (`worker_pid = 0`) plus de `PPP_WORKER_MISSING_GRACE_SECS`
+  (10 s) après l'initialisation de la shmem (`ppp_shared->shmem_init_at`) :
+  jamais démarré, ou incapable de se connecter (`pg_pass_policy.database`
+  inexistante). Dans ce cas seulement, les **superutilisateurs** ne reçoivent
+  plus le `57P03` : ils obtiennent la vraie réponse, leurs échecs sont
+  comptés et ils restent soumis au FATAL « locked » d'un verrou présent en
+  shmem. Sans cela, avec `exempt_roles` vide (défaut), une installation dont
+  le worker ne démarre jamais refuserait toutes les connexions par mot de
+  passe, `postgres` compris. Pendant un démarrage normal (worker présent,
+  rechargement en cours ou en échec), ils sont refusés comme les autres : un
+  superutilisateur verrouillé à la main dans `role_state` reste dehors, et la
+  réponse ne distingue pas un nom de superutilisateur d'un autre nom
+  (l'oracle résiduel n'existe que worker absent, §12). Le hook écrit alors
+  un `LOG` « pg_pass_policy: worker has not loaded the lock state yet
   (worker_pid = 0) » (HINT : vérifier `max_worker_processes` et
   `pg_pass_policy.database`), au plus une fois par minute pour toute
-  l'instance (`ppp_shared->worker_missing_logged_at`). Il n'est écrit que
-  dans le log : pendant l'authentification, PostgreSQL n'envoie au client
-  que les messages de niveau ERROR et plus.
+  l'instance (`ppp_shared->worker_missing_logged_at`) ;
+- **rien n'est dit au client** : hormis les FATAL de refus (« locked »,
+  `57P03` dont le DETAIL se borne à « The server has just started; retry in
+  a few seconds. »), tous les messages du hook sont de niveau `LOG` (log
+  serveur seulement), sans mention du worker ni de `exempt_roles`.
+  PostgreSQL n'envoie déjà au client, pendant l'authentification
+  (`ClientAuthInProgress`), que les messages de niveau ERROR et plus
+  (`should_output_to_client()`, vérifié dans 16.4) ; le niveau `LOG` ne
+  dépend pas de ce filtre. Les limiteurs « au plus une fois par N s » du
+  hook et du worker passent par `ppp_log_due(&last, now, msec)`
+  (`pg_pass_policy.h`).
 
 `locks_loaded` passe à vrai à la fin de `ppp_sync_reload()` (en même temps que
 `worker_last_reload`) **si tous les verrous de `role_state` ont été
@@ -581,7 +595,8 @@ fenêtre fermée, avec un LOG « %d persisted locks could not be loaded in
 shared memory: connections stay refused », et le rechargement reste en
 attente (`ppp_sync_reload()` renvoie faux), retenté au tour suivant. Un
 profil sans place ne retient pas la fenêtre (le rôle est compté avec les
-valeurs par défaut). `locks_loaded` passe aussi à vrai dès que le worker
+valeurs par défaut). Ce LOG est écrit au plus une fois par minute (le
+rechargement, lui, est retenté toutes les 5 s). `locks_loaded` passe aussi à vrai dès que le worker
 constate que l'extension n'est **pas installée** dans
 `pg_pass_policy.database` (`PPP_EXT_ABSENT` : aucun verrou persistant à
 réinjecter ; sans cela, aucun rôle non exempté ne pourrait se connecter
@@ -589,12 +604,22 @@ avant `CREATE EXTENSION`) ; la demande de rechargement et `ppp_sync_first`
 sont alors effacées (rien à recharger : pas de transaction de
 synchronisation supplémentaire à chaque tour ; après `CREATE EXTENSION`,
 `run_maintenance()` demande le rechargement). Une extension présente mais
-non fiable (`PPP_EXT_UNTRUSTED`) laisse la fenêtre fermée. Il n'est remis à
-faux que par l'initialisation de la shmem.
+non fiable (`PPP_EXT_UNTRUSTED` : schéma `pass_policy` cédé à un
+non-superutilisateur, par exemple) laisse la fenêtre fermée ; le worker
+l'écrit en `WARNING` « extension in database "x" is not trusted, the worker
+does nothing », DETAIL nommant le propriétaire du schéma
+(`ppp_untrusted_detail()`, partagé avec PPP-004), au plus une fois par
+minute. Il n'est remis à faux que par l'initialisation de la shmem ;
+`worker_status().locks_loaded` l'expose.
 
 Tant que la fenêtre est fermée (ou, avec `worker_interval = 0`, tant qu'un
 rechargement est en attente), le worker se réveille au plus
-`PPP_RETRY_SECS` (5 s) plus tard, quel que soit `worker_interval`.
+`PPP_RETRY_SECS` (5 s) plus tard, quel que soit `worker_interval`, sur un
+standby comme sur un primaire. Sur un primaire, tant que la synchronisation
+de tête (`ppp_sync_first`) échoue, ces réveils ne refont que cette
+synchronisation : le tour complet (maintenance, audit, seconde
+synchronisation) garde le rythme de `worker_interval` (premier tour,
+demande `shmem_reload()` ou SIGHUP compris).
 
 Cas particuliers :
 
@@ -614,24 +639,24 @@ Cas particuliers :
   (fail-closed) ; les superutilisateurs, les rôles de
   `pg_pass_policy.exempt_roles` (typiquement `postgres`) et les méthodes sans
   secret (`peer`, `trust`, `cert`…) passent toujours : c'est le filet de
-  sécurité de l'administrateur. Le WARNING « worker_pid = 0 » (worker jamais
-  démarré), le LOG limité à une ligne par seconde et
-  `worker_status().last_reload` NULL (ou `pid` NULL) signalent la
-  situation.
+  sécurité de l'administrateur, avec les superutilisateurs quand le worker
+  est absent (ci-dessus). Le LOG « worker_pid = 0 » (worker jamais démarré),
+  le LOG limité à une ligne par seconde, `worker_status().locks_loaded` faux
+  et `last_reload` NULL (ou `pid` NULL) signalent la situation.
 
 ### 6.4 Worker (`worker.c`)
 
 - enregistré dans `_PG_init` via `RegisterBackgroundWorker` (`BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION`, `BgWorkerStart_ConsistentState` pour tourner aussi sur un hot standby, `bgw_restart_time = 10`) ;
 - `ppp_worker_main` : `BackgroundWorkerInitializeConnection(ppp_database, NULL, 0)` puis `search_path = pg_catalog, pg_temp` (le worker est superutilisateur : toutes ses requêtes sont qualifiées, `pg_catalog.jsonb_build_object` compris), boucle `WaitLatch` avec `ppp_worker_interval` ; sur `reload_requested` ou SIGHUP → tour immédiat ;
 - la base `pg_pass_policy.database` doit exister au démarrage : sinon `BackgroundWorkerInitializeConnection` lève le FATAL standard « database "x" does not exist » et le postmaster relance le worker toutes les 10 s (comportement standard des bgworkers, identique à pg_cron) ; le GUC étant `postmaster`, corriger puis redémarrer ;
-- premier tour d'un primaire après le démarrage, après une promotion ou après le retour de `enabled` à `on` (`ppp_sync_first`) : synchronisation shmem (nettoyage + rechargement **forcé**) **avant** `run_maintenance()` et l'étape d'audit, pour que les verrous de `role_state` soient réinjectés sans attendre une passe de maintenance (§6.3, « Démarrage ») ; la demande de rechargement est consommée, `run_maintenance()` en fait une nouvelle, servie par la synchronisation de fin de tour. En cas d'échec (erreur, verrous de `role_state` qui ne tiennent pas tous dans le hash), le tour suivant recommence par là, au plus 5 s plus tard tant que la fenêtre de démarrage est fermée ; une extension absente efface la demande (rien à recharger, §6.3) ;
+- premier tour d'un primaire après le démarrage, après une promotion ou après le retour de `enabled` à `on` (`ppp_sync_first`) : synchronisation shmem (nettoyage + rechargement **forcé**) **avant** `run_maintenance()` et l'étape d'audit, pour que les verrous de `role_state` soient réinjectés sans attendre une passe de maintenance (§6.3, « Démarrage ») ; la demande de rechargement est consommée, `run_maintenance()` en fait une nouvelle, servie par la synchronisation de fin de tour. En cas d'échec (erreur, verrous de `role_state` qui ne tiennent pas tous dans le hash), le tour suivant recommence par là, au plus 5 s plus tard tant que la fenêtre de démarrage est fermée ; ces relances ne refont que la synchronisation, le tour complet restant au rythme de `worker_interval` (§6.3) ; une extension absente efface la demande (rien à recharger, §6.3) ;
 - chaque tour : `StartTransactionCommand` → si l'extension n'est pas installée (`get_extension_oid("pg_pass_policy", true) == InvalidOid`) → attendre ; sinon `SPI_execute("SELECT * FROM pass_policy.run_maintenance()")`, puis synchronisation shmem (§6.3) ; `CommitTransactionCommand`. `run_maintenance()` prend `pg_advisory_xact_lock(hashtext('pg_pass_policy.run_maintenance'))` en tête : une passe du worker, de pg_cron ou manuelle attend la fin d'une passe concurrente au lieu d'agir sur les mêmes lignes (audits et NOTIFY en double) ;
 - l'étape d'audit regroupe les noms inexistants (`role_missing`) en une ligne `auth_failed` par tour (§6.3) : un flot de noms inventés ne produit plus une ligne et un NOTIFY par nom ;
-- sur un hot standby (`RecoveryInProgress()`), tour en **lecture seule** (`ppp_worker_cycle_standby`) : ni `run_maintenance()` ni l'étape d'audit en attente (elles écrivent) ; les échecs et verrous comptés localement par le hook **ne sont pas acquittés** : `pending_failures` et `lock_pending_audit` restent posés (les entrées de vrais rôles concernées ne sont alors pas évincables par le hook, c'est voulu, sauf celles dont le verrou a expiré : sur un standby leur audit est aussitôt « périmé » et elles redeviennent évincables, voir « Perte bornée » §6.3 ; un verrou local expiré n'est pas effacé par le worker mais ne bloque plus, voir « verrou expiré » §6.3) et le premier tour après promotion les écrit dans `audit_log` et `role_state`. Puis nettoyage + rechargement **forcé à chaque tour** (`shmem_reload()` du primaire ne peut pas atteindre le worker du standby) : SELECT uniquement, dans une transaction que PostgreSQL force en lecture seule pendant la récupération. Intervalle : `worker_interval`, 60 s s'il vaut 0 (le standby doit sonder, rien ne le réveille). Un verrou réinjecté depuis `role_state` (`lock_from_state`) qui n'y figure plus est levé (unlock ou expiration sur le primaire) ; les verrous posés localement (hook, ou `shmem_lock_role()` sur le standby) ne sont pas levés par le rechargement : ils expirent selon `lock_duration`, ou un superutilisateur appelle `pass_policy.shmem_unlock_role()` sur le standby (fonctionne en lecture seule). Après promotion, le tour suivant est un tour normal avec audit des échecs et verrous en attente et rechargement complet ;
+- sur un hot standby (`RecoveryInProgress()`), tour en **lecture seule** (`ppp_worker_cycle_standby`) : ni `run_maintenance()` ni l'étape d'audit en attente (elles écrivent) ; les échecs et verrous comptés localement par le hook **ne sont pas acquittés** : `pending_failures` et `lock_pending_audit` restent posés (les entrées de vrais rôles concernées ne sont alors pas évincables par le hook, c'est voulu, sauf celles dont le verrou a expiré : sur un standby leur audit est aussitôt « périmé » et elles redeviennent évincables, voir « Perte bornée » §6.3 ; un verrou local expiré n'est pas effacé par le worker mais ne bloque plus, voir « verrou expiré » §6.3) et le premier tour après promotion les écrit dans `audit_log` et `role_state`. Puis nettoyage + rechargement **forcé à chaque tour** (`shmem_reload()` du primaire ne peut pas atteindre le worker du standby) : SELECT uniquement, dans une transaction que PostgreSQL force en lecture seule pendant la récupération. Intervalle : `worker_interval`, 60 s s'il vaut 0 (le standby doit sonder, rien ne le réveille) ; tant que la fenêtre de démarrage est fermée (premier rechargement en échec), au plus 5 s. Un verrou réinjecté depuis `role_state` (`lock_from_state`) qui n'y figure plus est levé (unlock ou expiration sur le primaire) ; les verrous posés localement (hook, ou `shmem_lock_role()` sur le standby) ne sont pas levés par le rechargement : ils expirent selon `lock_duration`, ou un superutilisateur appelle `pass_policy.shmem_unlock_role()` sur le standby (fonctionne en lecture seule). Après promotion, le tour suivant est un tour normal avec audit des échecs et verrous en attente et rechargement complet ;
 - `pg_pass_policy.enabled = off` (`ppp_worker_suspended()`) : le tour entier est sauté, sur le primaire comme sur un standby (ni `run_maintenance()`, ni écriture d'audit ou de `role_state`, ni nettoyage ni rechargement de la shmem ; `worker_status().last_run` et `last_reload` n'avancent plus). Les échecs et verrous en attente restent en shmem (entrées `PENDING_AUDIT` / `KEEP`, éviction selon §6.3) ; une demande `shmem_reload()` est mémorisée. Le premier tour après le retour à `on` fait tout, avec un rechargement forcé (profils ou `role_state` ont pu changer, restauration par exemple). Un LOG à chaque transition (« worker suspended » / « worker resumed ») ;
 - sans `hot_standby`, aucune connexion n'est acceptée pendant la récupération : le worker démarre à la fin de celle-ci ;
 - `pg_pass_policy.worker_interval = 0` → après un premier tour au démarrage (synchronisation shmem seule, avec rechargement : il ferme la fenêtre fail-closed de §6.3), le worker dort indéfiniment (réveil sur SIGHUP ou `shmem_reload()`) ; tant que ce rechargement n'a pas réussi (fenêtre fermée ou rechargement en attente), il est retenté toutes les 5 s (`PPP_RETRY_SECS`) ;
-- `RegisterBackgroundWorker()` ne signale pas un refus faute de place (`max_worker_processes`) : le hook d'authentification le détecte (`worker_pid = 0`) et le signale par un WARNING limité (§6.3, « Démarrage »).
+- `RegisterBackgroundWorker()` ne signale pas un refus faute de place (`max_worker_processes`) : le hook d'authentification le détecte (`worker_pid = 0`) et le signale par un LOG limité (§6.3, « Démarrage »).
 
 ### 6.5 Compatibilité (`compat.h`)
 
@@ -808,6 +833,7 @@ basic ou en-tête reverse-proxy (`REMOTE_USER`), rôle PG dédié membre de
 - (revue finale 5) K5 — `rotate_password()` relisait `effective_profile()` après `_rotate_role()` pour le seul nom du profil de l'audit : un `assign_profile()` concurrent pouvait faire journaliser un autre profil que celui utilisé pour générer le mot de passe. `_rotate_role()` renvoie `OUT password text, OUT profile text` : une seule lecture, audit cohérent ; `switch_rotation_pair()` ne lit que `password`.
 - (revue finale 6) Sécurité (Medium) — fenêtre d'ouverture au démarrage : le hash shmem est vide après un démarrage du postmaster, et le premier tour du worker exécutait `run_maintenance()` (passe complète, plus l'attente du verrou consultatif si pg_cron tourne) et l'étape d'audit **avant** `ppp_sync_reload()`, qui réinjecte `role_state.locked_until`. Pendant cette fenêtre, tout rôle verrouillé (verrou manuel `infinity` d'un compte compromis compris) pouvait s'authentifier, et la session obtenue survivait à la réinjection. Corrections : (1) `ppp_sync_first` (`worker.c`) : au premier tour, après promotion et après le retour de `enabled` à `on`, nettoyage + rechargement forcé d'abord, maintenance et audit ensuite (§6.4) ; (2) fail-closed dans le hook : nouveaux champs `pppSharedState.locks_loaded` et `not_loaded_logged_at` ; tant que `locks_loaded` est faux, les rôles non exemptés authentifiés par une méthode à secret reçoivent `FATAL 57P03` « pg_pass_policy: lock state not loaded yet, retry », bon ou mauvais mot de passe, avec un LOG au plus une fois par seconde ; `locks_loaded` est posé par `ppp_sync_reload()` ou quand l'extension est absente de `pg_pass_policy.database` (`PPP_EXT_ABSENT`, rien à réinjecter) ; `enabled = off` ne bloque pas (hook inactif), `worker_interval = 0` fait un premier tour de synchronisation au démarrage (vérifié, comportement existant), le tour standby recharge à chaque tour. Les rôles de `exempt_roles` et les méthodes sans secret passent toujours (§6.3, « Démarrage »). Tests : `lockout.sh` (verrou manuel, redémarrage avec `worker_interval = 0` puis connexion immédiate refusée, « locked » après le premier tour ; fenêtre tenue ouverte en renommant `role_state` : 57P03 pour le bon et le mauvais mot de passe, rôle exempté accepté, LOG limité, « locked » une fois `role_state` rétablie), `standby.sh` (`last_reload` posé par le premier tour standby) ; `common.sh` attend le premier rechargement après `CREATE EXTENSION`.
 - (revue finale 7) Fenêtre fail-closed du démarrage, sept constats. (1) `worker_interval = 0` : un échec du premier rechargement n'était jamais retenté (`WaitLatch` sans délai), la fenêtre restait fermée jusqu'au prochain SIGHUP ; tant que `locks_loaded` est faux, ou qu'un rechargement est en attente avec `worker_interval = 0`, le worker se réveille au plus `PPP_RETRY_SECS` (5 s) plus tard. (2) `ppp_sync_reload()` posait `locks_loaded` même quand des verrous de `role_state` n'avaient pas trouvé de place dans le hash : il ne le pose plus que si tous les verrous sont réinjectés (un profil sans place ne retient pas la fenêtre), sinon LOG « persisted locks could not be loaded in shared memory: connections stay refused » et nouvelle tentative au tour suivant (`ppp_sync_reload()` renvoie faux, la demande reste en attente). (3) Extension absente : `ppp_sync_first` ne s'effaçait jamais, d'où deux transactions de synchronisation par tour ; `PPP_EXT_ABSENT` vaut désormais « rien à recharger » (`ppp_reload_pending` et `ppp_sync_first` effacés, `locks_loaded` posé). (4) La ligne `role_locked` d'un verrou automatique remplacé par un `lock_role()` avant le passage du worker portait `lifted_before_audit` : la copie retient `ppp_is_locked()` ; entrée encore verrouillée → `details.replaced_by_manual = true`, entrée non verrouillée → `lifted_before_audit`. (5) `ppp_extension_installed()` était du code mort : supprimée (prototype compris) ; le commentaire de `pg_pass_policy.h` renvoie à `ppp_require_extension()` / `ppp_extension_state()`. (6) Pendant la fenêtre, un échec était compté (et pouvait verrouiller) alors que le client recevait « retry » quel que soit le mot de passe, et un succès remettait le compteur à zéro (oracle : « 4 mauvais + candidat + mauvais » puis « locked » ou non à la sortie de la fenêtre) : l'entrée n'est plus modifiée tant que le rôle reçoit le `57P03` (`not_loaded` évalué juste après `ppp_is_locked()`, le refus d'un rôle déjà verrouillé en shmem gardant la priorité). (7) Sécurité/disponibilité : un worker qui ne démarre jamais (`max_worker_processes` épuisé, base inexistante) laissait, avec `exempt_roles` vide par défaut, une installation neuve refuser toutes les connexions par mot de passe, `postgres` compris ; les superutilisateurs (`rolsuper`, lu par la recherche syscache du hook) ne reçoivent plus le `57P03` (vraie réponse, échecs comptés, FATAL « locked » si un verrou est en shmem), et le hook émet un WARNING « pg_pass_policy worker has not loaded the lock state yet (worker_pid = 0) », HINT `max_worker_processes` / `pg_pass_policy.database`, au plus une fois par minute, 10 s après l'initialisation de la shmem (`shmem_init_at`, `worker_missing_logged_at`). Tests : `lockout.sh` (fenêtre tenue avec `worker_interval = 0` : rechargement retenté sans SIGHUP après le retour de `role_state` ; « 4 mauvais + bon + mauvais » toujours `57P03`, `failed_attempts()` vide, rôle accepté après la fenêtre ; superutilisateur non exempté accepté pendant la fenêtre, refus normal sur mauvais mot de passe ; `pg_pass_policy.database` inexistante : superutilisateur accepté, rôle ordinaire `57P03`, WARNING une seule fois, superutilisateur verrouillé en shmem après 5 échecs), `hashfull.sh` (verrou automatique remplacé par `lock_role()` : `replaced_by_manual` sans `lifted_before_audit` ; 599 verrous persistés pour `max_tracked_roles = 16` : LOG répété, fenêtre maintenue, connexion acceptée une fois les verrous levés dans `role_state`, sans SIGHUP).
+- (revue finale 8) Fenêtre de démarrage, neuf constats. (1) Sécurité : le message « worker has not loaded the lock state yet (worker_pid = 0) » était un `WARNING` émis depuis le hook d'authentification. PostgreSQL ne l'envoyait pas au client (`should_output_to_client()` ne laisse passer que ERROR et plus tant que `ClientAuthInProgress`, vérifié dans 16.4), mais rien dans le code ne le garantissait : il est désormais `LOG`, avec `PPP_LOG_PREFIX`, comme les autres messages du hook (seuls les FATAL de refus dépassent `LOG`) ; le DETAIL du FATAL `57P03`, lui envoyé au client, ne nomme plus le worker (« The server has just started; retry in a few seconds. »), et les HINT des LOG ne disent plus que les superutilisateurs passent toujours. (2) Sécurité : l'exception superutilisateur de la revue finale 7 retirait la garantie fail-closed pour un superutilisateur verrouillé à la main pendant toute fenêtre de démarrage et créait un oracle « nom de superutilisateur » ; elle ne s'applique plus que worker démontrablement absent (`worker_pid = 0` plus de `PPP_WORKER_MISSING_GRACE_SECS` après `shmem_init_at`, la condition du LOG « worker missing ») ; pendant un démarrage normal les superutilisateurs reçoivent le `57P03` comme les autres. (3) Standby : le test `RecoveryInProgress()` précédait la relance, si bien qu'un premier rechargement en échec sur un standby attendait `worker_interval` ; la relance de 5 s est évaluée d'abord. (4) Extension non fiable (`PPP_EXT_UNTRUSTED`) : journalisée en DEBUG1 avec le texte « not installed » alors que la fenêtre restait fermée sans trace ; `WARNING` au plus une fois par minute, DETAIL du propriétaire du schéma (`ppp_untrusted_detail()`, partagé avec PPP-004). (5) Fenêtre maintenue ouverte : chaque relance de 5 s exécutait tout le tour (maintenance, audit, deux synchronisations) ; tant que `ppp_sync_first` est posé, une relance (réveil sur délai, sans demande ni SIGHUP, moins de `worker_interval` après le dernier tour complet) s'arrête après la synchronisation en échec ; le LOG « persisted locks could not be loaded » est limité à une fois par minute. (6) `replaced_by_manual` était déduit de `ppp_is_locked()` : un verrou manuel de remplacement déjà expiré au passage du worker était audité `lifted_before_audit` ; il l'est d'après `locked_until != 0` (et `!= audit_locked_until`). (7) `worker_status()` expose `locks_loaded bool` (5 colonnes, `expected_natts` 5) ; le CLI (`cli/src/commands.rs`) et le web (`web/app/db.py`) nomment leurs colonnes, l'ajout ne les touche pas. (8) Les deux limiteurs « une fois par N s » du hook (`not_loaded_logged_at`, `worker_missing_logged_at`) et ceux du worker passent par `ppp_log_due()` (`pg_pass_policy.h`). (9) Délai de relance : `(ppp_worker_interval > 0 ? Min(ppp_worker_interval, PPP_RETRY_SECS) : PPP_RETRY_SECS) * 1000L` au lieu de deux `Min` imbriqués. Tests : `lockout.sh` (fenêtre, worker présent : superutilisateur non exempté refusé `57P03` au bon comme au mauvais mot de passe, sortie du client sans « worker » ni « exempt », `locks_loaded` faux puis vrai, relances limitées à la synchronisation : `last_run` inchangé ; base inexistante : superutilisateur refusé avant 10 s, accepté ensuite, LOG et plus de WARNING ; schéma cédé à un non-superutilisateur : WARNING une fois avec le propriétaire, fenêtre fermée puis rouverte), `hashfull.sh` (verrou manuel d'une seconde expiré avant le worker : `replaced_by_manual` sans `lifted_before_audit`, échoue sans la correction ; LOG « persisted locks » une seule fois), `standby.sh` (premier rechargement du standby en échec avec `worker_interval = 3600`, retenté en 5 s une fois `role_state` rétablie, échoue sans la correction), `00_setup` (colonnes de `worker_status()`).
 - (revue finale 7, point 8) `generate_password()` levait « could not generate a password compliant with profile … » en `XX000` (erreur interne), que le web traite en 500. Seul `PPP-019` (`max_repeat`) peut réellement épuiser les `PPP_GEN_MAX_TRIES` tirages : longueur et minima de classes sont vérifiés avant (`22023`), la composition des classes est garantie par construction et l'alphabet spécial ne contient pas d'espace (`PPP-020`). Ce cas (minima qui imposent beaucoup de caractères d'une petite classe avec un `max_repeat` bas) est un profil irréalisable en pratique : `22023` (`ERRCODE_INVALID_PARAMETER_VALUE`), avec DETAIL et HINT ; tout autre code reste `XX000` (défaut du générateur). Test : `40_generate` (200 chiffres sur 203 caractères, `max_repeat = 1` → `22023`).
 
 ## 12. Constats de revue acceptés
@@ -850,20 +876,29 @@ Points relevés en revue et volontairement non corrigés :
   reposent pas sur un mot de passe compromis. Inversement, un worker qui ne
   démarre pas (base inexistante, `max_worker_processes` épuisé) ou des
   verrous trop nombreux pour `max_tracked_roles` laissent la fenêtre fermée
-  indéfiniment pour les rôles non exemptés et non superutilisateurs : c'est
-  le choix fail-closed, signalé par le WARNING « worker_pid = 0 », les LOG et
-  `worker_status().last_reload` NULL.
-- **Superutilisateurs pendant la fenêtre de démarrage** (revue finale 7) :
-  ils ne reçoivent jamais le `57P03`, pour qu'une installation neuve dont le
+  indéfiniment pour les rôles non exemptés (superutilisateurs compris tant
+  que le worker tourne, voir ci-dessous) : c'est
+  le choix fail-closed, signalé par le LOG « worker_pid = 0 », les autres LOG
+  et `worker_status().locks_loaded` faux.
+- **Superutilisateurs quand le worker est absent** (revue finale 7, restreint
+  en revue finale 8) : pendant un démarrage normal (worker présent), ils
+  reçoivent le `57P03` comme les autres. Ils ne passent que lorsque le
+  worker est démontrablement absent (`worker_pid = 0` plus de 10 s après
+  l'initialisation de la shmem : base `pg_pass_policy.database` inexistante,
+  `max_worker_processes` épuisé), pour qu'une installation neuve dont le
   worker ne démarre pas (`exempt_roles` vide par défaut) reste administrable
-  par mot de passe. Conséquences acceptées : un superutilisateur verrouillé
-  dans `role_state` (et pas encore en shmem) peut se connecter pendant la
-  fenêtre, ce que `exempt_roles` permettait déjà pour les rôles exemptés ; un
-  superutilisateur peut par ailleurs se donner tous les droits, le verrou ne
-  le protège que d'un mot de passe compromis. Et, pendant la fenêtre
-  seulement, la réponse distingue un nom de superutilisateur (vraie réponse)
-  d'un autre nom (`57P03`) : oracle d'énumération limité à la fenêtre et aux
-  superutilisateurs.
+  par mot de passe. Conséquences acceptées, dans ce seul cas : un
+  superutilisateur verrouillé dans `role_state` (et pas encore en shmem)
+  peut se connecter, ce que `exempt_roles` permettait déjà pour les rôles
+  exemptés ; un superutilisateur peut par ailleurs se donner tous les
+  droits, le verrou ne le protège que d'un mot de passe compromis. Et la
+  réponse distingue un nom de superutilisateur (vraie réponse) d'un autre
+  nom (`57P03`) : oracle d'énumération limité aux superutilisateurs et à une
+  installation dont le worker ne tourne pas, situation que le log signale
+  (LOG « worker_pid = 0 » une fois par minute). Un worker qui redémarre
+  après un FATAL laisse aussi `worker_pid = 0` pendant `bgw_restart_time`
+  (10 s) : si la fenêtre est encore fermée à ce moment, l'exception
+  s'applique pendant ce délai.
 - **`_audit()` lève une erreur sans bibliothèque préchargée** : `_audit()`
   appelle la fonction C `_worker_pid()`, dont le chargement échoue quand la
   bibliothèque n'est pas dans `shared_preload_libraries` (`_PG_init()` le

@@ -299,6 +299,14 @@ SELECT count(*) AS worker_rows FROM pass_policy.worker_status();
            1
 (1 row)
 
+-- Colonnes de worker_status() : locks_loaded indique si la fenêtre de
+-- démarrage est fermée (revue finale 8)
+SELECT pg_get_function_result('pass_policy.worker_status()'::regprocedure) AS worker_status_columns;
+                                                          worker_status_columns                                                           
+------------------------------------------------------------------------------------------------------------------------------------------
+ TABLE(pid integer, last_run timestamp with time zone, last_reload timestamp with time zone, tracked_roles integer, locks_loaded boolean)
+(1 row)
+
 -- Le worker démarre dès l'état cohérent, avant que pg_regress ait créé
 -- contrib_regression : ce premier démarrage échoue (FATAL « database does not
 -- exist ») et il revient après bgw_restart_time (10 s, plus sous charge).

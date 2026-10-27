@@ -370,6 +370,28 @@ ppp_extension_state(Oid *nspowner)
 }
 
 /*
+ * ppp_untrusted_detail
+ *
+ * Detail of an untrusted extension (PPP_EXT_UNTRUSTED), shared by the PPP-004
+ * error of policy.c and the message of the worker: names the owner of schema
+ * PPP_SCHEMA when it is not a superuser.
+ */
+char *
+ppp_untrusted_detail(Oid nspowner)
+{
+	if (!OidIsValid(nspowner))
+		return pstrdup("Schema \"" PPP_SCHEMA "\" does not exist or does not hold the objects of extension pg_pass_policy.");
+	if (!superuser_arg(nspowner))
+	{
+		const char *owner = GetUserNameFromId(nspowner, true);
+
+		return psprintf("Schema \"" PPP_SCHEMA "\" is owned by role \"%s\", which is not a superuser.",
+						owner ? owner : "?");
+	}
+	return pstrdup("The objects of extension pg_pass_policy are not in schema \"" PPP_SCHEMA "\".");
+}
+
+/*
  * Wipe memory that held a secret.  explicit_bzero() cannot be optimized away;
  * the volatile loop is the portable fallback.
  */
@@ -430,31 +452,37 @@ ppp_begin_materialize(FunctionCallInfo fcinfo, TupleDesc *tupdesc,
 /*
  * pass_policy.worker_status()
  *		RETURNS TABLE(pid int, last_run timestamptz, last_reload timestamptz,
- *					  tracked_roles int)
+ *					  tracked_roles int, locks_loaded bool)
+ *
+ * locks_loaded: the fail-closed start-up window is closed (SPEC 6.3,
+ * "Démarrage"); false while roles authenticating with a secret are refused
+ * with 57P03.
  */
 Datum
 ppp_worker_status(PG_FUNCTION_ARGS)
 {
 	TupleDesc	tupdesc;
 	Tuplestorestate *tupstore;
-	Datum		values[4];
-	bool		nulls[4];
+	Datum		values[5];
+	bool		nulls[5];
 	pid_t		pid;
 	TimestampTz last_run;
 	TimestampTz last_reload;
 	int32		tracked = 0;
+	bool		locks_loaded;
 
 	if (ppp_shared == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("pg_pass_policy must be loaded via shared_preload_libraries")));
 
-	ppp_begin_materialize(fcinfo, &tupdesc, &tupstore, 4);
+	ppp_begin_materialize(fcinfo, &tupdesc, &tupstore, 5);
 
 	LWLockAcquire(ppp_shared->lock, LW_SHARED);
 	pid = ppp_shared->worker_pid;
 	last_run = ppp_shared->worker_last_run;
 	last_reload = ppp_shared->worker_last_reload;
+	locks_loaded = ppp_shared->locks_loaded;
 	if (ppp_role_hash != NULL)
 		tracked = (int32) hash_get_num_entries(ppp_role_hash);
 	LWLockRelease(ppp_shared->lock);
@@ -467,6 +495,7 @@ ppp_worker_status(PG_FUNCTION_ARGS)
 	values[2] = TimestampTzGetDatum(last_reload);
 	nulls[2] = (last_reload == 0);
 	values[3] = Int32GetDatum(tracked);
+	values[4] = BoolGetDatum(locks_loaded);
 
 	tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 

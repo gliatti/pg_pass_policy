@@ -55,13 +55,14 @@ Puis, connecté en superutilisateur **à la base désignée** :
 CREATE EXTENSION pg_pass_policy;
 ```
 
-Au démarrage, seuls les superutilisateurs et les rôles de `exempt_roles`
-passent tant que le worker n'a pas chargé les verrous (les autres
-connexions par mot de passe reçoivent `57P03`, voir « Verrouillage et
+Au démarrage, seuls les rôles de `exempt_roles` passent tant que le worker
+n'a pas chargé les verrous (les autres connexions par mot de passe, celles
+des superutilisateurs comprises, reçoivent `57P03`, voir « Verrouillage et
 déverrouillage »). Le worker occupe une place de `max_worker_processes` : si
 aucune n'est libre, ou si `pg_pass_policy.database` n'existe pas, il ne
-démarre pas et le log porte, au plus une fois par minute, le WARNING
-`pg_pass_policy worker has not loaded the lock state yet (worker_pid = 0)`.
+démarre pas ; 10 secondes après le démarrage, les superutilisateurs sont
+alors acceptés et le log porte, au plus une fois par minute, le message
+`pg_pass_policy: worker has not loaded the lock state yet (worker_pid = 0)`.
 
 Recommandé : `pg_pass_policy.exempt_roles = 'postgres'` (ou votre compte
 d'administration), pour ne jamais être bloqué par un profil trop strict.
@@ -141,7 +142,7 @@ SELECT * FROM pass_policy.v_expiring;      -- status IN (warning, grace, expired
 SELECT * FROM pass_policy.v_locked;
 SELECT * FROM pass_policy.v_recent_audit;  -- 1000 derniers événements
 SELECT * FROM pass_policy.failed_attempts();  -- compteurs d'échecs en mémoire partagée
-SELECT * FROM pass_policy.worker_status();    -- pid, last_run, last_reload, tracked_roles
+SELECT * FROM pass_policy.worker_status();    -- pid, last_run, last_reload, tracked_roles, locks_loaded
 ```
 
 `v_role_status.status` vaut `ok`, `warning` (expiration dans moins de
@@ -176,7 +177,7 @@ enregistrés dans `role_state` (dont les verrous manuels sans fin) n'y sont
 réinjectés que par le premier tour du worker, qui commence par là. Pour
 qu'aucun rôle verrouillé ne se glisse dans cette fenêtre, les connexions par
 mot de passe ou secret (`password`, `md5`, `scram-sha-256`, `ldap`, `pam`,
-`radius`, `bsd`) des rôles non exemptés et non superutilisateurs sont
+`radius`, `bsd`) des rôles non exemptés, superutilisateurs compris, sont
 refusées tant que l'état n'est pas chargé, bon ou mauvais mot de passe :
 `FATAL: pg_pass_policy: lock state not loaded yet, retry` (SQLSTATE `57P03`,
 comme « the database system is starting up » : il suffit de réessayer). Ces
@@ -185,13 +186,20 @@ remise à zéro. La fenêtre dure normalement une fraction de seconde. Si le
 worker ne peut pas charger l'état (base `pg_pass_policy.database`
 inexistante, `max_worker_processes` épuisé, table illisible, verrous de
 `role_state` plus nombreux que `max_tracked_roles`), elle reste fermée et le
-log l'indique (au plus une ligne par seconde, plus le WARNING `worker_pid =
-0` si le worker n'a jamais démarré) ; le worker réessaie toutes les 5
-secondes, et `pass_policy.worker_status()` montre `last_reload` à NULL. Les
-superutilisateurs, les rôles de `pg_pass_policy.exempt_roles` et les
-connexions sans secret (`peer`, `cert`…) passent toujours (un
-superutilisateur reste refusé si un verrou est déjà en mémoire partagée) :
-c'est le filet de sécurité de l'administrateur. Avec `enabled = off`, rien
+log l'indique (au plus une ligne par seconde, plus le message `worker_pid =
+0` si le worker n'a jamais démarré, ou un WARNING par minute si le schéma
+`pass_policy` n'appartient plus à un superutilisateur) ; le worker réessaie
+toutes les 5 secondes, y compris sur un standby, et
+`pass_policy.worker_status()` montre `locks_loaded` à faux. Le client, lui,
+ne reçoit que le `57P03`, sans détail sur l'état interne. Les rôles de
+`pg_pass_policy.exempt_roles` et les connexions sans secret (`peer`,
+`cert`…) passent toujours : c'est le filet de sécurité de l'administrateur.
+Les superutilisateurs ne passent que si le worker est absent (aucun worker
+10 secondes après le démarrage : base inexistante, `max_worker_processes`
+épuisé), pour qu'une installation dont le worker ne démarre pas reste
+administrable ; ils restent alors refusés si un verrou est déjà en mémoire
+partagée. Pendant un démarrage normal, un superutilisateur verrouillé dans
+`role_state` est donc refusé comme les autres. Avec `enabled = off`, rien
 n'est bloqué ; avec `worker_interval = 0`, le worker fait quand même ce
 premier chargement au démarrage.
 
