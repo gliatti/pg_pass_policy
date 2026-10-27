@@ -132,6 +132,10 @@ SELECT ppp_test.try($$SELECT * FROM pass_policy.v_role_status$$) AS sel_status;
 -- changer le mot de passe d'un superutilisateur (prise de contrôle)
 SELECT ppp_test.try($$SELECT pass_policy.rotate_password('regress_super')$$) AS rotate_superuser;
 SELECT ppp_test.try($$SELECT pass_policy.lock_role('regress_super')$$) AS lock_superuser;
+-- ... ni lui assigner ou retirer un profil (verrouillage ou expiration d'un
+-- superutilisateur par un profil agressif)
+SELECT ppp_test.try($$SELECT pass_policy.assign_profile('regress_super', 'default')$$) AS assign_superuser;
+SELECT ppp_test.try($$SELECT pass_policy.unassign_profile('regress_super')$$) AS unassign_superuser;
 -- ... ni d'un rôle qui en hérite : membre direct, transitif, ou d'un rôle pg_*
 SELECT ppp_test.try($$SELECT pass_policy.rotate_password('regress_proxy')$$) AS rotate_member_of_super;
 SELECT ppp_test.try($$SELECT pass_policy.expire_password('regress_proxy')$$) AS expire_member_of_super;

@@ -397,6 +397,20 @@ SELECT ppp_test.try($$SELECT pass_policy.lock_role('regress_super')$$) AS lock_s
  42501
 (1 row)
 
+-- ... ni lui assigner ou retirer un profil (verrouillage ou expiration d'un
+-- superutilisateur par un profil agressif)
+SELECT ppp_test.try($$SELECT pass_policy.assign_profile('regress_super', 'default')$$) AS assign_superuser;
+ assign_superuser 
+------------------
+ 42501
+(1 row)
+
+SELECT ppp_test.try($$SELECT pass_policy.unassign_profile('regress_super')$$) AS unassign_superuser;
+ unassign_superuser 
+--------------------
+ 42501
+(1 row)
+
 -- ... ni d'un rôle qui en hérite : membre direct, transitif, ou d'un rôle pg_*
 SELECT ppp_test.try($$SELECT pass_policy.rotate_password('regress_proxy')$$) AS rotate_member_of_super;
  rotate_member_of_super 

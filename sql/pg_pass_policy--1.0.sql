@@ -1023,11 +1023,9 @@ DECLARE
     v_pid  int;
 BEGIN
     PERFORM pass_policy._require_admin();
-    SELECT a.oid INTO v_oid FROM pg_catalog.pg_authid a WHERE a.rolname = v_role;
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'pg_pass_policy: role "%" does not exist', v_role
-              USING ERRCODE = 'undefined_object';
-    END IF;
+    -- a non-superuser admin must not be able to assign a lockout-prone or
+    -- fast-expiring profile to a privileged role (same rule as rotate/lock)
+    v_oid := pass_policy._require_target_allowed(v_role);
     SELECT p.profile_id INTO v_pid FROM pass_policy.profile p WHERE p.name = $2;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'pg_pass_policy: profile "%" does not exist', $2
@@ -1056,6 +1054,11 @@ DECLARE
 BEGIN
     PERFORM pass_policy._require_admin();
     SELECT a.oid INTO v_oid FROM pg_catalog.pg_authid a WHERE a.rolname = v_role;
+    -- existing role: same target rule as assign_profile; a dropped role only
+    -- has a stale row left for the purge, nothing privileged to protect
+    IF v_oid IS NOT NULL THEN
+        PERFORM pass_policy._require_target_allowed(v_role);
+    END IF;
     DELETE FROM pass_policy.role_profile rp
      WHERE rp.role_oid = v_oid OR (v_oid IS NULL AND rp.role_name = v_role);
     IF NOT FOUND THEN
