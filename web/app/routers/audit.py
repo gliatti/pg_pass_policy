@@ -62,7 +62,7 @@ def _context(request: Request, conn: Connection, filters: dict[str, Any]) -> dic
 def audit_page(
     request: Request,
     filters: dict[str, Any] = Depends(_filters),
-    conn: Connection = Depends(db.get_conn),
+    conn: Connection = db.CONN,
 ):
     return render(request, "audit/index.html", _context(request, conn, filters))
 
@@ -71,6 +71,6 @@ def audit_page(
 def audit_table(
     request: Request,
     filters: dict[str, Any] = Depends(_filters),
-    conn: Connection = Depends(db.get_conn),
+    conn: Connection = db.CONN,
 ):
     return render(request, "audit/_table.html", _context(request, conn, filters))

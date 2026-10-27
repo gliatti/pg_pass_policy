@@ -541,3 +541,156 @@ def test_htmx_validation_error_keeps_the_role_row(client):
     assert response.status_code == 422
     assert "HX-Retarget" not in response.headers
     assert response.text.lstrip().startswith('<tbody class="role">')
+
+
+PROFILE_FORM = {
+    "min_length": "12",
+    "max_length": "128",
+    "min_lower": "1",
+    "min_upper": "1",
+    "min_digit": "1",
+    "min_special": "0",
+    "min_classes": "3",
+    "max_repeat": "3",
+    "history_count": "5",
+    "history_days": "365",
+    "max_age": "",
+    "min_age": "0",
+    "grace_period": "7 days",
+    "warn_before": "14 days",
+    "max_failures": "5",
+    "failure_window": "15 minutes",
+    "lock_duration": "",
+}
+
+
+def test_profile_created_is_listed_immediately(client, super_conn):
+    """The request transaction is committed before the 303 / HX-Redirect
+    (scope="function"): the GET that follows sees the new profile."""
+    token = csrf_token(client, "/profiles")
+    try:
+        for name, headers in (
+            ("web_t_now1", {"X-CSRF-Token": token}),
+            ("web_t_now2", {"X-CSRF-Token": token, "HX-Request": "true"}),
+        ):
+            response = client.post(
+                "/profiles",
+                data={"name": name, **PROFILE_FORM},
+                headers=headers,
+                follow_redirects=False,
+            )
+            assert response.status_code in (204, 303), response.text
+            listing = client.get("/profiles")
+            assert f'href="/profiles/{name}"' in listing.text or name in listing.text
+            assert super_conn.execute(
+                "SELECT count(*) FROM pass_policy.profile WHERE name = %s", (name,)
+            ).fetchone() == (1,)
+        # plain form post: the redirect is followed to the listing
+        response = client.post(
+            "/profiles/web_t_now1/delete", data={"csrf_token": token}, follow_redirects=True
+        )
+        assert response.status_code == 200 and "web_t_now1" not in response.text
+    finally:
+        super_conn.execute("DELETE FROM pass_policy.profile WHERE name LIKE 'web_t_now%'")
+
+
+def test_reserved_profile_names_are_refused(client, super_conn):
+    token = csrf_token(client, "/profiles")
+    headers = {"X-CSRF-Token": token, "HX-Request": "true"}
+    for name in ("new", "assign", "unassign", ".", ".."):
+        response = client.post("/profiles", data={"name": name, **PROFILE_FORM}, headers=headers)
+        assert response.status_code == 422, (name, response.text)
+        assert "is reserved by the web interface" in response.text
+    assert super_conn.execute(
+        "SELECT count(*) FROM pass_policy.profile"
+        " WHERE name IN ('new', 'assign', 'unassign', '.', '..')"
+    ).fetchone() == (0,)
+
+
+PRIV_ROLES = {
+    # role: (CREATE ROLE options, granted roles)
+    "web_t_priv_plain": ("LOGIN", ()),
+    "web_t_priv_createrole": ("LOGIN CREATEROLE", ()),
+    "web_t_priv_repl": ("LOGIN REPLICATION", ()),
+    "web_t_priv_bypass": ("LOGIN BYPASSRLS", ()),
+    "web_t_priv_pgfiles": ("LOGIN", ("pg_read_server_files",)),
+    "web_t_priv_group": ("NOLOGIN", ("pg_monitor",)),
+    "web_t_priv_indirect": ("LOGIN", ("web_t_priv_group",)),
+    "web_t_priv_dbowner": ("LOGIN", ("pg_database_owner",)),
+}
+
+
+# PostgreSQL >= 16: CREATEROLE alone is not privileged; pg_database_owner is
+# excluded by the rule
+EXPECTED_REFUSED = {
+    "web_t_priv_repl",
+    "web_t_priv_bypass",
+    "web_t_priv_pgfiles",
+    "web_t_priv_group",
+    "web_t_priv_indirect",
+}
+
+
+def test_privileged_rule_agrees_with_the_extension(client, super_conn, test_url):
+    """db._PRIVILEGED_ROLE (assignment form and refusal) must agree with
+    pass_policy._require_target_allowed(): expire_password() is the oracle,
+    called by the service role in a transaction that is rolled back."""
+    from psycopg import sql
+
+    from app import db
+
+    with psycopg.connect(test_url) as conn:
+        if conn.execute("SELECT rolsuper FROM pg_roles WHERE rolname = session_user").fetchone()[0]:
+            pytest.skip("the web service role is a superuser")
+
+    def drop_all():
+        for role in reversed(list(PRIV_ROLES)):
+            super_conn.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(role)))
+
+    drop_all()
+    try:
+        for role, (options, granted) in PRIV_ROLES.items():
+            super_conn.execute(sql.SQL("CREATE ROLE {} " + options).format(sql.Identifier(role)))
+            for g in granted:
+                try:
+                    super_conn.execute(
+                        sql.SQL("GRANT {} TO {}").format(sql.Identifier(g), sql.Identifier(role))
+                    )
+                except psycopg.Error:
+                    pass  # pg_database_owner cannot be granted explicitly
+        superuser = super_conn.execute(
+            "SELECT rolname FROM pg_roles WHERE rolsuper AND rolcanlogin ORDER BY 1 LIMIT 1"
+        ).fetchone()[0]
+        candidates = [*PRIV_ROLES, superuser, "pgpp_web"]
+
+        from psycopg.rows import dict_row
+
+        with psycopg.connect(test_url, row_factory=dict_row) as conn:
+            offered = set(db.login_roles(conn, superuser=False))
+            for role in candidates:
+                try:
+                    with conn.transaction(force_rollback=True):
+                        conn.execute("SELECT pass_policy.expire_password(%s)", (role,))
+                    extension_refuses = False
+                except psycopg.errors.InsufficientPrivilege:
+                    extension_refuses = True
+                web_refuses = db.privileged_target_refused(conn, role, superuser=False)
+                assert web_refuses is extension_refuses, role
+                login = super_conn.execute(
+                    "SELECT rolcanlogin FROM pg_roles WHERE rolname = %s", (role,)
+                ).fetchone()[0]
+                assert (role in offered) is (login and not extension_refuses), role
+                assert extension_refuses is (role in EXPECTED_REFUSED or role == superuser), role
+        token = csrf_token(client, "/profiles")
+        response = client.post(
+            "/profiles/assign",
+            data={"role": "web_t_priv_indirect", "profile": T_PROFILE},
+            headers={"X-CSRF-Token": token, "HX-Request": "true"},
+        )
+        assert response.status_code == 422
+        assert "only a superuser can manage privileged role" in response.text
+    finally:
+        super_conn.execute(
+            "DELETE FROM pass_policy.role_profile WHERE role_name LIKE 'web_t_priv_%'"
+        )
+        drop_all()

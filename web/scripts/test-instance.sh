@@ -6,6 +6,11 @@
 #                                     pass_policy_admin, CREATEROLE for the tests)
 #   test-instance.sh stop DIR         stop and remove DIR
 #
+# DIR is removed (rm -rf) only when it carries the marker file written by
+# "start" (DIR/.pgpp-web-test-instance): a mistyped DIR (".", "$HOME", an
+# existing data directory...) is refused, never erased.  "start" accepts a
+# DIR that does not exist, an empty one, or one created by a previous start.
+#
 # Passwords never appear on a command line, in SQL text, in a URL or in the
 # shell history: the superuser password is generated into a 0600 file handed
 # to initdb --pwfile, the pgpp_web password is generated server side by
@@ -40,6 +45,19 @@ pgpass_escape() {
 	sed -e 's/\\/\\\\/g' -e 's/:/\\:/g'
 }
 
+marker=.pgpp-web-test-instance
+
+# refuse to erase a directory this script did not create
+check_owned() {
+	if [ -e "$dir" ] && [ ! -f "$dir/$marker" ]; then
+		if [ -d "$dir" ] && [ -z "$(ls -A "$dir")" ]; then
+			return 0
+		fi
+		echo "refusing to remove $dir: not a test instance created by $0 (no $marker)" >&2
+		exit 1
+	fi
+}
+
 psql_super() {
 	PGPASSFILE="$dir/pgpass" "$bindir/psql" -X -q -At -v ON_ERROR_STOP=1 \
 		-h 127.0.0.1 -p "$port" -U "$superuser" -d "$db" "$@"
@@ -51,10 +69,12 @@ start)
 		echo "instance already running in $dir" >&2
 		exit 1
 	fi
+	check_owned
 	rm -rf "$dir"
 	mkdir -p "$dir"
 	chmod 700 "$dir"
 	umask 077
+	: >"$dir/$marker"
 	# superuser password: generated, written to a file for initdb --pwfile
 	python3 -c 'import secrets; print(secrets.token_urlsafe(24))' >"$dir/super.pw"
 	"$bindir/initdb" -D "$dir/data" -U "$superuser" -A scram-sha-256 --pwfile="$dir/super.pw" \
@@ -106,6 +126,8 @@ HBA
 	echo "export PGPP_TEST_SUPER_URL=postgresql://$superuser@127.0.0.1:$port/$db"
 	;;
 stop)
+	[ -e "$dir" ] || exit 0
+	check_owned
 	if [ -d "$dir/data" ]; then
 		"$bindir/pg_ctl" -D "$dir/data" -m fast -w stop >/dev/null 2>&1 || true
 	fi

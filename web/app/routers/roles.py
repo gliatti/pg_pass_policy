@@ -35,12 +35,17 @@ def _filters(
 
 
 def _table_context(conn: Connection, filters: dict[str, Any]) -> dict[str, Any]:
+    # one row more than shown: tells "exactly MAX_ROLES" from "more"
     rows = db.list_roles(
-        conn, status=filters["status"], profile=filters["profile"], search=filters["q"]
+        conn,
+        status=filters["status"],
+        profile=filters["profile"],
+        search=filters["q"],
+        limit=db.MAX_ROLES + 1,
     )
     return {
-        "roles": rows,
-        "truncated": len(rows) >= db.MAX_ROLES,
+        "roles": rows[: db.MAX_ROLES],
+        "truncated": len(rows) > db.MAX_ROLES,
         "filters": filters,
         "statuses": db.STATUSES,
         "profiles": db.profile_names(conn),
@@ -51,7 +56,7 @@ def _table_context(conn: Connection, filters: dict[str, Any]) -> dict[str, Any]:
 def roles_page(
     request: Request,
     filters: dict[str, Any] = Depends(_filters),
-    conn: Connection = Depends(db.get_conn),
+    conn: Connection = db.CONN,
 ):
     return render(request, "roles/index.html", _table_context(conn, filters))
 
@@ -60,7 +65,7 @@ def roles_page(
 def roles_table(
     request: Request,
     filters: dict[str, Any] = Depends(_filters),
-    conn: Connection = Depends(db.get_conn),
+    conn: Connection = db.CONN,
 ):
     return render(request, "roles/_table.html", _table_context(conn, filters))
 
@@ -80,12 +85,9 @@ def _row_response(
     else:
         # the rotation is committed: whatever happens to the re-read, this
         # response is the only place the new password will ever be shown
-        try:
-            with conn.transaction():
-                row = db.get_role(conn, role)
-        except psycopg.Error as exc:
-            log.error("role %s rotated, its row could not be re-read: %s", role, exc)
-            row, reread_failed = None, True
+        row, reread_failed = db.reread_after_commit(
+            conn, lambda c: db.get_role(c, role), log, f"role {role} rotated"
+        )
     context = {
         "r": row,
         "role_name": role,
@@ -130,7 +132,7 @@ def rotate(
     request: Request,
     role: str,
     length: int = Form(default=24, ge=8, le=128),
-    conn: Connection = Depends(db.get_conn),
+    conn: Connection = db.CONN,
 ):
     password: str | None = None
     try:
@@ -149,7 +151,7 @@ def lock(
     role: str,
     duration: str = Form(default="", max_length=64),
     reason: str = Form(default="", max_length=500),
-    conn: Connection = Depends(db.get_conn),
+    conn: Connection = db.CONN,
 ):
     error = _run(conn, db.lock_role, role, duration.strip(), reason.strip())
     notice = None if error else ("Role locked" + (" until unlock" if not duration.strip() else ""))
@@ -157,7 +159,7 @@ def lock(
 
 
 @router.post("/{role:path}/unlock", name="role_unlock")
-def unlock(request: Request, role: str, conn: Connection = Depends(db.get_conn)):
+def unlock(request: Request, role: str, conn: Connection = db.CONN):
     error = _run(conn, db.unlock_role, role)
     return _row_response(
         request, conn, role, error=error, notice=None if error else "Role unlocked"
@@ -165,7 +167,7 @@ def unlock(request: Request, role: str, conn: Connection = Depends(db.get_conn))
 
 
 @router.post("/{role:path}/expire", name="role_expire")
-def expire(request: Request, role: str, conn: Connection = Depends(db.get_conn)):
+def expire(request: Request, role: str, conn: Connection = db.CONN):
     error = _run(conn, db.expire_password, role)
     return _row_response(
         request, conn, role, error=error, notice=None if error else "Password expired"

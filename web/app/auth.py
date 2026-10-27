@@ -11,6 +11,7 @@ import bcrypt
 from fastapi import HTTPException, Request, status
 
 from app.config import Settings
+from app.hashpw import BCRYPT_MAX_BYTES
 from app.logfilter import get_logger
 from app.security import route_path
 
@@ -34,8 +35,8 @@ def _unauthorized(settings: Settings, detail: str) -> HTTPException:
     )
 
 
-def basic_user_name(authorization: str | None) -> str | None:
-    """The user name claimed by a Basic header (for logging only, unverified)."""
+def _decode_basic(authorization: str | None) -> tuple[bytes, bytes] | None:
+    """(user, password) bytes of a well-formed Basic header, else None."""
     scheme, _, payload = (authorization or "").partition(" ")
     if scheme.lower() != "basic" or not payload:
         return None
@@ -43,7 +44,18 @@ def basic_user_name(authorization: str | None) -> str | None:
         decoded = base64.b64decode(payload.strip(), validate=True)
     except (binascii.Error, ValueError):
         return None
-    return decoded.partition(b":")[0].decode("utf-8", "replace")
+    user_b, sep, password_b = decoded.partition(b":")
+    if not sep:
+        return None
+    return user_b, password_b
+
+
+def basic_user_name(authorization: str | None) -> str | None:
+    """The user name claimed by a Basic header (for logging only, unverified)."""
+    decoded = _decode_basic(authorization)
+    if decoded is None:
+        return None
+    return decoded[0].decode("utf-8", "replace")
 
 
 def _loggable(user: str | None) -> str:
@@ -55,26 +67,22 @@ def _loggable(user: str | None) -> str:
 
 def verify_basic(authorization: str | None, users: dict[str, bytes]) -> str | None:
     """Return the user name if the Authorization header holds valid credentials."""
-    if not authorization:
+    decoded = _decode_basic(authorization)
+    if decoded is None:
         return None
-    scheme, _, payload = authorization.partition(" ")
-    if scheme.lower() != "basic" or not payload:
-        return None
-    try:
-        decoded = base64.b64decode(payload.strip(), validate=True)
-    except (binascii.Error, ValueError):
-        return None
-    user_b, sep, password_b = decoded.partition(b":")
-    if not sep:
-        return None
+    user_b, password_b = decoded
     try:
         user = user_b.decode("utf-8")
     except UnicodeDecodeError:
         return None
+    if len(password_b) > BCRYPT_MAX_BYTES:
+        # refused, not truncated (pgpp-web-hash never hashes such a password);
+        # the length does not depend on the user: nothing leaks
+        return None
     digest = users.get(user)
     # always run bcrypt (constant work), compare against a dummy hash if unknown
     try:
-        valid = bcrypt.checkpw(password_b[:72], digest or _DUMMY_HASH)
+        valid = bcrypt.checkpw(password_b, digest or _DUMMY_HASH)
     except ValueError:
         valid = False
     if digest is None or not valid:
@@ -92,7 +100,12 @@ def _client_is_trusted(request: Request, settings: Settings) -> bool:
         addr = ipaddress.ip_address(client.host)
     except ValueError:
         return False
-    return any(addr in net for net in settings.trusted_networks())
+    # uvicorn --host :: reports an IPv4 peer as ::ffff:127.0.0.1: match its
+    # IPv4 form too (and the mapped form itself, if listed as such)
+    candidates = [addr]
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        candidates.append(addr.ipv4_mapped)
+    return any(a in net for a in candidates for net in settings.trusted_networks())
 
 
 def user_from_proxy(request: Request, settings: Settings) -> str:

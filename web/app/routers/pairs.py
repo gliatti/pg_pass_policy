@@ -6,7 +6,7 @@ import secrets
 from typing import Any
 
 import psycopg
-from fastapi import APIRouter, Depends, Form, Request
+from fastapi import APIRouter, Form, Request
 from psycopg import Connection
 
 from app import db
@@ -38,12 +38,10 @@ def _content(
     else:
         # the switch is committed: whatever happens to the re-read, this
         # response is the only place the new password will ever be shown
-        try:
-            with conn.transaction():
-                pairs = db.list_pairs(conn)
-        except psycopg.Error as exc:
-            log.error("pair %s switched, the pairs could not be re-read: %s", switched["pair"], exc)
-            pairs, warning = [], REREAD_WARNING
+        read, failed = db.reread_after_commit(
+            conn, db.list_pairs, log, f"pair {switched['pair']} switched"
+        )
+        pairs, warning = (read or []), (REREAD_WARNING if failed else None)
     context = {
         "pairs": pairs,
         "warning": warning,
@@ -63,7 +61,7 @@ def _content(
 
 
 @router.get("", name="pairs")
-def pairs_page(request: Request, conn: Connection = Depends(db.get_conn)):
+def pairs_page(request: Request, conn: Connection = db.CONN):
     return _content(request, conn, "pairs/index.html")
 
 
@@ -74,7 +72,7 @@ def pair_create(
     role_a: str = Form(max_length=128),
     role_b: str = Form(max_length=128),
     group_role: str = Form(max_length=128),
-    conn: Connection = Depends(db.get_conn),
+    conn: Connection = db.CONN,
 ):
     values = {
         "pair_name": pair_name.strip(),
@@ -101,7 +99,7 @@ def pair_switch(
     request: Request,
     pair: str,
     length: int = Form(default=24, ge=8, le=128),
-    conn: Connection = Depends(db.get_conn),
+    conn: Connection = db.CONN,
 ):
     try:
         with conn.transaction():

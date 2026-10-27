@@ -5,12 +5,12 @@ from __future__ import annotations
 from typing import Any
 
 import psycopg
-from fastapi import APIRouter, Depends, Form, Request
-from fastapi.responses import RedirectResponse, Response
+from fastapi import APIRouter, Form, Request
+from fastapi.responses import Response
 from psycopg import Connection
 
 from app import db
-from app.templating import render
+from app.templating import redirect_to, render
 
 router = APIRouter(prefix="/profiles")
 
@@ -36,6 +36,18 @@ LABELS = {
     "failure_window": "Failure counting window (interval, 0 = none)",
     "lock_duration": "Automatic lock duration (interval, empty = manual unlock)",
 }
+
+
+# names that the profile routes cannot reach: /profiles/new, /profiles/assign
+# and /profiles/unassign are fixed routes, "." and ".." are removed from the
+# URL by the browser (dot segments).  The extension accepts them (its CHECK
+# is ^[A-Za-z0-9_.-]{1,63}$): the web interface refuses to create or update
+# them, such a profile is managed with SQL.
+RESERVED_NAMES = frozenset({"new", "assign", "unassign", ".", ".."})
+RESERVED_MESSAGE = (
+    'the profile name "{}" is reserved by the web interface'
+    " (new, assign, unassign, . and ..): choose another name or use SQL"
+)
 
 
 def settings_from_form(form: Any) -> dict[str, Any]:
@@ -67,7 +79,7 @@ def _page(request: Request, conn: Connection, **extra: Any) -> Response:
     context = {
         "profiles": profiles,
         "assignments": db.assignments(conn),
-        "login_roles": db.login_roles(conn),
+        "login_roles": db.login_roles(conn, db.session_is_superuser(request, conn)),
         # same order as profile_names(): derived, no second query
         "profile_names": [p["name"] for p in profiles],
         **extra,
@@ -80,7 +92,7 @@ def _assignments_fragment(
 ) -> Response:
     context = {
         "assignments": db.assignments(conn),
-        "login_roles": db.login_roles(conn),
+        "login_roles": db.login_roles(conn, db.session_is_superuser(request, conn)),
         "profile_names": db.profile_names(conn),
         "error": error,
         "notice": notice,
@@ -88,13 +100,38 @@ def _assignments_fragment(
     return render(request, "profiles/_assignments.html", context, 422 if error else 200)
 
 
+def _form_response(
+    request: Request,
+    profile: dict[str, Any] | None,
+    values: Any,
+    *,
+    error: str | None = None,
+    notice: str | None = None,
+) -> Response:
+    """The form fragment for htmx, the full page for a plain form post."""
+    template = (
+        "profiles/_form.html"
+        if request.headers.get("hx-request") == "true"
+        else "profiles/form.html"
+    )
+    context = {
+        "profile": profile,
+        "values": values,
+        "fields": db.PROFILE_FIELDS,
+        "labels": LABELS,
+        "error": error,
+        "notice": notice,
+    }
+    return render(request, template, context, status_code=422 if error else 200)
+
+
 @router.get("", name="profiles")
-def profiles_page(request: Request, conn: Connection = Depends(db.get_conn)):
+def profiles_page(request: Request, conn: Connection = db.CONN):
     return _page(request, conn)
 
 
 @router.get("/new", name="profile_new")
-def profile_new(request: Request, conn: Connection = Depends(db.get_conn)):
+def profile_new(request: Request, conn: Connection = db.CONN):
     defaults = db.get_profile(conn, "default") or {}
     return render(
         request,
@@ -104,7 +141,7 @@ def profile_new(request: Request, conn: Connection = Depends(db.get_conn)):
 
 
 @router.post("", name="profile_create")
-async def profile_create(request: Request, conn: Connection = Depends(db.get_conn)):
+async def profile_create(request: Request, conn: Connection = db.CONN):
     form = await request.form()
     name = str(form.get("name", "")).strip()
     values = {k: form.get(k) for k, _ in db.PROFILE_FIELDS}
@@ -112,31 +149,21 @@ async def profile_create(request: Request, conn: Connection = Depends(db.get_con
     try:
         if not name:
             raise ValueError("a profile name is required")
+        if name in RESERVED_NAMES:
+            raise ValueError(RESERVED_MESSAGE.format(name))
         settings = settings_from_form(form)
         with conn.transaction():
             db.create_profile(conn, name, settings)
     except (ValueError, psycopg.Error) as exc:
         message = db.error_message(exc) if isinstance(exc, psycopg.Error) else str(exc)
-        return render(
-            request,
-            "profiles/_form.html",
-            {
-                "profile": None,
-                "values": values,
-                "fields": db.PROFILE_FIELDS,
-                "labels": LABELS,
-                "error": message,
-            },
-            status_code=422,
-        )
-    target = request.url_for("profiles").path
-    if request.headers.get("hx-request") == "true":
-        return Response(status_code=204, headers={"HX-Redirect": target})
-    return RedirectResponse(target, status_code=303)
+        return _form_response(request, None, values, error=message)
+    return redirect_to(request, "profiles")
 
 
 # same wording as pass_policy._require_target_allowed(): the dropdown already
-# hides privileged roles, but the form value is user-controlled
+# hides privileged roles, but the form value is user-controlled (and
+# assign_profile() / unassign_profile() do not check the target, see
+# db._PRIVILEGED_ROLE)
 _PRIVILEGED = 'only a superuser can manage privileged role "{}"'
 
 
@@ -146,10 +173,10 @@ def profile_assign(
     request: Request,
     role: str = Form(max_length=128),
     profile: str = Form(max_length=128),
-    conn: Connection = Depends(db.get_conn),
+    conn: Connection = db.CONN,
 ):
     role, profile = role.strip(), profile.strip()
-    if db.privileged_target_refused(conn, role):
+    if db.privileged_target_refused(conn, role, db.session_is_superuser(request, conn)):
         return _assignments_fragment(request, conn, error=_PRIVILEGED.format(role))
     try:
         with conn.transaction():
@@ -161,10 +188,10 @@ def profile_assign(
 
 @router.post("/unassign", name="profile_unassign")
 def profile_unassign(
-    request: Request, role: str = Form(max_length=128), conn: Connection = Depends(db.get_conn)
+    request: Request, role: str = Form(max_length=128), conn: Connection = db.CONN
 ):
     role = role.strip()
-    if db.privileged_target_refused(conn, role):
+    if db.privileged_target_refused(conn, role, db.session_is_superuser(request, conn)):
         return _assignments_fragment(request, conn, error=_PRIVILEGED.format(role))
     try:
         with conn.transaction():
@@ -179,7 +206,7 @@ def profile_unassign(
 # spans two segments and "x/delete" cannot be mistaken for the delete action
 # on "x" (tests/test_integration.py checks that such a name is refused)
 @router.get("/{name}", name="profile_edit")
-def profile_edit(request: Request, name: str, conn: Connection = Depends(db.get_conn)):
+def profile_edit(request: Request, name: str, conn: Connection = db.CONN):
     profile = db.get_profile(conn, name)
     if profile is None:
         return render(
@@ -193,7 +220,7 @@ def profile_edit(request: Request, name: str, conn: Connection = Depends(db.get_
 
 
 @router.post("/{name}", name="profile_update")
-async def profile_update(request: Request, name: str, conn: Connection = Depends(db.get_conn)):
+async def profile_update(request: Request, name: str, conn: Connection = db.CONN):
     form = await request.form()
     profile = db.get_profile(conn, name)
     if profile is None:
@@ -202,6 +229,8 @@ async def profile_update(request: Request, name: str, conn: Connection = Depends
     values["name"] = name
     error = notice = None
     try:
+        if name in RESERVED_NAMES:
+            raise ValueError(RESERVED_MESSAGE.format(name))
         settings = settings_from_form(form)
         with conn.transaction():
             db.alter_profile(conn, name, settings)
@@ -209,29 +238,14 @@ async def profile_update(request: Request, name: str, conn: Connection = Depends
         values = db.get_profile(conn, name) or values
     except (ValueError, psycopg.Error) as exc:
         error = db.error_message(exc) if isinstance(exc, psycopg.Error) else str(exc)
-    return render(
-        request,
-        "profiles/_form.html",
-        {
-            "profile": profile,
-            "values": values,
-            "fields": db.PROFILE_FIELDS,
-            "labels": LABELS,
-            "error": error,
-            "notice": notice,
-        },
-        status_code=422 if error else 200,
-    )
+    return _form_response(request, profile, values, error=error, notice=notice)
 
 
 @router.post("/{name}/delete", name="profile_delete")
-def profile_delete(request: Request, name: str, conn: Connection = Depends(db.get_conn)):
+def profile_delete(request: Request, name: str, conn: Connection = db.CONN):
     try:
         with conn.transaction():
             db.drop_profile(conn, name)
     except psycopg.Error as exc:
         return render(request, "_alert.html", {"error": db.error_message(exc)}, 422)
-    target = request.url_for("profiles").path
-    if request.headers.get("hx-request") == "true":
-        return Response(status_code=204, headers={"HX-Redirect": target})
-    return RedirectResponse(target, status_code=303)
+    return redirect_to(request, "profiles")

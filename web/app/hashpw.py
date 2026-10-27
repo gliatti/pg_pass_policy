@@ -11,6 +11,10 @@ import sys
 
 import bcrypt
 
+# bcrypt only uses the first 72 bytes (bcrypt >= 5 raises beyond): a longer
+# password is refused, here and by auth.verify_basic(), rather than truncated
+BCRYPT_MAX_BYTES = 72
+
 
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
@@ -33,7 +37,16 @@ def main(argv: list[str] | None = None) -> int:
     if len(password) < 12:
         print("the password must be at least 12 characters long", file=sys.stderr)
         return 1
-    digest = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=12)).decode("ascii")
+    encoded = password.encode("utf-8")
+    if len(encoded) > BCRYPT_MAX_BYTES:
+        # bcrypt ignores (bcrypt >= 5: rejects) what lies beyond 72 bytes
+        print(
+            f"the password must not exceed {BCRYPT_MAX_BYTES} bytes in UTF-8"
+            f" ({len(encoded)} given)",
+            file=sys.stderr,
+        )
+        return 1
+    digest = bcrypt.hashpw(encoded, bcrypt.gensalt(rounds=12)).decode("ascii")
     print(f"{user}:{digest}")
     return 0
 

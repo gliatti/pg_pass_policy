@@ -10,7 +10,7 @@ from urllib.parse import quote
 
 from fastapi import Request
 from fastapi.templating import Jinja2Templates
-from starlette.responses import Response
+from starlette.responses import RedirectResponse, Response
 
 from app.csrf import get_csrf_token
 from app.db import INFINITY
@@ -103,3 +103,11 @@ def render(
 
 
 NO_STORE = {"Cache-Control": "no-store", "Pragma": "no-cache"}
+
+
+def redirect_to(request: Request, route: str) -> Response:
+    """After a successful POST: HX-Redirect (204) for htmx, 303 otherwise."""
+    target = request.url_for(route).path
+    if request.headers.get("hx-request") == "true":
+        return Response(status_code=204, headers={"HX-Redirect": target})
+    return RedirectResponse(target, status_code=303)

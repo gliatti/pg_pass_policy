@@ -49,8 +49,11 @@ SELECT pass_policy.rotate_password('pgpp_web');   -- le mot de passe est affich�
 Le mot de passe se range dans un fichier `~/.pgpass` (mode 0600) ou se passe
 par `PGPASSWORD` dans l'environnement du service, jamais dans l'URL de
 connexion. Un membre de `pass_policy_admin` qui n'est pas superutilisateur ne
-peut pas agir sur les rôles `SUPERUSER`, `REPLICATION` ou `BYPASSRLS` : c'est
-voulu par l'extension.
+peut pas agir sur les rôles privilégiés (`SUPERUSER`, `REPLICATION`,
+`BYPASSRLS`, rôles prédéfinis `pg_*`, membres même indirects de tels rôles) :
+c'est voulu par l'extension. L'application détermine une seule fois, à la
+première requête, si son rôle de service est superutilisateur : après un
+changement de ses attributs, redémarrer l'application.
 
 ## Configuration
 
@@ -73,7 +76,10 @@ Tout passe par des variables d'environnement préfixées `PGPP_WEB_`.
 
 ### Comptes HTTP basic
 
-Les mots de passe ne sont stockés qu'en empreinte bcrypt. La commande
+Les mots de passe ne sont stockés qu'en empreinte bcrypt, limitée à 72 octets
+en UTF-8 : `pgpp-web-hash` refuse un mot de passe plus long (bcrypt ignorerait
+la suite) et l'authentification le refuse de même au lieu de le tronquer. La
+commande
 `pgpp-web-hash` lit le mot de passe au clavier (sans écho) et affiche l'entrée
 à placer dans `PGPP_WEB_BASIC_USERS` :
 
@@ -112,7 +118,9 @@ reverse proxy (nginx, Apache, Caddy…) termine le TLS. Deux options :
    authentifie (LDAP, OIDC, certificats clients…) et transmet l'identité dans
    `X-Remote-User`. L'application n'accepte cet en-tête que si l'adresse du pair
    figure dans `PGPP_WEB_TRUSTED_PROXIES` ; le proxy **doit** écraser tout
-   `X-Remote-User` envoyé par le client.
+   `X-Remote-User` envoyé par le client. Une adresse IPv4 vue sous sa forme
+   IPv6 (`::ffff:127.0.0.1`, uvicorn lancé avec `--host ::`) est comparée sous
+   ses deux formes.
 
 Exemple nginx (option 2) :
 
@@ -220,13 +228,32 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
   `/{role:path}/action` le reconstituent. Les routes des profils gardent un
   segment simple (`/profiles/{name}`) : la contrainte `CHECK (name ~
   '^[A-Za-z0-9_.-]{1,63}$')` de `pass_policy.profile` interdit `/` (un profil
-  `x/delete` ne peut pas exister, ce que vérifie un test d'intégration).
+  `x/delete` ne peut pas exister, ce que vérifie un test d'intégration). Les
+  noms `new`, `assign` et `unassign` (routes fixes) ainsi que `.` et `..`
+  (segments supprimés de l'URL par le navigateur) sont acceptés par
+  l'extension mais injoignables par ces routes : l'interface refuse de créer ou
+  de modifier un profil portant l'un d'eux (422, message explicite) ; un tel
+  profil se gère en SQL.
 - **Droits** : le rôle de service est seulement membre de `pass_policy_admin` ;
-  les fonctions `SECURITY DEFINER` de l'extension refusent de toucher aux rôles
-  privilégiés. L'application applique la même règle de son côté : si le rôle
-  de service n'est pas superutilisateur, les rôles `SUPERUSER`, `REPLICATION`
-  et `BYPASSRLS` sont absents du formulaire d'assignation de profil et toute
-  assignation ou désassignation forgée sur l'un d'eux est refusée (422).
+  les fonctions `SECURITY DEFINER` de rotation, d'expiration, de verrouillage
+  et des paires refusent de toucher aux rôles privilégiés
+  (`_require_target_allowed()`), et l'erreur est affichée telle quelle.
+  `assign_profile()` et `unassign_profile()` ne font pas ce contrôle :
+  l'application l'applique donc elle-même pour l'assignation de profil. Si le
+  rôle de service n'est pas superutilisateur, les rôles privilégiés sont absents
+  du formulaire d'assignation et toute assignation ou désassignation forgée sur
+  l'un d'eux est refusée (422). La règle (`db._PRIVILEGED_ROLE`) reprend celle
+  de l'extension, qui n'est pas exécutable par `pass_policy_admin` :
+  `SUPERUSER`, `REPLICATION`, `BYPASSRLS`, rôles `pg_*` sauf
+  `pg_database_owner`, `CREATEROLE` jusqu'à PostgreSQL 15, appartenance même
+  indirecte (`pg_has_role`) à l'un de ces rôles. Un test d'intégration vérifie
+  qu'elle donne le même verdict que l'extension sur un jeu de rôles.
+- **Transactions** : chaque requête utilise une connexion du pool dans une
+  transaction validée quand la fonction de la route se termine, **avant**
+  l'envoi de la réponse (dépendance déclarée avec `scope="function"` : depuis
+  FastAPI 0.118, une dépendance `yield` ordinaire n'est fermée qu'après l'envoi).
+  La requête qui suit un 303 ou un `HX-Redirect` voit donc la modification, et
+  un échec du `COMMIT` donne une page 500 au lieu d'une redirection trompeuse.
 - **Affichage unique** : le fragment d'une rotation remplace tout le `<tbody>`
   du rôle (ligne + note) ; la prochaine action sur le même rôle, ou tout autre
   échange HTMX sur la page, retire le mot de passe affiché (`htmx:beforeSwap`
@@ -250,11 +277,14 @@ chargée ; ils sont ignorés quand `PGPP_TEST_URL` est absente. Le script
 local, scram-sha-256, extension installée depuis le `pg_config` du `PATH`, rôle
 `pgpp_web` membre de `pass_policy_admin` avec `CREATEROLE` pour les besoins
 des tests) et affiche les variables à exporter ; les mots de passe générés vont
-dans un fichier `pgpass` (0600), jamais sur une ligne de commande :
+dans un fichier `pgpass` (0600), jamais sur une ligne de commande. Le script
+ne supprime (`rm -rf`) que le répertoire qu'il a lui-même créé, reconnu à son
+fichier marqueur `.pgpp-web-test-instance` : un répertoire existant non vide
+sans ce marqueur est refusé, à `start` comme à `stop` :
 
 ```sh
 eval "$(scripts/test-instance.sh start /tmp/pgpp-web-test 54332)"
-pytest                     # 112 tests : unitaires + intégration
+pytest                     # 152 tests : unitaires + intégration
 scripts/test-instance.sh stop /tmp/pgpp-web-test
 ```
 
@@ -264,8 +294,10 @@ les rôles de test `web_t_*`), `PGPASSFILE`. Les tests d'intégration couvrent l
 tableau de bord, la liste et les filtres des rôles, la rotation (le mot de passe
 figure dans la réponse et nulle part ailleurs : ni dans les journaux capturés,
 ni dans l'audit, et il permet réellement de se connecter), lock / unlock /
-expire, les profils (création, modification, assignation, suppression, refus
-d'assignation sur un rôle privilégié), l'audit (filtres, pagination), les
+expire, les profils (création visible dès la requête suivante, modification,
+assignation, suppression, noms réservés, refus d'assignation sur un rôle
+privilégié, règle des rôles privilégiés identique à celle de l'extension),
+l'audit (filtres, pagination), les
 paires de rotation, la maintenance et le refus CSRF.
 
 ## Arborescence

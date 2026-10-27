@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Request
 from psycopg import Connection
 
 from app import db
@@ -12,7 +12,7 @@ router = APIRouter()
 
 
 @router.get("/", name="dashboard")
-def dashboard(request: Request, conn: Connection = Depends(db.get_conn)):
+def dashboard(request: Request, conn: Connection = db.CONN):
     counts = db.status_counts(conn)
     return render(
         request,

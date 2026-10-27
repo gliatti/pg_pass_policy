@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import psycopg
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Request
 from psycopg import Connection
 
 from app import db
@@ -13,12 +13,12 @@ router = APIRouter(prefix="/maintenance")
 
 
 @router.get("", name="maintenance")
-def maintenance_page(request: Request, conn: Connection = Depends(db.get_conn)):
+def maintenance_page(request: Request, conn: Connection = db.CONN):
     return render(request, "maintenance/index.html", {"worker": db.worker_status(conn)})
 
 
 @router.post("/run", name="maintenance_run")
-def maintenance_run(request: Request, conn: Connection = Depends(db.get_conn)):
+def maintenance_run(request: Request, conn: Connection = db.CONN):
     try:
         with conn.transaction():
             actions = db.run_maintenance(conn)

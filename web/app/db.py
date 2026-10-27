@@ -7,12 +7,13 @@ and no password is ever logged or kept beyond the HTTP response.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import logging
+from collections.abc import Callable, Iterator
 from datetime import datetime
-from typing import Any
+from typing import Any, TypeVar
 
 import psycopg
-from fastapi import Request
+from fastapi import Depends, Request
 from psycopg import Connection
 from psycopg.rows import dict_row
 from psycopg.types.datetime import TimestamptzLoader
@@ -101,11 +102,40 @@ def set_actor(conn: Connection, settings: Settings, user: str | None) -> None:
 
 
 def get_conn(request: Request) -> Iterator[Connection]:
-    """FastAPI dependency: one pooled connection per request, committed on success."""
+    """FastAPI dependency: one pooled connection per request, committed on success.
+
+    Always used through CONN (scope="function"): since FastAPI 0.118 a yield
+    dependency of the default "request" scope is closed after the response
+    is sent, so the implicit commit would come after a 303 / HX-Redirect
+    (the next GET could miss the change, a failed commit would go unseen).
+    With scope="function" the commit runs when the endpoint returns, before
+    the response starts; a commit error becomes the usual 500 page.
+    """
     pool: ConnectionPool = request.app.state.pool
     with pool.connection() as conn:
         set_actor(conn, request.app.state.settings, getattr(request.state, "user", None))
         yield conn
+
+
+# the dependency to declare in the endpoints: `conn: Connection = db.CONN`
+CONN: Any = Depends(get_conn, scope="function")
+
+T = TypeVar("T")
+
+
+def reread_after_commit(
+    conn: Connection, read: Callable[[Connection], T], logger: logging.Logger, what: str
+) -> tuple[T | None, bool]:
+    """Re-read after a committed action whose result (a one-time password)
+    must be shown whatever happens: a failing read is logged and reported
+    as (None, True) instead of raising.  The read runs in a savepoint so
+    that the connection stays usable."""
+    try:
+        with conn.transaction():
+            return read(conn), False
+    except psycopg.Error as exc:
+        logger.error("%s, the re-read failed: %s", what, exc)
+        return None, True
 
 
 def error_message(exc: psycopg.Error) -> str:
@@ -244,41 +274,71 @@ def expire_password(conn: Connection, role: str) -> None:
     conn.execute("SELECT pass_policy.expire_password(%s)", (role,))
 
 
-def _session_is_superuser(conn: Connection) -> bool:
+def _query_session_is_superuser(conn: Connection) -> bool:
     return conn.execute(
         "SELECT coalesce((SELECT s.rolsuper FROM pg_catalog.pg_roles s"
         "                  WHERE s.rolname = session_user), false) AS su"
     ).fetchone()["su"]
 
 
-def login_roles(conn: Connection) -> list[str]:
-    """Login roles the service role may act on: privileged roles (SUPERUSER,
-    REPLICATION, BYPASSRLS) are listed only when the session is a superuser,
-    mirroring pass_policy._require_target_allowed()."""
+def session_is_superuser(request: Request, conn: Connection) -> bool:
+    """Whether the service role is a superuser: queried once, on first use,
+    then kept in app.state (every pooled connection uses the same role; a
+    change of its attributes needs a restart of the application)."""
+    state = request.app.state
+    cached = getattr(state, "session_superuser", None)
+    if cached is None:
+        cached = state.session_superuser = _query_session_is_superuser(conn)
+    return cached
+
+
+# Display filter for the profile assignment form, and refusal of a forged
+# assignment: pass_policy.assign_profile() / unassign_profile() do not check
+# the target themselves (only rotate/expire/lock/unlock and the rotation
+# pairs go through _require_target_allowed()), so the web application
+# applies the same rule.  This predicate is a copy of
+# pass_policy._require_target_allowed() (not executable by pass_policy_admin):
+# SUPERUSER / REPLICATION / BYPASSRLS, predefined pg_* roles except
+# pg_database_owner, CREATEROLE on PostgreSQL <= 15, and membership, even
+# indirect, in any such role.  tests/test_integration.py checks that it
+# agrees with the extension (expire_password() as the oracle).
+_PRIVILEGED_ROLE = (
+    "(r.rolsuper OR r.rolreplication OR r.rolbypassrls"
+    " OR (starts_with(r.rolname, 'pg_') AND r.rolname <> 'pg_database_owner')"
+    " OR (r.rolcreaterole AND current_setting('server_version_num')::int < 160000)"
+    " OR EXISTS (SELECT FROM pg_catalog.pg_roles x"
+    "             WHERE x.oid <> r.oid"
+    "               AND (x.rolsuper OR x.rolreplication OR x.rolbypassrls"
+    "                    OR (starts_with(x.rolname, 'pg_') AND x.rolname <> 'pg_database_owner'))"
+    "               AND pg_catalog.pg_has_role(r.oid, x.oid, 'MEMBER')))"
+)
+
+
+def login_roles(conn: Connection, superuser: bool) -> list[str]:
+    """Login roles offered in the assignment form: the privileged ones
+    (see _PRIVILEGED_ROLE) only when the service role is a superuser."""
     return [
         r["rolname"]
         for r in conn.execute(
-            "SELECT rolname FROM pg_catalog.pg_roles"
-            " WHERE rolcanlogin"
-            "   AND (NOT (rolsuper OR rolreplication OR rolbypassrls) OR %s)"
-            " ORDER BY rolname",
-            (_session_is_superuser(conn),),
+            "SELECT r.rolname FROM pg_catalog.pg_roles r"
+            f" WHERE r.rolcanlogin AND (%s OR NOT {_PRIVILEGED_ROLE})"
+            " ORDER BY r.rolname",
+            (superuser,),
         )
     ]
 
 
-def privileged_target_refused(conn: Connection, role: str) -> bool:
-    """True when `role` is privileged and the session is not a superuser: the
-    web application then refuses the action itself, whatever the extension
-    does (defense in depth, same rule as _require_target_allowed())."""
+def privileged_target_refused(conn: Connection, role: str, superuser: bool) -> bool:
+    """True when `role` is privileged (see _PRIVILEGED_ROLE) and the service
+    role is not a superuser.  An unknown role is not refused here: the
+    extension reports it."""
+    if superuser:
+        return False
     row = conn.execute(
-        "SELECT (rolsuper OR rolreplication OR rolbypassrls) AS privileged"
-        "  FROM pg_catalog.pg_roles WHERE rolname = %s",
+        f"SELECT {_PRIVILEGED_ROLE} AS privileged FROM pg_catalog.pg_roles r WHERE r.rolname = %s",
         (role,),
     ).fetchone()
-    if row is None or not row["privileged"]:
-        return False
-    return not _session_is_superuser(conn)
+    return row is not None and bool(row["privileged"])
 
 
 # --- profiles ----------------------------------------------------------------
