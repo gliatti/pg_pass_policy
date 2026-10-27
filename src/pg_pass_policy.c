@@ -1,53 +1,413 @@
-/* pg_pass_policy.c — squelette : _PG_init, GUC, shmem. À compléter (agent core). */
+/*-------------------------------------------------------------------------
+ *
+ * pg_pass_policy.c
+ *		Module entry point: _PG_init, GUC definitions, shared memory
+ *		request/startup, exemption list and small shared helpers.
+ *
+ * See docs/SPEC.md sections 5 and 6.
+ *
+ *-------------------------------------------------------------------------
+ */
 #include "postgres.h"
+
+#include <string.h>
+
 #include "fmgr.h"
+#include "funcapi.h"
 #include "miscadmin.h"
 #include "storage/ipc.h"
+#include "storage/lwlock.h"
 #include "storage/shmem.h"
+#include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/timestamp.h"
+#include "utils/tuplestore.h"
+#include "utils/varlena.h"
+
 #include "pg_pass_policy.h"
 #include "compat.h"
 
-PG_MODULE_MAGIC;
+PPP_MODULE_MAGIC;
 
-bool  ppp_enabled = true;
-char *ppp_database = NULL;
-int   ppp_worker_interval = 60;
-int   ppp_max_tracked_roles = 1024;
-bool  ppp_manage_valid_until = true;
-bool  ppp_log_events = true;
-char *ppp_notify_channel = NULL;
-char *ppp_exempt_roles = NULL;
-bool  ppp_superuser_bypass = false;
-bool  ppp_require_scram = true;
-bool  ppp_enforce_database = true;
+/* ---- GUC variables ----------------------------------------------------- */
+bool		ppp_enabled = true;
+char	   *ppp_database = NULL;
+int			ppp_worker_interval = 60;
+int			ppp_max_tracked_roles = 1024;
+bool		ppp_manage_valid_until = true;
+bool		ppp_log_events = true;
+char	   *ppp_notify_channel = NULL;
+char	   *ppp_exempt_roles = NULL;
+bool		ppp_superuser_bypass = false;
+bool		ppp_require_scram = true;
+bool		ppp_enforce_database = true;
 
+/* ---- shared state ------------------------------------------------------ */
 pppSharedState *ppp_shared = NULL;
-HTAB *ppp_role_hash = NULL;
+HTAB	   *ppp_role_hash = NULL;
 
-void _PG_init(void);
+/* default lockout parameters, mirroring the "default" profile of SPEC 3.1 */
+#define PPP_DEFAULT_MAX_FAILURES		5
+#define PPP_DEFAULT_FAILURE_WINDOW_SECS	(15 * 60)
+#define PPP_DEFAULT_LOCK_DURATION_SECS	(30 * 60)
 
+#ifdef PPP_HAVE_SHMEM_REQUEST_HOOK
+static shmem_request_hook_type prev_shmem_request_hook = NULL;
+#endif
+static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+
+void		_PG_init(void);
+
+PG_FUNCTION_INFO_V1(ppp_worker_status);
+
+
+/*
+ * Size of the shared memory segment we need: the fixed state plus the hash
+ * table of tracked roles (created by ppp_lockout_shmem_init()).
+ */
 Size
 ppp_shmem_size(void)
 {
-	return 0;
+	Size		size;
+
+	size = MAXALIGN(sizeof(pppSharedState));
+	size = add_size(size, hash_estimate_size(ppp_max_tracked_roles,
+											 sizeof(pppRoleEntry)));
+	return size;
 }
 
+static void
+ppp_request_shmem(void)
+{
+	RequestAddinShmemSpace(ppp_shmem_size());
+	RequestNamedLWLockTranche(PPP_LWLOCK_TRANCHE, 1);
+}
+
+#ifdef PPP_HAVE_SHMEM_REQUEST_HOOK
+static void
+ppp_shmem_request(void)
+{
+	if (prev_shmem_request_hook)
+		prev_shmem_request_hook();
+	ppp_request_shmem();
+}
+#endif
+
+static void
+ppp_shmem_startup(void)
+{
+	bool		found;
+
+	if (prev_shmem_startup_hook)
+		prev_shmem_startup_hook();
+
+	/* reset in case this is a restart within the postmaster */
+	ppp_shared = NULL;
+	ppp_role_hash = NULL;
+
+	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+
+	ppp_shared = ShmemInitStruct("pg_pass_policy shared state",
+								 sizeof(pppSharedState), &found);
+	if (!found)
+	{
+		memset(ppp_shared, 0, sizeof(pppSharedState));
+		ppp_shared->lock = &(GetNamedLWLockTranche(PPP_LWLOCK_TRANCHE))->lock;
+		ppp_shared->default_max_failures = PPP_DEFAULT_MAX_FAILURES;
+		ppp_shared->default_failure_window_secs = PPP_DEFAULT_FAILURE_WINDOW_SECS;
+		ppp_shared->default_lock_duration_secs = PPP_DEFAULT_LOCK_DURATION_SECS;
+		pg_atomic_init_u32(&ppp_shared->reload_requested, 0);
+		ppp_shared->worker_pid = 0;
+		ppp_shared->worker_last_run = 0;
+		ppp_shared->worker_last_reload = 0;
+	}
+
+	/* the role hash table belongs to lockout.c */
+	ppp_lockout_shmem_init();
+
+	LWLockRelease(AddinShmemInitLock);
+}
+
+/*
+ * GUC check hook for pg_pass_policy.exempt_roles: the value must be a valid
+ * comma-separated list of identifiers.
+ */
+static bool
+ppp_check_exempt_roles(char **newval, void **extra, GucSource source)
+{
+	char	   *rawstring;
+	List	   *elemlist;
+	bool		ok;
+
+	rawstring = pstrdup(*newval ? *newval : "");
+	ok = SplitIdentifierString(rawstring, ',', &elemlist);
+	if (!ok)
+		GUC_check_errdetail("List syntax is invalid.");
+	list_free(elemlist);
+	pfree(rawstring);
+	return ok;
+}
+
+/*
+ * Is the role exempted from the policy and from the lockout?
+ *
+ * The list follows the SQL identifier rules of SplitIdentifierString():
+ * unquoted names are down-cased, double-quoted names keep their case.  The
+ * comparison with the role name is then exact.
+ *
+ * Safe to call from the ClientAuthentication hook (no catalog access).
+ */
 bool
 ppp_role_is_exempt(const char *rolename)
 {
-	return false;
+	char	   *rawstring;
+	List	   *elemlist;
+	ListCell   *lc;
+	bool		result = false;
+
+	if (rolename == NULL || ppp_exempt_roles == NULL ||
+		ppp_exempt_roles[0] == '\0')
+		return false;
+
+	rawstring = pstrdup(ppp_exempt_roles);
+	if (!SplitIdentifierString(rawstring, ',', &elemlist))
+	{
+		/* cannot happen thanks to the check hook, be conservative */
+		list_free(elemlist);
+		pfree(rawstring);
+		return false;
+	}
+
+	foreach(lc, elemlist)
+	{
+		const char *name = (const char *) lfirst(lc);
+
+		if (strcmp(name, rolename) == 0)
+		{
+			result = true;
+			break;
+		}
+	}
+
+	list_free(elemlist);
+	pfree(rawstring);
+	return result;
 }
 
+/*
+ * Wipe memory that held a secret.  explicit_bzero() cannot be optimized away;
+ * the volatile loop is the portable fallback.
+ */
 void
 ppp_secure_zero(void *p, size_t len)
 {
-	volatile unsigned char *vp = (volatile unsigned char *) p;
-	while (len--)
-		*vp++ = 0;
+	if (p == NULL || len == 0)
+		return;
+#ifdef HAVE_EXPLICIT_BZERO
+	explicit_bzero(p, len);
+#else
+	{
+		volatile unsigned char *vp = (volatile unsigned char *) p;
+
+		while (len--)
+			*vp++ = 0;
+	}
+#endif
+}
+
+/*
+ * pass_policy.worker_status()
+ *		RETURNS TABLE(pid int, last_run timestamptz, last_reload timestamptz,
+ *					  tracked_roles int)
+ */
+Datum
+ppp_worker_status(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	TupleDesc	tupdesc;
+	Tuplestorestate *tupstore;
+	MemoryContext per_query_ctx;
+	MemoryContext oldcontext;
+	Datum		values[4];
+	bool		nulls[4];
+	pid_t		pid;
+	TimestampTz last_run;
+	TimestampTz last_reload;
+	int32		tracked = 0;
+
+	if (ppp_shared == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pg_pass_policy must be loaded via shared_preload_libraries")));
+
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+	if (!(rsinfo->allowedModes & SFRM_Materialize))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("materialize mode required, but it is not allowed in this context")));
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
+	oldcontext = MemoryContextSwitchTo(per_query_ctx);
+	tupdesc = CreateTupleDescCopy(tupdesc);
+	tupstore = tuplestore_begin_heap(true, false, work_mem);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = tupdesc;
+	MemoryContextSwitchTo(oldcontext);
+
+	LWLockAcquire(ppp_shared->lock, LW_SHARED);
+	pid = ppp_shared->worker_pid;
+	last_run = ppp_shared->worker_last_run;
+	last_reload = ppp_shared->worker_last_reload;
+	if (ppp_role_hash != NULL)
+		tracked = (int32) hash_get_num_entries(ppp_role_hash);
+	LWLockRelease(ppp_shared->lock);
+
+	memset(nulls, 0, sizeof(nulls));
+	values[0] = Int32GetDatum((int32) pid);
+	nulls[0] = (pid == 0);
+	values[1] = TimestampTzGetDatum(last_run);
+	nulls[1] = (last_run == 0);
+	values[2] = TimestampTzGetDatum(last_reload);
+	nulls[2] = (last_reload == 0);
+	values[3] = Int32GetDatum(tracked);
+
+	tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+
+	return (Datum) 0;
 }
 
 void
 _PG_init(void)
 {
+	if (!process_shared_preload_libraries_in_progress)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pg_pass_policy must be loaded via shared_preload_libraries"),
+				 errhint("Add pg_pass_policy to shared_preload_libraries in postgresql.conf and restart the server.")));
+
+	DefineCustomBoolVariable("pg_pass_policy.enabled",
+							 "Enables the password policy and the lockout.",
+							 "When off, the hooks do nothing and the background worker does not modify anything.",
+							 &ppp_enabled,
+							 true,
+							 PGC_SIGHUP,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomStringVariable("pg_pass_policy.database",
+							   "Database where the pg_pass_policy extension is installed.",
+							   "The background worker connects to this database.",
+							   &ppp_database,
+							   "postgres",
+							   PGC_POSTMASTER,
+							   0,
+							   NULL, NULL, NULL);
+
+	DefineCustomIntVariable("pg_pass_policy.worker_interval",
+							"Interval between two maintenance runs of the background worker.",
+							"0 disables the periodic run (run_maintenance() must then be called manually).",
+							&ppp_worker_interval,
+							60,
+							0,
+							INT_MAX / 1000,
+							PGC_SIGHUP,
+							GUC_UNIT_S,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("pg_pass_policy.max_tracked_roles",
+							"Maximum number of roles tracked in shared memory by the lockout.",
+							NULL,
+							&ppp_max_tracked_roles,
+							1024,
+							16,
+							1048576,
+							PGC_POSTMASTER,
+							0,
+							NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("pg_pass_policy.manage_valid_until",
+							 "Lets the background worker write pg_authid.rolvaliduntil.",
+							 NULL,
+							 &ppp_manage_valid_until,
+							 true,
+							 PGC_SIGHUP,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("pg_pass_policy.log_events",
+							 "Logs every pg_pass_policy event in the server log.",
+							 NULL,
+							 &ppp_log_events,
+							 true,
+							 PGC_SIGHUP,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomStringVariable("pg_pass_policy.notify_channel",
+							   "NOTIFY channel used for pg_pass_policy events.",
+							   NULL,
+							   &ppp_notify_channel,
+							   "pg_pass_policy",
+							   PGC_SIGHUP,
+							   0,
+							   NULL, NULL, NULL);
+
+	DefineCustomStringVariable("pg_pass_policy.exempt_roles",
+							   "Comma-separated list of roles exempted from the policy and the lockout.",
+							   "Unquoted names are down-cased like SQL identifiers.",
+							   &ppp_exempt_roles,
+							   "",
+							   PGC_SIGHUP,
+							   GUC_LIST_INPUT,
+							   ppp_check_exempt_roles, NULL, NULL);
+
+	DefineCustomBoolVariable("pg_pass_policy.superuser_bypass",
+							 "Superusers setting a password are not subject to the complexity rules.",
+							 NULL,
+							 &ppp_superuser_bypass,
+							 false,
+							 PGC_SIGHUP,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("pg_pass_policy.require_scram",
+							 "Rejects MD5 passwords.",
+							 NULL,
+							 &ppp_require_scram,
+							 true,
+							 PGC_SIGHUP,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("pg_pass_policy.enforce_database",
+							 "Rejects password changes made outside pg_pass_policy.database.",
+							 "When off, such changes are only accepted with a WARNING.",
+							 &ppp_enforce_database,
+							 true,
+							 PGC_SIGHUP,
+							 0,
+							 NULL, NULL, NULL);
+
+	PPP_RESERVE_GUC_PREFIX("pg_pass_policy");
+
+	/* shared memory */
+#ifdef PPP_HAVE_SHMEM_REQUEST_HOOK
+	prev_shmem_request_hook = shmem_request_hook;
+	shmem_request_hook = ppp_shmem_request;
+#else
+	ppp_request_shmem();
+#endif
+	prev_shmem_startup_hook = shmem_startup_hook;
+	shmem_startup_hook = ppp_shmem_startup;
+
+	/* hooks and background worker */
+	ppp_policy_init();
+	ppp_lockout_init();
+	ppp_worker_register();
 }

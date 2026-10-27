@@ -2,6 +2,7 @@ EXTENSION    = pg_pass_policy
 EXTVERSION   = 1.0
 MODULE_big   = pg_pass_policy
 OBJS         = src/pg_pass_policy.o src/policy.o src/lockout.o src/worker.o
+PG_CPPFLAGS  = -I$(srcdir)/src
 DATA         = sql/pg_pass_policy--$(EXTVERSION).sql
 PGFILEDESC   = "pg_pass_policy - password policy, rotation and lockout for roles"
 
