@@ -166,7 +166,7 @@ ppp_run_in_xact(const char *what, void (*step) (void))
 			elog(ERROR, "SPI_connect failed");
 		PushActiveSnapshot(GetTransactionSnapshot());
 
-		if (OidIsValid(get_extension_oid(PPP_LIBRARY_NAME, true)))
+		if (ppp_extension_installed())
 			step();
 		else
 			elog(DEBUG1, PPP_LOG_PREFIX "extension not installed in database \"%s\", nothing to do",

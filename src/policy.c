@@ -173,11 +173,14 @@ ppp_spi_end(pppSpiState *st)
 	SetUserIdAndSecContext(st->save_userid, st->save_sec_context);
 }
 
-/* Is the pg_pass_policy schema present in the current database? */
+/*
+ * Is the pg_pass_policy extension (not merely a schema of that name)
+ * installed in the current database?  See ppp_extension_installed().
+ */
 static bool
 ppp_schema_exists(void)
 {
-	return OidIsValid(get_namespace_oid(PPP_SCHEMA, true));
+	return ppp_extension_installed();
 }
 
 static int

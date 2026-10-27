@@ -130,6 +130,17 @@ SELECT ppp_test.try($$SELECT pass_policy.record_password_change('regress_user', 
  42501
 (1 row)
 
+-- ... et refusé aussi en superutilisateur hors du hook : seul le hook C peut
+-- enregistrer un changement (sinon un admin non superutilisateur pourrait
+-- rouvrir un compte superutilisateur expiré sans changer son mot de passe).
+RESET SESSION AUTHORIZATION;
+SELECT ppp_test.try($$SELECT pass_policy.record_password_change('regress_target', 'SCRAM-SHA-256$4096:haqxM21W2X4JN2z5mNIhgQ==$6wQyAb1jy/PwU6taBTaUoM8DCeQcK961IfQ80mS4Iwk=:nYBdZfaOxx6o2q0ioUkoxD3rmW1Nff4RWaNnPPYCZiw=')$$) AS record_as_superuser;
+ record_as_superuser 
+---------------------
+ 42501
+(1 row)
+
+SET SESSION AUTHORIZATION regress_user;
 -- Lecture directe des tables et vues : refusée
 SELECT ppp_test.try($$SELECT * FROM pass_policy.profile$$) AS sel_profile;
  sel_profile 
@@ -461,6 +472,45 @@ SELECT ppp_test.try($$SELECT pass_policy.create_rotation_pair('pair_super', 'reg
 (1 row)
 
 DO $$BEGIN EXECUTE format('ALTER DATABASE %I OWNER TO %I', current_database(), (SELECT o FROM dbowner)); END$$;
+-- ---------------------------------------------------------------------
+-- Faux schéma pass_policy dans une autre base : le hook ne doit jamais
+-- exécuter en superutilisateur les fonctions d'un schéma qui n'appartient pas
+-- à l'extension. Le propriétaire de la base (non superutilisateur) crée un
+-- schéma « pass_policy » avec une fonction effective_profile() piégée ; son
+-- ALTER ROLE doit être refusé par PPP-003 et la fonction ne doit pas tourner.
+-- ---------------------------------------------------------------------
+SELECT current_user AS orig_user \gset
+CREATE ROLE regress_fake_owner LOGIN NOSUPERUSER;
+CREATE DATABASE regress_fake OWNER regress_fake_owner;
+\c regress_fake regress_fake_owner
+CREATE SCHEMA pass_policy;
+CREATE TABLE pass_policy.trap(hit boolean);
+CREATE FUNCTION pass_policy.effective_profile(name) RETURNS SETOF record
+LANGUAGE plpgsql AS $$
+BEGIN
+  INSERT INTO pass_policy.trap VALUES (true);
+  ALTER ROLE regress_fake_owner SUPERUSER;
+  RETURN;
+END$$;
+\set VERBOSITY terse
+ALTER ROLE regress_fake_owner PASSWORD 'Fake-Schema-Probe-2026!';
+ERROR:  PPP-003: password changes must be made while connected to database "contrib_regression"
+\set VERBOSITY default
+SELECT count(*) AS trap_hits FROM pass_policy.trap;
+ trap_hits 
+-----------
+         0
+(1 row)
+
+SELECT rolsuper FROM pg_roles WHERE rolname = 'regress_fake_owner';
+ rolsuper 
+----------
+ f
+(1 row)
+
+\c contrib_regression :orig_user
+DROP DATABASE regress_fake;
+DROP ROLE regress_fake_owner;
 SELECT ppp_test.leaks();
  leaks 
 -------

@@ -12,9 +12,14 @@
 
 #include <string.h>
 
+#include "access/htup_details.h"
+#include "catalog/namespace.h"
+#include "catalog/pg_namespace.h"
+#include "commands/extension.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "utils/syscache.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
@@ -198,6 +203,44 @@ ppp_role_is_exempt(const char *rolename)
  * Wipe memory that held a secret.  explicit_bzero() cannot be optimized away;
  * the volatile loop is the portable fallback.
  */
+/*
+ * ppp_extension_installed
+ *
+ * The password hook runs in every database of the cluster and executes SPI
+ * queries as the bootstrap superuser against schema-qualified objects.  Merely
+ * finding a schema named PPP_SCHEMA is not enough: a user with CREATE on a
+ * database could create a look-alike schema whose effective_profile() would
+ * then run with superuser rights.  Require the real extension, bound to that
+ * very schema, and a superuser owner of the schema.
+ */
+bool
+ppp_extension_installed(void)
+{
+	Oid			extoid;
+	Oid			nspoid;
+	HeapTuple	tup;
+	Oid			nspowner;
+
+	extoid = get_extension_oid(PPP_LIBRARY_NAME, true);
+	if (!OidIsValid(extoid))
+		return false;
+
+	nspoid = get_namespace_oid(PPP_SCHEMA, true);
+	if (!OidIsValid(nspoid))
+		return false;
+
+	if (get_extension_schema(extoid) != nspoid)
+		return false;
+
+	tup = SearchSysCache1(NAMESPACEOID, ObjectIdGetDatum(nspoid));
+	if (!HeapTupleIsValid(tup))
+		return false;
+	nspowner = ((Form_pg_namespace) GETSTRUCT(tup))->nspowner;
+	ReleaseSysCache(tup);
+
+	return superuser_arg(nspowner);
+}
+
 void
 ppp_secure_zero(void *p, size_t len)
 {

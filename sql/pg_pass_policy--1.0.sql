@@ -870,14 +870,16 @@ COMMENT ON FUNCTION effective_profile(name) IS 'Profile applying to a role (assi
 /*
  * Called by the C hook (SPI) after a password has been accepted, in the
  * session of whoever runs CREATE/ALTER ROLE ... PASSWORD, hence
- * SECURITY DEFINER + EXECUTE to PUBLIC.  Allowed when:
- *  - the backend is inside the pg_pass_policy hook (_in_password_hook()):
- *    PostgreSQL has already checked that the current user may set this
- *    role's password (CREATEROLE/ADMIN, self, superuser) before calling the
- *    hook ; or
- *  - session_user is a superuser or a pass_policy_admin member.
- * A plain user calling it directly for himself is refused: otherwise he
- * could reset his own expiry without changing his password.
+ * SECURITY DEFINER + EXECUTE to PUBLIC.  Allowed ONLY when the backend is
+ * inside the pg_pass_policy hook (_in_password_hook()): PostgreSQL has
+ * already checked that the current user may set this role's password
+ * (CREATEROLE/ADMIN, self, superuser) before calling the hook.
+ * Any direct call is refused, whoever the caller is: a plain user could
+ * otherwise reset his own expiry without changing his password, and a
+ * non-superuser admin could re-open a superuser account that a superuser had
+ * expired (record_password_change does not go through
+ * _require_target_allowed()).  The SQL API never needs the direct call:
+ * run_maintenance() reconciles pg_authid through _record_password_change().
  */
 CREATE FUNCTION record_password_change(role text, verifier text)
 RETURNS void
@@ -885,10 +887,10 @@ LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN
-    IF NOT coalesce(pass_policy._in_password_hook() OR pass_policy._is_admin(), false) THEN
+    IF NOT coalesce(pass_policy._in_password_hook(), false) THEN
         RAISE EXCEPTION 'pg_pass_policy: permission denied to record a password change for role "%"', $1
               USING ERRCODE = 'insufficient_privilege',
-                    HINT = 'Change the password with ALTER ROLE ... PASSWORD.';
+                    HINT = 'Change the password with ALTER ROLE ... PASSWORD; direct calls are never allowed.';
     END IF;
     PERFORM pass_policy._record_password_change($1, $2);
 END

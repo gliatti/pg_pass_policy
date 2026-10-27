@@ -75,6 +75,14 @@ extern HTAB *ppp_role_hash;
 /* ---- pg_pass_policy.c -------------------------------------------------- */
 extern Size ppp_shmem_size(void);
 extern bool ppp_role_is_exempt(const char *rolename);
+/*
+ * True only if the pg_pass_policy extension is installed in the current
+ * database, its objects live in schema PPP_SCHEMA and that schema is owned by
+ * a superuser.  Any SPI call executed with elevated privileges must be gated
+ * by this check: a look-alike schema created by an unprivileged user must
+ * never be trusted.  Requires a transaction and catalog access.
+ */
+extern bool ppp_extension_installed(void);
 /* efface une zone mémoire contenant un secret avant de la libérer */
 extern void ppp_secure_zero(void *p, size_t len);
 
