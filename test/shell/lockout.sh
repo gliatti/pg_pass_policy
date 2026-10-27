@@ -280,6 +280,20 @@ t0=$(psql_admin "SELECT clock_timestamp()")
 psql_admin "ALTER SYSTEM SET pg_pass_policy.worker_interval = 600"
 psql_admin "SELECT pg_reload_conf()" >/dev/null
 wait_for 30 "SELECT coalesce(max(last_run) > '$t0'::timestamptz, false) FROM pass_policy.worker_status()" || fail "F5 : pas de tour du worker après le passage à 600 s"
+# (revue finale 4, H7) le worker dort : une demande shmem_reload() annulée par
+# ROLLBACK TO SAVEPOINT ne le réveille pas ; validée par RELEASE, si.
+t0=$(psql_admin "SELECT clock_timestamp()")
+printf '%s\n' "BEGIN;" "SAVEPOINT s;" "SELECT pass_policy.shmem_reload();" "ROLLBACK TO SAVEPOINT s;" "COMMIT;" | psql_admin_script >/dev/null || true
+sleep 3
+out=$(psql_admin "SELECT coalesce(max(last_reload) > '$t0'::timestamptz, false) FROM pass_policy.worker_status()")
+check_eq "H7 : shmem_reload() annulé par ROLLBACK TO SAVEPOINT : worker non réveillé" "f" "$out"
+t0=$(psql_admin "SELECT clock_timestamp()")
+printf '%s\n' "BEGIN;" "SAVEPOINT s;" "SELECT pass_policy.shmem_reload();" "RELEASE SAVEPOINT s;" "COMMIT;" | psql_admin_script >/dev/null || true
+if wait_for 30 "SELECT coalesce(max(last_reload) > '$t0'::timestamptz AND max(last_run) > '$t0'::timestamptz, false) FROM pass_policy.worker_status()"; then
+	ok "H7 : shmem_reload() dans un SAVEPOINT validé : worker réveillé au COMMIT"
+else
+	fail "H7 : shmem_reload() dans un SAVEPOINT validé n'a pas réveillé le worker"
+fi
 id0=$(psql_admin "SELECT coalesce(max(id), 0) FROM pass_policy.audit_log")
 for n in regress_ghost_a regress_ghost_b regress_ghost_c; do
 	for i in 1 2; do psql_as "$n" "$BAD" >/dev/null || true; done

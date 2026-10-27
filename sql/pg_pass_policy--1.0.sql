@@ -367,9 +367,9 @@ COMMENT ON FUNCTION worker_status() IS 'State of the pg_pass_policy background w
 /*
  * Addition to SPEC §4: true only while this backend is executing the
  * pg_pass_policy check_password_hook (static flag set by the C hook around
- * its SPI calls).  Defence in depth for record_password_change() and
- * audit(): neither is granted to PUBLIC any more (the hook calls them as
- * superuser), but should EXECUTE be granted by mistake, a user could
+ * its SPI calls).  Defence in depth for record_password_change(): it is
+ * not granted to PUBLIC any more (the hook calls it as superuser), but
+ * should EXECUTE be granted by mistake, a user could
  * otherwise call record_password_change() on himself and push back his own
  * expiry without changing his password.
  */
@@ -931,19 +931,20 @@ COMMENT ON FUNCTION _apply_profile_settings(int, jsonb) IS 'Internal: validates 
 -- 6. Public API (SPEC §4)
 -------------------------------------------------------------------------------
 
--- audit(): granted to pass_policy_admin; the C hook calls it as superuser
--- (password_rejected).  The check below keeps any other caller out even if
--- EXECUTE were granted more widely.
+-- audit(): granted to pass_policy_admin.  The C hook no longer calls it (a
+-- password_rejected row would be rolled back by the ERROR that follows: the
+-- hook writes a LOG line instead).  The check below keeps any other caller
+-- out even if EXECUTE were granted more widely.
 CREATE FUNCTION audit(event_type text, role_name text, details jsonb DEFAULT '{}')
 RETURNS void
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN
-    IF NOT coalesce(pass_policy._is_admin() OR pass_policy._in_password_hook(), false) THEN
+    IF NOT coalesce(pass_policy._is_admin(), false) THEN
         RAISE EXCEPTION 'pg_pass_policy: permission denied'
               USING ERRCODE = 'insufficient_privilege',
-                    HINT = 'audit() may only be called by an administrator or by the password hook.';
+                    HINT = 'audit() may only be called by an administrator.';
     END IF;
     PERFORM pass_policy._audit($1, $2, $3);
 END
@@ -1142,12 +1143,57 @@ $$;
 COMMENT ON FUNCTION unassign_profile(name) IS 'Removes the profile assignment of a role (back to "default")';
 
 /*
+ * Internal: generate a password conforming to the effective profile of a
+ * role, set it, record it and apply the VALID UNTIL rule; returns the
+ * password.  Shared by rotate_password() and switch_rotation_pair(), which
+ * check the caller and the target first (_require_admin(),
+ * _require_target_allowed(): p_oid is the OID that check returned).  Not
+ * SECURITY DEFINER: only called from those SECURITY DEFINER functions, and
+ * EXECUTE is granted to nobody.
+ *
  * The generated password exists only in a local variable and in the result
  * of the call: it is never written to a table, the audit, a NOTIFY payload,
  * a RAISE or the server log (see _set_password()).
  * The ALTER ROLE fires the C hook, which checks the policy and calls
  * record_password_change(); _ensure_recorded() covers the case where the
  * hook did not run.
+ */
+CREATE FUNCTION _rotate_role(p_role name, p_oid oid, p_length int)
+RETURNS text
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    v_profile text;
+    v_pwd     text;
+BEGIN
+    SELECT p.name INTO v_profile FROM pass_policy.effective_profile(p_role) p;
+    v_pwd := pass_policy.generate_password(coalesce(p_length, 24), v_profile);
+    IF v_pwd IS NULL THEN
+        RAISE EXCEPTION 'pg_pass_policy: password generation failed';
+    END IF;
+    PERFORM pass_policy._set_password(p_role, v_pwd);
+    -- records the change (must_change cleared) if the hook did not
+    PERFORM pass_policy._ensure_recorded(p_role);
+
+    PERFORM pass_policy._refresh_role_state(p_oid);
+    -- run_maintenance() step d never synchronises an exempt role (it only
+    -- lifts a past VALID UNTIL, 'unblock'): a VALID UNTIL written here would
+    -- never be updated again, so only a past one is lifted, as with
+    -- manage_valid_until = off (this also lifts the bound left by a
+    -- previous switch_rotation_pair())
+    PERFORM pass_policy._apply_valid_until(p_oid,
+              CASE WHEN pass_policy._guc_on('pg_pass_policy.manage_valid_until', true)
+                        AND NOT pass_policy._is_exempt(p_role)
+                   THEN 'force' ELSE 'unblock' END);
+    RETURN v_pwd;
+END
+$$;
+COMMENT ON FUNCTION _rotate_role(name, oid, int) IS 'Internal: generates, sets and records a new password for an already checked role; returns it';
+
+/*
+ * The password is generated and set by _rotate_role(); it is returned once
+ * and never stored or logged.
  */
 CREATE FUNCTION rotate_password(role name, length int DEFAULT 24)
 RETURNS text
@@ -1159,30 +1205,13 @@ DECLARE
     v_oid     oid;
     v_profile text;
     v_pwd     text;
-    v_vu      jsonb;
 BEGIN
     PERFORM pass_policy._require_admin();
     v_oid := pass_policy._require_target_allowed(v_role);
+
+    v_pwd := pass_policy._rotate_role(v_role, v_oid, $2);
+
     SELECT p.name INTO v_profile FROM pass_policy.effective_profile(v_role) p;
-
-    v_pwd := pass_policy.generate_password(coalesce($2, 24), v_profile);
-    IF v_pwd IS NULL THEN
-        RAISE EXCEPTION 'pg_pass_policy: password generation failed';
-    END IF;
-    PERFORM pass_policy._set_password(v_role, v_pwd);
-    -- records the change (must_change cleared) if the hook did not
-    PERFORM pass_policy._ensure_recorded(v_role);
-
-    PERFORM pass_policy._refresh_role_state(v_oid);
-    -- run_maintenance() step d never synchronises an exempt role (it only
-    -- lifts a past VALID UNTIL, 'unblock'): a VALID UNTIL written here would
-    -- never be updated again, so only a past one is lifted, as with
-    -- manage_valid_until = off
-    v_vu := pass_policy._apply_valid_until(v_oid,
-              CASE WHEN pass_policy._guc_on('pg_pass_policy.manage_valid_until', true)
-                        AND NOT pass_policy._is_exempt(v_role)
-                   THEN 'force' ELSE 'unblock' END);
-
     PERFORM pass_policy._audit('password_rotated', v_role,
             jsonb_build_object('profile', v_profile, 'length', coalesce($2, 24),
                                'valid_until', (SELECT a.rolvaliduntil FROM pg_catalog.pg_authid a
@@ -1367,7 +1396,6 @@ DECLARE
     v_old     name;
     v_new_oid oid;
     v_old_oid oid;
-    v_profile text;
     v_pwd     text;
     v_bound   timestamptz;
 BEGIN
@@ -1384,28 +1412,14 @@ BEGIN
         v_old_oid := pass_policy._require_target_allowed(v_old);
     END IF;
 
-    SELECT p.name INTO v_profile FROM pass_policy.effective_profile(v_new) p;
-    v_pwd := pass_policy.generate_password(coalesce($2, 24), v_profile);
-    IF v_pwd IS NULL THEN
-        RAISE EXCEPTION 'pg_pass_policy: password generation failed';
-    END IF;
-
     -- the new active role must not stay bounded by a previous switch
+    -- (cleared before the password is set; an ERROR below rolls it back)
     UPDATE pass_policy.rotation_pair r
        SET active_role = v_new, previous_role = v_old, switched_at = now(),
            previous_valid_until = NULL
      WHERE r.pair_name = rp.pair_name;
 
-    PERFORM pass_policy._set_password(v_new, v_pwd);
-    PERFORM pass_policy._ensure_recorded(v_new);
-    PERFORM pass_policy._refresh_role_state(v_new_oid);
-    -- same rule as rotate_password(): 'force' only when the extension
-    -- manages VALID UNTIL for this role (the bound of a previous switch, in
-    -- the past, is lifted by 'unblock' otherwise)
-    PERFORM pass_policy._apply_valid_until(v_new_oid,
-              CASE WHEN pass_policy._guc_on('pg_pass_policy.manage_valid_until', true)
-                        AND NOT pass_policy._is_exempt(v_new)
-                   THEN 'force' ELSE 'unblock' END);
+    v_pwd := pass_policy._rotate_role(v_new, v_new_oid, $2);
 
     IF v_old IS NOT NULL THEN
         SELECT now() + p.grace_period INTO v_bound FROM pass_policy.effective_profile(v_old) p;
@@ -1625,7 +1639,12 @@ BEGIN
             details := jsonb_build_object('reason', 'no_history',
                                           'changed_at', coalesce(r.password_changed_at, now()));
         ELSIF r.hverifier <> r.rolpassword AND (NOT r.has_state OR r.verifier_pending) THEN
-            -- expected mismatch: the hook recorded its own verifier (other salt)
+            -- expected mismatch: the hook recorded its own verifier (other salt).
+            -- Limit (SPEC 11, revue finale 4 H4): a real change made without
+            -- the hook (enforce_database = off outside the database,
+            -- enabled = off, exempt role) between that change and this pass
+            -- cannot be told apart from the salt gap without the clear text,
+            -- and is taken for it: no audit row, no new change date.
             UPDATE pass_policy.password_history h SET verifier = r.rolpassword WHERE h.id = r.hid;
             INSERT INTO pass_policy.role_state AS s (role_oid, role_name, password_changed_at)
             VALUES (r.oid, r.rname, r.hchanged)
@@ -1963,8 +1982,8 @@ COMMENT ON VIEW v_recent_audit IS 'Last 1000 audit events';
  *   superuser (ppp_spi_begin(), src/policy.c), whoever changes a password,
  *   so neither USAGE on the schema nor EXECUTE on effective_profile(),
  *   record_password_change() or audit() is needed by ordinary users ;
- *   record_password_change() and audit() keep their _in_password_hook()
- *   guard as defence in depth ;
+ *   record_password_change() keeps its _in_password_hook() guard and
+ *   audit() its _is_admin() check as defence in depth ;
  * - viewer: SELECT on tables and views, except password_history.verifier
  *   (column grant: the hashes are offline-cracking material) ;
  * - admin: member of viewer + EXECUTE on the administration API ;

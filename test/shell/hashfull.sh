@@ -222,6 +222,57 @@ check_contains "15 profils + fantômes : le 16e rôle, sans profil, est compté 
 out=$(psql_admin "SELECT failed_count FROM pass_policy.failed_attempts() WHERE role_name = 'regress_np'")
 check_eq "failed_attempts() : compteur du 16e rôle = 5" "5" "$out"
 
+# --- parcours d'éviction borné en mode COUNT (revue finale 4, H3) -----------
+# max_tracked_roles = 600 > PPP_EVICT_SCAN_LIMIT (256) : le hook n'examine que
+# 256 entrées par tentative, en reprenant là où il s'était arrêté. Extension
+# recréée (plus de profil ni de verrou à réinjecter) et redémarrage : hash vide.
+# Un seul nom inexistant (évincable), puis 599 verrous : la seule entrée
+# évincable est trouvée en 2 ou 3 tentatives (3 × 256 >= 600), sans LOG
+# « cannot track » (moins de 600 entrées examinées en vain). Ensuite, hash
+# plein d'entrées non évincables : LOG « cannot track » seulement une fois
+# tout le hash examiné.
+psql_admin "DROP EXTENSION pg_pass_policy; DROP SCHEMA pass_policy; CREATE EXTENSION pg_pass_policy" >/dev/null
+psql_admin "ALTER SYSTEM SET pg_pass_policy.max_tracked_roles = 600" >/dev/null
+"$PPP_BINDIR/pg_ctl" -D "$PPP_TMP/data" -l "$PPP_TMP/server.log" -o "-p $PPP_PORT" -w -t 60 restart >/dev/null
+kick || fail "H3 : pas de tour du worker après le redémarrage"
+check_eq "H3 : hash vide après le redémarrage" "0" "$(n_entries)"
+psql_admin "CREATE ROLE regress_h3 LOGIN PASSWORD '$GOOD'"
+# Nom inexistant placé dans l'un des derniers buckets du hash (1024 buckets
+# pour 600 entrées ; HASH_STRINGS hache comme hashtext() en collation "C") :
+# la première fenêtre de 256 entrées, depuis le bucket 0, ne l'atteint pas.
+ghost=$(psql_admin "SELECT n FROM (SELECT 'ghost9_' || i AS n FROM generate_series(1, 500) i) t
+                     ORDER BY hashtext(n COLLATE \"C\") & 1023 DESC LIMIT 1")
+psql_as "$ghost" "$BAD" >/dev/null || true
+psql_admin "DO \$\$BEGIN
+  FOR i IN 1..599 LOOP
+    EXECUTE format('CREATE ROLE regress_h%s LOGIN', i + 1000);
+    PERFORM pass_policy.lock_role(format('regress_h%s', i + 1000)::name, NULL, 'h3');
+    COMMIT;
+  END LOOP;
+END\$\$" >/dev/null
+check_eq "H3 : 599 verrous de vrais rôles + 1 nom inexistant" "599|1" \
+	"$(psql_admin "SELECT count(*) FILTER (WHERE locked_until IS NOT NULL), count(*) FILTER (WHERE role_name LIKE 'ghost9%') FROM pass_policy.failed_attempts()")"
+n0=$(n_log 'cannot track authentication failures')
+tries=0
+while [ "$tries" -lt 6 ]; do
+	tries=$((tries + 1))
+	psql_as regress_h3 "$BAD" >/dev/null || true
+	[ "$(psql_admin "SELECT count(*) FROM pass_policy.failed_attempts() WHERE role_name = 'regress_h3'")" = "1" ] && break
+done
+check_eq "H3 : l'entrée évincable est trouvée en 2 ou 3 tentatives, fenêtre par fenêtre ($tries)" "1" \
+	"$( [ "$tries" -ge 2 ] && [ "$tries" -le 3 ] && [ "$(psql_admin "SELECT count(*) FROM pass_policy.failed_attempts() WHERE role_name = 'regress_h3'")" = "1" ] && echo 1 || echo 0)"
+check_eq "H3 : le nom inexistant a été évincé" "0" \
+	"$(psql_admin "SELECT count(*) FROM pass_policy.failed_attempts() WHERE role_name LIKE 'ghost9%'")"
+check_eq "H3 : aucun LOG « cannot track » pendant la recherche" "0" "$(($(n_log 'cannot track authentication failures') - n0))"
+n0=$(n_log 'cannot track authentication failures')
+t_start=$(date +%s%N)
+flood ghost10 6
+t_ms=$((($(date +%s%N) - t_start) / 1000000))
+n1=$(($(n_log 'cannot track authentication failures') - n0))
+check_eq "H3 : hash plein non évincable : LOG « cannot track » une fois le hash parcouru ($n1 en $t_ms ms)" "1" \
+	"$( [ "$n1" -ge 1 ] && [ "$n1" -le $((t_ms / 1000 + 1)) ] && echo 1 || echo 0)"
+check_eq "H3 : le serveur répond" "1" "$(psql_admin "SELECT 1")"
+
 check_eq "aucun échec de cycle du worker dans le log" "0" "$(n_log 'pg_pass_policy: worker .* failed')"
 
 ppp_finish

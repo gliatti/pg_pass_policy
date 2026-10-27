@@ -229,7 +229,7 @@ Tous préfixés `pg_pass_policy.`. Contexte `postmaster` = redémarrage ;
 | `enabled` | bool | `on` | SIGHUP | `off` : les hooks ne font rien et le worker ne modifie rien |
 | `database` | string | `postgres` | postmaster | base où l'extension est installée et où le worker se connecte |
 | `worker_interval` | int (s) | `60` | SIGHUP | `0` : pas de tour périodique (appeler `run_maintenance()` à la main) |
-| `max_tracked_roles` | int | `1024` | postmaster | taille du hash de verrouillage en mémoire partagée (16 à 1 048 576). Doit dépasser le nombre de rôles LOGIN qui ont un profil ou un verrou : ces entrées ne sont jamais évincées ; si le hash n'en contient plus d'autres, les échecs ne sont plus comptés (LOG « cannot track ») et `lock_role()` échoue (ERROR 53400, transaction annulée). Les entrées des noms de rôles inexistants et les compteurs inactifs sont évincés en premier |
+| `max_tracked_roles` | int | `1024` | postmaster | taille du hash de verrouillage en mémoire partagée (16 à 1 048 576). Doit dépasser le nombre de rôles LOGIN qui ont un profil ou un verrou : ces entrées ne sont jamais évincées ; si le hash n'en contient plus d'autres, les échecs ne sont plus comptés (LOG « cannot track ») et `lock_role()` échoue (ERROR 53400, transaction annulée). Les entrées des noms de rôles inexistants et les compteurs inactifs sont évincés en premier. Recommandation : une valeur largement supérieure au nombre de rôles, avec une marge (voir « Énumération des rôles ») |
 | `manage_valid_until` | bool | `on` | SIGHUP | le worker écrit `pg_authid.rolvaliduntil` |
 | `log_events` | bool | `on` | SIGHUP | une ligne `LOG: pg_pass_policy: …` par événement |
 | `notify_channel` | string | `pg_pass_policy` | SIGHUP | canal `NOTIFY` (charge utile JSON `event`/`role`/`at`/`details`) |
@@ -243,6 +243,10 @@ Tous préfixés `pg_pass_policy.`. Contexte `postmaster` = redémarrage ;
 Un refus par le hook est une erreur SQLSTATE `28P01` (`invalid_password`) dont
 le message commence par le code ; `check_password()` renvoie le même code en
 texte. Le mot de passe n'apparaît jamais dans le message, le log ni l'audit.
+Un refus n'écrit pas de ligne dans `audit_log` (l'erreur annule la
+transaction) : la trace est une ligne du log serveur,
+`pg_pass_policy: password_rejected role=<rôle> {"code": "PPP-0xx"}`, si
+`pg_pass_policy.log_events = on`.
 
 | code | motif |
 |---|---|
@@ -268,6 +272,28 @@ Les caractères sont comptés en points de code UTF-8 ; tout caractère non ASCI
 compte comme « spécial ».
 
 ## Avertissements de sécurité
+
+- **Énumération des rôles** : un nom inexistant est « verrouillé » comme un
+  vrai rôle, pour que la réponse ne révèle pas son existence. Mais l'entrée
+  d'un nom inexistant reste évincable (sinon un flot de noms inventés
+  remplirait la mémoire partagée) : un attaquant qui, après le verrou, sature
+  le hash avec environ `max_tracked_roles` autres noms inexistants voit le
+  pseudo-verrou disparaître, alors que le verrou d'un vrai rôle reste.
+  L'oracle est donc atténué, pas éliminé : il exige de saturer le hash.
+  Dimensionner `max_tracked_roles` largement au-dessus du nombre de rôles,
+  avec une marge, et surveiller les lignes `auth_failed` agrégées
+  (`details.unknown_roles`).
+- **`enforce_database = off`, `enabled = off` ou rôle exempté** : un
+  changement de mot de passe fait hors du hook (hors de
+  `pg_pass_policy.database` avec `enforce_database = off`, hook désactivé, ou
+  rôle de `exempt_roles`) est normalement détecté par `run_maintenance()` (ligne
+  `password_changed`, `details.source = reconciliation`). Exception : s'il
+  survient entre un changement passé par le hook et la passe suivante de
+  `run_maintenance()`, il est pris pour l'écart de sel attendu entre le
+  vérificateur calculé par le hook et celui que PostgreSQL stocke : l'historique
+  reçoit le nouveau vérificateur sans ligne d'audit ni remise à zéro de la date
+  de changement. Avec `enforce_database = on` et `enabled = on` (défauts),
+  ce cas ne peut se produire que pour un rôle exempté.
 
 - **Mots de passe pré-hachés** : avec `reject_prehashed = true` (défaut), la
   commande `\password` de psql (qui envoie un vérificateur SCRAM) et la

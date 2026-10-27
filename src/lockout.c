@@ -235,12 +235,24 @@ ppp_expire_lock(pppRoleEntry *entry, TimestampTz now, bool check_inflight)
  * a caller that gives the room back (ppp_apply_lock_ops on error) can put
  * the entry back.
  *
- * The scan is linear in max_tracked_roles and only happens once the hash is
- * full.  In PPP_ENTER_COUNT mode, a scan that found nothing is not repeated
- * for one second (ppp_shared->evict_failed_at, ev->scan_skipped): the hash
- * is then full of entries the hook may not evict, and a flood of failed
- * connections would otherwise rescan it at every attempt under the
- * exclusive lock.
+ * The scan only happens once the hash is full.  In PPP_ENTER_PRIORITY mode
+ * (rare: locks, re-injection, profiles) it examines the whole hash.  In
+ * PPP_ENTER_COUNT mode (every failed connection) it is bounded: at most
+ * PPP_EVICT_SCAN_LIMIT entries are examined, from the bucket where the
+ * previous scan stopped (ppp_shared->evict_scan_bucket), and the victim is
+ * the best one of that window.  A fruitless window is treated as "no room"
+ * for this attempt (ev->scan_skipped, not logged); once fruitless windows
+ * have covered every entry (ppp_shared->evict_scan_fruitless), the scan is
+ * not repeated for one second (ppp_shared->evict_failed_at): the hash is
+ * then full of entries the hook may not evict, and a flood of failed
+ * connections would otherwise keep scanning it under the exclusive lock.
+ *
+ * Resuming a scan sets HASH_SEQ_STATUS.curBucket after hash_seq_init(),
+ * whose only other effect is to register the scan: the structure is
+ * documented as opaque, but its fields and the way hash_seq_search() reads
+ * curBucket are unchanged in PG 13 to 18 (PG 18 adds hasHashvalue, which
+ * hash_seq_init() sets to false).  A curBucket beyond max_bucket simply
+ * ends the scan, which then restarts from bucket 0.
  *
  * The explicit size check is needed: a shared hash can grow beyond its
  * max_size as long as the shared memory segment has free space left.
@@ -269,6 +281,12 @@ ppp_enter_role(const char *rolename, pppEnterMode mode, TimestampTz now,
 		pppRoleEntry *victim = NULL;
 		HASH_SEQ_STATUS seq;
 		pppRoleEntry *e;
+		long		nentries = hash_get_num_entries(ppp_role_hash);
+		long		limit = nentries;
+		long		examined = 0;
+		uint32		start_bucket = 0;
+		bool		wrapped;
+		bool		scanning;
 
 		if (mode == PPP_ENTER_COUNT && ppp_shared->evict_failed_at != 0 &&
 			now >= ppp_shared->evict_failed_at &&
@@ -280,10 +298,36 @@ ppp_enter_role(const char *rolename, pppEnterMode mode, TimestampTz now,
 		}
 
 		hash_seq_init(&seq, ppp_role_hash);
-		while ((e = (pppRoleEntry *) hash_seq_search(&seq)) != NULL)
+		if (mode == PPP_ENTER_COUNT)
 		{
-			pppEntryClass c = ppp_entry_class(e, now, in_recovery);
+			limit = Min(nentries, PPP_EVICT_SCAN_LIMIT);
+			start_bucket = ppp_shared->evict_scan_bucket;
+			seq.curBucket = start_bucket;
+		}
+		/* a scan started at bucket 0 has nothing to wrap around to */
+		wrapped = (start_bucket == 0);
+		scanning = true;
 
+		while (examined < limit)
+		{
+			pppEntryClass c;
+
+			e = (pppRoleEntry *) hash_seq_search(&seq);
+			if (e == NULL)
+			{
+				/* hash_seq_search() has terminated the scan */
+				if (wrapped)
+				{
+					scanning = false;
+					break;
+				}
+				wrapped = true;
+				hash_seq_init(&seq, ppp_role_hash);
+				continue;
+			}
+
+			examined++;
+			c = ppp_entry_class(e, now, in_recovery);
 			if (c > max_class)
 				continue;
 			if (victim == NULL || c < best_class ||
@@ -294,12 +338,45 @@ ppp_enter_role(const char *rolename, pppEnterMode mode, TimestampTz now,
 			}
 		}
 
+		if (mode == PPP_ENTER_COUNT)
+		{
+			uint32		next_bucket = 0;
+
+			if (scanning)
+			{
+				/*
+				 * Stopped by the limit.  In the middle of a chain, the next
+				 * scan restarts at the beginning of that bucket (a few
+				 * entries examined twice), unless no progress would be
+				 * made.
+				 */
+				next_bucket = seq.curBucket;
+				if (seq.curEntry != NULL && next_bucket == start_bucket)
+					next_bucket++;
+			}
+			ppp_shared->evict_scan_bucket = next_bucket;
+		}
+		if (scanning)
+			hash_seq_term(&seq);
+
 		if (victim == NULL)
 		{
 			if (mode == PPP_ENTER_COUNT)
-				ppp_shared->evict_failed_at = now;
+			{
+				ppp_shared->evict_scan_fruitless += examined;
+				if (ppp_shared->evict_scan_fruitless >= nentries)
+				{
+					/* every entry examined in vain: give up for a second */
+					ppp_shared->evict_failed_at = now;
+					ppp_shared->evict_scan_fruitless = 0;
+				}
+				else if (ev)
+					ev->scan_skipped = true;
+			}
 			return NULL;
 		}
+		if (mode == PPP_ENTER_COUNT)
+			ppp_shared->evict_scan_fruitless = 0;
 
 		if (ev)
 		{
@@ -733,8 +810,16 @@ static pppPendingOp *ppp_pending_ops_tail = NULL;
 /* the list holds at least one PPP_OP_LOCK (set at PRE_COMMIT) */
 static bool ppp_xact_has_lock_ops = false;
 
-/* shmem_reload() was called in the current transaction */
-static bool ppp_reload_in_xact = false;
+/*
+ * shmem_reload() was called in the current transaction: sub-transaction
+ * that owns the request, InvalidSubTransactionId if none.  Like the
+ * subxid of a pppPendingOp, it is handed to the parent when the
+ * sub-transaction commits and the request is dropped when it aborts.  It is
+ * always the current sub-transaction or one of its ancestors: the request
+ * of a committed child moves up to the parent, the one of an aborted child
+ * is dropped.  A second call therefore keeps the owner already recorded.
+ */
+static SubTransactionId ppp_reload_subxid = InvalidSubTransactionId;
 
 /* callbacks registered once per backend */
 static bool ppp_xact_cb_registered = false;
@@ -1097,9 +1182,9 @@ ppp_xact_callback(XactEvent event, void *arg)
 			/* after ProcArrayEndTransaction: our rows are visible to the worker */
 			ppp_finish_pending_ops(true);
 			ppp_reset_pending_ops();
-			if (ppp_reload_in_xact)
+			if (ppp_reload_subxid != InvalidSubTransactionId)
 			{
-				ppp_reload_in_xact = false;
+				ppp_reload_subxid = InvalidSubTransactionId;
 				ppp_signal_worker_reload();
 			}
 			break;
@@ -1109,7 +1194,7 @@ ppp_xact_callback(XactEvent event, void *arg)
 			/* locks applied at PRE_COMMIT, if the commit failed afterwards */
 			ppp_finish_pending_ops(false);
 			ppp_reset_pending_ops();
-			ppp_reload_in_xact = false;
+			ppp_reload_subxid = InvalidSubTransactionId;
 			break;
 
 		case XACT_EVENT_PRE_PREPARE:
@@ -1127,7 +1212,7 @@ ppp_xact_callback(XactEvent event, void *arg)
 
 		case XACT_EVENT_PREPARE:
 			/* a reload request is simply dropped: the next run_maintenance() catches up */
-			ppp_reload_in_xact = false;
+			ppp_reload_subxid = InvalidSubTransactionId;
 			break;
 
 		default:
@@ -1140,6 +1225,15 @@ ppp_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 					 SubTransactionId parentSubid, void *arg)
 {
 	pppPendingOp *op;
+
+	/* the reload request, if this sub-transaction owns it */
+	if (ppp_reload_subxid == mySubid)
+	{
+		if (event == SUBXACT_EVENT_COMMIT_SUB)
+			ppp_reload_subxid = parentSubid;
+		else if (event == SUBXACT_EVENT_ABORT_SUB)
+			ppp_reload_subxid = InvalidSubTransactionId;
+	}
 
 	if (ppp_pending_ops == NULL)
 		return;
@@ -1248,6 +1342,39 @@ ppp_require_superuser(const char *funcname)
 				 errdetail("Only superusers can call this function directly; use the pg_pass_policy administration functions.")));
 }
 
+/*
+ * Allocate, in cxt, room for one row of rowsize bytes per entry of
+ * ppp_role_hash, then take ppp_shared->lock in the given mode and return
+ * with it held: the caller copies the entries under the lock without
+ * allocating.  The size is read under a shared lock, plus a small margin
+ * for entries created before the lock is taken again; if the hash has grown
+ * beyond it meanwhile, the allocation is made again.  *maxrows receives the
+ * number of rows allocated, which bounds the copy.
+ */
+void *
+ppp_alloc_hash_copy(MemoryContext cxt, Size rowsize, int *maxrows,
+					LWLockMode mode)
+{
+	for (;;)
+	{
+		long		n;
+		void	   *buf;
+
+		LWLockAcquire(ppp_shared->lock, LW_SHARED);
+		n = hash_get_num_entries(ppp_role_hash);
+		LWLockRelease(ppp_shared->lock);
+
+		*maxrows = (int) n + PPP_HASH_COPY_MARGIN;
+		buf = MemoryContextAlloc(cxt, rowsize * (Size) *maxrows);
+
+		LWLockAcquire(ppp_shared->lock, mode);
+		if (hash_get_num_entries(ppp_role_hash) <= *maxrows)
+			return buf;
+		LWLockRelease(ppp_shared->lock);
+		pfree(buf);
+	}
+}
+
 /* local copy of a hash entry, built under the lock */
 typedef struct pppAttemptRow
 {
@@ -1283,11 +1410,10 @@ ppp_failed_attempts(PG_FUNCTION_ARGS)
 	ppp_begin_materialize(fcinfo, &tupdesc, &tupstore, 5);
 
 	/* copy the interesting entries under a shared lock, no palloc inside */
-	maxrows = ppp_max_tracked_roles > 0 ? ppp_max_tracked_roles : 1;
-	rows = (pppAttemptRow *) palloc(sizeof(pppAttemptRow) * maxrows);
 	now = GetCurrentTimestamp();
-
-	LWLockAcquire(ppp_shared->lock, LW_SHARED);
+	rows = (pppAttemptRow *) ppp_alloc_hash_copy(CurrentMemoryContext,
+												 sizeof(pppAttemptRow),
+												 &maxrows, LW_SHARED);
 	hash_seq_init(&seq, ppp_role_hash);
 	while ((entry = (pppRoleEntry *) hash_seq_search(&seq)) != NULL)
 	{
@@ -1351,14 +1477,16 @@ ppp_failed_attempts(PG_FUNCTION_ARGS)
  * caller's changes are visible and consume the request for nothing.  Not
  * signalled when called from the worker itself (run_maintenance() calls
  * shmem_reload()): the worker consumes reload_requested at its next step.
- * A ROLLBACK drops the request.
+ * A ROLLBACK drops the request, and so does a ROLLBACK TO SAVEPOINT that
+ * undoes the call (ppp_reload_subxid).
  */
 Datum
 ppp_shmem_reload(PG_FUNCTION_ARGS)
 {
 	ppp_check_shmem();
 	ppp_register_xact_callbacks();
-	ppp_reload_in_xact = true;
+	if (ppp_reload_subxid == InvalidSubTransactionId)
+		ppp_reload_subxid = GetCurrentSubTransactionId();
 
 	PG_RETURN_VOID();
 }

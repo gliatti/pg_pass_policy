@@ -144,6 +144,14 @@ typedef enum pppEntryClass
 #define PPP_STALE_AUDIT_SECS	(24 * 60 * 60)
 
 /*
+ * Maximum number of entries examined by one eviction scan in PPP_ENTER_COUNT
+ * mode (authentication hook), under the exclusive lock.  PPP_ENTER_PRIORITY
+ * (locks, re-injection, profiles: rare, made by administrators or the
+ * worker) still scans the whole hash.
+ */
+#define PPP_EVICT_SCAN_LIMIT	256
+
+/*
  * Entry creation when the hash is full (SPEC 6.3):
  * - PPP_ENTER_COUNT: plain failure counting (authentication hook); evicts
  *   PPP_CLASS_GHOST then PPP_CLASS_INACTIVE entries only;
@@ -161,7 +169,10 @@ typedef struct pppEviction
 {
 	bool		evicted;
 	bool		ghost;					/* evicted entry was a non-existent role */
-	bool		scan_skipped;			/* COUNT mode: recent failed scan, skipped */
+	bool		scan_skipped;			/* COUNT mode: no room, but no conclusive
+										 * scan (skipped after a recent fruitless
+										 * one, or fruitless window of a cycle
+										 * not finished yet): not logged */
 	char		rolename[NAMEDATALEN];
 	int32		lost_failed_count;		/* counter still inside its window */
 	int32		lost_pending_failures;	/* failures lost before being audited */
@@ -193,6 +204,18 @@ typedef struct pppSharedState
 	 * attempt.
 	 */
 	TimestampTz evict_failed_at;
+
+	/*
+	 * Bounded eviction scan of PPP_ENTER_COUNT mode (ppp_enter_role): the
+	 * hook examines at most PPP_EVICT_SCAN_LIMIT entries per attempt,
+	 * starting from the bucket where the previous scan stopped
+	 * (evict_scan_bucket).  evict_scan_fruitless counts the entries examined
+	 * since an evictable one was last found; once it reaches the number of
+	 * entries, the whole hash has been examined in vain and evict_failed_at
+	 * is set.
+	 */
+	uint32		evict_scan_bucket;
+	int64		evict_scan_fruitless;
 
 	/*
 	 * Incremented (under the lock) each time a lock or unlock requested
@@ -269,6 +292,14 @@ extern pppRoleEntry *ppp_enter_role(const char *rolename, pppEnterMode mode,
 									TimestampTz now, bool in_recovery,
 									pppEviction *ev);
 extern void ppp_log_eviction(const pppEviction *ev);
+/*
+ * Allocate in cxt one row of rowsize bytes per hash entry (plus
+ * PPP_HASH_COPY_MARGIN), then return with ppp_shared->lock held in mode;
+ * *maxrows bounds the copy made under the lock.
+ */
+#define PPP_HASH_COPY_MARGIN	16
+extern void *ppp_alloc_hash_copy(MemoryContext cxt, Size rowsize,
+								 int *maxrows, LWLockMode mode);
 /* failure_window_secs > 0 and elapsed since first_failure_at */
 extern bool ppp_window_elapsed(const pppRoleEntry *entry, TimestampTz now);
 /* class of an entry; ppp_entry_real_class() ignores role_missing */

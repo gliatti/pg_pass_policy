@@ -259,7 +259,7 @@ ppp_sync_pending(void)
 	pppRoleEntry *entry;
 	pppPendingRow *rows;
 	int			nrows = 0;
-	int			maxrows = ppp_max_tracked_roles > 0 ? ppp_max_tracked_roles : 1;
+	int			maxrows;
 	int			i;
 	int			ghost_names = 0;
 	int64		ghost_attempts = 0;
@@ -267,11 +267,12 @@ ppp_sync_pending(void)
 	TimestampTz ghost_last = 0;
 
 	Assert(ppp_pending_rows == NULL);
-	rows = (pppPendingRow *) MemoryContextAlloc(ppp_worker_cxt,
-												sizeof(pppPendingRow) * maxrows);
+	/* read only: a shared lock is enough (the acknowledgement is separate) */
+	rows = (pppPendingRow *) ppp_alloc_hash_copy(ppp_worker_cxt,
+												 sizeof(pppPendingRow),
+												 &maxrows, LW_SHARED);
 	ppp_pending_rows = rows;
 
-	LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
 	hash_seq_init(&seq, ppp_role_hash);
 	while ((entry = (pppRoleEntry *) hash_seq_search(&seq)) != NULL)
 	{

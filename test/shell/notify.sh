@@ -106,10 +106,9 @@ leak_probe "ALTER ROLE via EXECUTE (CONTEXT)" 'leakprobe2' \
 	"DO \$\$ BEGIN EXECUTE 'ALTER ROLE regress_notify PASSWORD ''leakprobe2'''; END \$\$"
 leak_probe "_set_password (chemin de rotate_password)" 'leakprobe3' \
 	"SELECT pass_policy._set_password('regress_notify', 'leakprobe3')"
-# La ligne d'audit password_rejected est écrite dans une sous-transaction, mais
-# la transaction englobante est annulée par l'ERROR : seule la ligne LOG
-# (RAISE LOG de _audit, sans CONTEXT) subsiste.
-n=$(grep -cE 'password_rejected role=regress_notify .*PPP-010' "$PPP_TMP/server.log" || true)
+# Un refus n'écrit pas de ligne d'audit (l'ERROR annulerait la transaction) :
+# le hook écrit directement une ligne LOG au format de _audit, sans CONTEXT.
+n=$(grep -cF 'pg_pass_policy: password_rejected role=regress_notify {"code": "PPP-010"}' "$PPP_TMP/server.log" || true)
 check_eq "trois refus journalisés (LOG password_rejected, code seul)" "3" "$n"
 out=$(psql_admin "SELECT count(*) FROM pass_policy.audit_log WHERE details::text LIKE '%leakprobe%'")
 check_eq "aucun mot de passe refusé dans l'audit" "0" "$out"

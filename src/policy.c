@@ -57,7 +57,7 @@ static bool ppp_missing_schema_warned = false;
 
 /*
  * True while this backend runs the password hook: lets the SQL side
- * (record_password_change(), audit()) accept calls coming from the hook.
+ * (record_password_change()) accept calls coming from the hook.
  */
 static bool ppp_in_hook = false;
 
@@ -995,83 +995,18 @@ ppp_evaluate_plain(const char *username, Oid roleid, const char *password,
  */
 
 /*
- * Write a password_rejected audit row in a subtransaction.  Any failure is
- * downgraded to a LOG message so that it never hides the main error.
+ * Reject the password: log, then ERROR.  The statement (which holds the
+ * clear-text password) and the context (which holds it too when the ALTER
+ * ROLE is run through EXECUTE, as in rotate_password) are hidden from the
+ * server log, here and again by ppp_rethrow_hidden() in the hook.
  *
- * Runs inside the SPI session of the hook (the subtransaction rollback keeps
- * the identity, GUC level and SPI connection set up before it).
- *
- * Note: the ERROR raised right after aborts the enclosing transaction, which
- * also discards this row: the durable trace is the server log line written
- * by audit() (RAISE LOG), or by ppp_reject() when the audit failed.
- * Returns true if audit() succeeded.
- */
-static bool
-ppp_audit_rejection(const char *username, const char *code)
-{
-	MemoryContext oldcxt = CurrentMemoryContext;
-	ResourceOwner oldowner = CurrentResourceOwner;
-	volatile bool ok = true;
-
-	if (IsInParallelMode())
-		return false;
-
-	BeginInternalSubTransaction(NULL);
-	MemoryContextSwitchTo(oldcxt);
-
-	PG_TRY();
-	{
-		Oid			argtypes[2] = {TEXTOID, TEXTOID};
-		Datum		values[2];
-		int			ret;
-
-		values[0] = CStringGetTextDatum(username);
-		values[1] = CStringGetTextDatum(code);
-
-		ret = SPI_execute_with_args("SELECT " PPP_SCHEMA ".audit('password_rejected', $1, "
-									"pg_catalog.jsonb_build_object('code', $2))",
-									2, argtypes, values, NULL, false, 0);
-		if (ret != SPI_OK_SELECT)
-			elog(ERROR, "audit() failed: %s", SPI_result_code_string(ret));
-
-		ReleaseCurrentSubTransaction();
-		MemoryContextSwitchTo(oldcxt);
-		CurrentResourceOwner = oldowner;
-	}
-	PG_CATCH();
-	{
-		ErrorData  *edata;
-
-		MemoryContextSwitchTo(oldcxt);
-		edata = CopyErrorData();
-		FlushErrorState();
-
-		RollbackAndReleaseCurrentSubTransaction();
-		MemoryContextSwitchTo(oldcxt);
-		CurrentResourceOwner = oldowner;
-		ok = false;
-
-		ereport(LOG,
-				(errmsg(PPP_LOG_PREFIX "could not write audit event password_rejected for role \"%s\": %s",
-						username, edata->message),
-				 errhidestmt(true),
-				 errhidecontext(true)));
-		FreeErrorData(edata);
-	}
-	PG_END_TRY();
-
-	return ok;
-}
-
-/*
- * Reject the password: log, audit, then ERROR.  The statement (which holds
- * the clear-text password) and the context (which holds it too when the
- * ALTER ROLE is run through EXECUTE, as in rotate_password) are hidden from
- * the server log, here and again by ppp_rethrow_hidden() in the hook.
+ * The rejection is not written to audit_log: the ERROR raised right after
+ * aborts the enclosing transaction, which would discard the row and its
+ * NOTIFY anyway.  The durable trace is this LOG line, in the format of the
+ * one written by _audit() for the other events (pg_pass_policy.log_events).
  */
 static void
-ppp_reject(const char *username, const char *code, const pppProfile *p,
-		   bool audit)
+ppp_reject(const char *username, const char *code, const pppProfile *p)
 {
 	char	   *msg;
 	char	   *detail;
@@ -1079,10 +1014,9 @@ ppp_reject(const char *username, const char *code, const pppProfile *p,
 
 	ppp_describe(code, p, &msg, &detail, &hint);
 
-	/* audit() logs the event itself; log here when not called or failed */
-	if (!(audit && ppp_audit_rejection(username, code)) && ppp_log_events)
+	if (ppp_log_events)
 		ereport(LOG,
-				(errmsg(PPP_LOG_PREFIX "password_rejected role=\"%s\" code=%s",
+				(errmsg(PPP_LOG_PREFIX "password_rejected role=%s {\"code\": \"%s\"}",
 						username, code),
 				 errhidestmt(true),
 				 errhidecontext(true)));
@@ -1187,7 +1121,7 @@ ppp_extension_absent(const char *username)
 
 		memset(&prof, 0, sizeof(prof));
 		prof.name = "?";
-		ppp_reject(username, "PPP-003", &prof, false);
+		ppp_reject(username, "PPP-003", &prof);
 	}
 
 	if (!ppp_missing_schema_warned)
@@ -1237,25 +1171,25 @@ ppp_apply_policy(const char *username, const char *shadow_pass,
 	{
 		/* step 3: pre-hashed password, complexity cannot be checked */
 		if (prof.reject_prehashed)
-			ppp_reject(username, "PPP-001", &prof, true);
+			ppp_reject(username, "PPP-001", &prof);
 		if (password_type == PASSWORD_TYPE_MD5 && ppp_require_scram)
-			ppp_reject(username, "PPP-002", &prof, true);
+			ppp_reject(username, "PPP-002", &prof);
 		if (may_check_history && !caller_is_super &&
 			ppp_min_age_violated(username, roleid, &prof))
-			ppp_reject(username, "PPP-030", &prof, true);
+			ppp_reject(username, "PPP-030", &prof);
 		verifier = pstrdup(shadow_pass);
 	}
 	else
 	{
 		if (ppp_require_scram && Password_encryption == PASSWORD_TYPE_MD5)
-			ppp_reject(username, "PPP-002", &prof, true);
+			ppp_reject(username, "PPP-002", &prof);
 
 		/* steps 4 to 6 */
 		code = ppp_evaluate_plain(username, roleid, shadow_pass, &prof,
 								  ppp_superuser_bypass && caller_is_super,
 								  may_check_history, caller_is_super);
 		if (code != NULL)
-			ppp_reject(username, code, &prof, true);
+			ppp_reject(username, code, &prof);
 
 		/* step 7 */
 		verifier = encrypt_password(PASSWORD_TYPE_SCRAM_SHA_256, username,
@@ -1406,9 +1340,10 @@ ppp_check_secret(FunctionCallInfo fcinfo, const char *username, Oid roleid,
  * otherwise "PPP-0xx: reason".  No side effect, no audit.
  *
  * The minimum age, history and current password checks are only done when
- * the caller is a superuser or the role itself, so that the function cannot
- * be used as an oracle on another role's passwords or on the date of its
- * last change.
+ * the caller is a superuser, the role itself, or may change the role's
+ * password (PPP_MAY_SET_PASSWORD_OF, the predicate of the hook), so that the
+ * function cannot be used as an oracle on the passwords of a role the
+ * caller may not change, or on the date of its last change.
  *
  * The whole body runs in one elevated SPI session whose GUC guard keeps
  * STATEMENT/CONTEXT (which hold the password) out of the messages emitted
@@ -1446,8 +1381,10 @@ ppp_check_password(PG_FUNCTION_ARGS)
 		/* everything that can fail without needing the secret comes first */
 		ppp_load_effective_profile(username, &prof, cxt);
 		roleid = get_role_oid(username, true);
+		/* same predicate as the hook (explicit user id, no elevation) */
 		may_check_history = caller_is_super ||
-			(OidIsValid(roleid) && roleid == caller);
+			(OidIsValid(roleid) &&
+			 (roleid == caller || PPP_MAY_SET_PASSWORD_OF(caller, roleid)));
 
 		code = ppp_check_secret(fcinfo, username, roleid, &prof,
 								may_check_history, caller_is_super);
@@ -1652,8 +1589,8 @@ ppp_generate_password(PG_FUNCTION_ARGS)
  * pass_policy._in_password_hook() RETURNS bool
  *
  * True only while this backend is executing the pg_pass_policy
- * check_password_hook (addition to SPEC 4, used by the SQL guards of
- * record_password_change() and audit()).
+ * check_password_hook (addition to SPEC 4, used by the SQL guard of
+ * record_password_change()).
  */
 Datum
 ppp_in_password_hook(PG_FUNCTION_ARGS)

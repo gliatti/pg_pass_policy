@@ -127,6 +127,16 @@ INSERT INTO ppp_test.secrets
 -- PPP-030 renseignerait sur la date du dernier changement d'un autre rôle
 INSERT INTO ppp_test.secrets VALUES ('admin_check', 'Unrelated-Valid#2026x');
 SELECT ppp_test.code(pass_policy.check_password('regress_target', 'Unrelated-Valid#2026x')) AS admin_check_other;
+-- ... mais un admin qui peut changer ce mot de passe (CREATEROLE et ADMIN
+-- OPTION sur regress_target : le prédicat du hook, PPP_MAY_SET_PASSWORD_OF,
+-- vrai sur PG 14-15 comme sur PG >= 16) voit l'historique et min_age : PPP-030
+RESET SESSION AUTHORIZATION;
+CREATE ROLE regress_hadmin LOGIN CREATEROLE IN ROLE pass_policy_admin;
+GRANT regress_target TO regress_hadmin WITH ADMIN OPTION;
+SET SESSION AUTHORIZATION regress_hadmin;
+SELECT ppp_test.code(pass_policy.check_password('regress_target', 'Unrelated-Valid#2026x')) AS admin_option_check_other;
+RESET SESSION AUTHORIZATION;
+SET SESSION AUTHORIZATION regress_admin;
 SELECT ppp_test.try($$SELECT pass_policy.lock_role('regress_target', interval '1 hour', 'admin test')$$) AS lock;
 SELECT ppp_test.try($$SELECT pass_policy.unlock_role('regress_target')$$) AS unlock;
 SELECT ppp_test.try($$SELECT pass_policy.create_profile('p_admin', '{"min_length": 14}')$$) AS create_profile;
