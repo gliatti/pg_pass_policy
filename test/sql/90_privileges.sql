@@ -134,6 +134,8 @@ SELECT ppp_test.try($$SELECT pass_policy.assign_profile('regress_target', 'p_adm
 SELECT ppp_test.try($$SELECT pass_policy.unassign_profile('regress_target')$$) AS unassign_profile;
 SELECT ppp_test.try($$SELECT pass_policy.drop_profile('p_admin')$$) AS drop_profile;
 SELECT ppp_test.try($$SELECT count(*) FROM pass_policy.run_maintenance()$$) AS run_maintenance;
+-- rebind_restored_roles() : superutilisateur seulement (aucun GRANT)
+SELECT ppp_test.try($$SELECT count(*) FROM pass_policy.rebind_restored_roles()$$) AS rebind_restored;
 SELECT ppp_test.try($$SELECT * FROM pass_policy.v_role_status$$) AS sel_status;
 -- Exigence de sécurité (proposée) : un admin non superutilisateur ne peut pas
 -- changer le mot de passe d'un superutilisateur (prise de contrôle)

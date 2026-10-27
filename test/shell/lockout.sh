@@ -341,6 +341,42 @@ check_eq "F1 : regress_rejected non verrouillé (6 refus pg_hba)" "regress_rejec
 n=$(grep -c 'pg_pass_policy: worker .* failed' "$PPP_TMP/server.log" || true)
 check_eq "aucun échec de cycle du worker dans le log" "0" "$n"
 
+# --- lock_role() concurrent de l'écriture d'un verrou automatique -----------
+# Un verrou automatique attend son audit pendant qu'une transaction de
+# lock_role() tient la ligne role_state : l'upsert du worker attend ce verrou
+# de ligne puis écrirait par-dessus le verrou manuel validé entre-temps, et le
+# rechargement du même tour le recopierait en mémoire partagée (le verrou
+# manuel « infinity » deviendrait un verrou auto qui expire). Le worker
+# compare lock_seq avant son COMMIT et recommence au tour suivant.
+psql_admin "SELECT pass_policy.create_profile('p_race',
+  '{\"max_failures\": 3, \"failure_window\": \"1 minute\", \"lock_duration\": \"1 hour\", \"min_age\": \"0\"}')" >/dev/null
+psql_admin "CREATE ROLE regress_race LOGIN PASSWORD '$GOOD'"
+t0=$(psql_admin "SELECT clock_timestamp()")
+psql_admin "SELECT pass_policy.assign_profile('regress_race', 'p_race')" >/dev/null
+wait_reload "$t0" || fail "pas de rechargement après assign_profile (regress_race)"
+race_out="$PPP_TMP/race_lock.out"
+printf '%s\n' "BEGIN;" "SELECT pass_policy.lock_role('regress_race', NULL, 'race') IS NOT NULL;" \
+	"SELECT pg_sleep(6);" "COMMIT;" | psql_admin_script >"$race_out" &
+race_pid=$!
+sleep 1
+for i in 1 2 3; do psql_as regress_race "$BAD" >/dev/null || true; done
+out=$(psql_admin "SELECT locked_until > now() + interval '50 minutes' AND locked_until <> 'infinity' FROM pass_policy.failed_attempts() WHERE role_name = 'regress_race'")
+check_eq "verrou automatique posé pendant la transaction de lock_role()" "t" "$out"
+wait "$race_pid" || fail "transaction lock_role() en échec" "$(cat "$race_out")"
+wait_worker_run 30 || true
+wait_worker_run 30 || true
+out=$(psql_admin "SELECT locked_by, locked_until = 'infinity' FROM pass_policy.role_state WHERE role_name = 'regress_race'")
+check_eq "role_state : le verrou manuel validé n'est pas écrasé par le verrou auto" "manual|t" "$out"
+out=$(psql_admin "SELECT locked_by, locked_until = 'infinity' FROM pass_policy.v_locked WHERE role_name = 'regress_race'")
+check_eq "v_locked : manual / infinity après deux tours" "manual|t" "$out"
+out=$(psql_admin "SELECT locked_until = 'infinity' FROM pass_policy.failed_attempts() WHERE role_name = 'regress_race'")
+check_eq "mémoire partagée : verrou manuel conservé" "t" "$out"
+out=$(psql_admin "SELECT count(*) FROM pass_policy.audit_log WHERE event_type = 'role_locked' AND role_name = 'regress_race' AND details->>'locked_by' = 'auto'")
+check_eq "verrou automatique audité une fois" "1" "$out"
+n=$(grep -c 'lock of role "regress_race" changed while its automatic lock was being written' "$PPP_TMP/server.log" || true)
+log "info : $n tour(s) du worker annulé(s) par la vérification de lock_seq"
+psql_admin "SELECT pass_policy.unlock_role('regress_race')" >/dev/null
+
 # --- bibliothèque retirée de shared_preload_libraries : lock_role échoue -----
 # Sans préchargement, shmem_lock_role() ne peut pas écrire en mémoire partagée
 # (le chargement de la bibliothèque échoue) : lock_role() et unlock_role()

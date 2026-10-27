@@ -75,6 +75,19 @@ typedef struct pppRoleEntry
 	TimestampTz audit_locked_until;
 
 	/*
+	 * Automatic lock episodes.  audit_lock_seq is incremented by the
+	 * authentication hook at every automatic lock; audit_acked_seq is the
+	 * episode whose role_locked row was last written (acknowledged by the
+	 * worker), or the last episode when none is pending.  When a new lock
+	 * overwrites audit_locked_until before the worker has written the
+	 * previous one, audit_lock_seq - audit_acked_seq - 1 episodes have lost
+	 * their own row: the worker reports that count in the details of the row
+	 * it writes (lost_episodes) instead.
+	 */
+	uint32		audit_lock_seq;
+	uint32		audit_acked_seq;
+
+	/*
 	 * When locked_until was last set to a new lock (authentication hook,
 	 * PRE_COMMIT of shmem_lock_role(), re-injection by the worker).  An
 	 * unlock committed afterwards only lifts a lock set before it was

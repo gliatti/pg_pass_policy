@@ -8,8 +8,8 @@
  * (PerformAuthentication() is called once StartTransactionCommand() and
  * GetTransactionSnapshot() have run, PG 13 to 17 at least): syscache lookups
  * work there, as get_role_password() itself does SearchSysCache1(AUTHNAME).
- * The hook only uses one, to know whether the user name is an existing role;
- * no SPI.  Everything else lives in shared memory (ppp_role_hash), which is
+ * The hook only uses one (AUTHNAME), to know whether the user name is an
+ * existing role and whether its rolvaliduntil has passed; no SPI.  Everything else lives in shared memory (ppp_role_hash), which is
  * filled by the background worker (profile parameters, persisted locks) and
  * read back by the worker to write audit rows and role_state (worker.c).
  *
@@ -37,6 +37,7 @@
 
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "catalog/pg_authid.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "libpq/auth.h"
@@ -47,6 +48,7 @@
 #include "storage/shmem.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/syscache.h"
 #include "utils/timestamp.h"
 #include "utils/tuplestore.h"
 
@@ -93,6 +95,8 @@ ppp_init_entry(pppRoleEntry *entry)
 	entry->lock_pending_audit = false;
 	entry->pending_failures = 0;
 	entry->audit_locked_until = 0;
+	entry->audit_lock_seq = 0;
+	entry->audit_acked_seq = 0;
 	entry->lock_set_at = 0;
 	entry->lock_from_state = false;
 	entry->lock_inflight = 0;
@@ -398,17 +402,62 @@ ppp_lockout_init(void)
 }
 
 /*
- * Does a user name match an existing role?  The hook runs inside the
+ * Look a user name up in pg_authid: *missing when no role has that name,
+ * *expired when its rolvaliduntil is in the past.  The hook runs inside the
  * transaction started by InitPostgres() for authentication, with catalog
- * caches available (see the file header); the check is skipped (role
- * assumed to exist, the conservative answer) if that ever stops being true.
+ * caches available (see the file header); the lookup is skipped (role
+ * assumed to exist and valid, the conservative answer) if that ever stops
+ * being true.
+ */
+static void
+ppp_role_lookup(const char *rolename, TimestampTz now,
+				bool *missing, bool *expired)
+{
+	HeapTuple	tup;
+	Datum		datum;
+	bool		isnull;
+
+	*missing = false;
+	*expired = false;
+	if (!IsTransactionState())
+		return;
+
+	tup = SearchSysCache1(AUTHNAME, CStringGetDatum(rolename));
+	if (!HeapTupleIsValid(tup))
+	{
+		*missing = true;
+		return;
+	}
+	datum = SysCacheGetAttr(AUTHNAME, tup, Anum_pg_authid_rolvaliduntil,
+							&isnull);
+	if (!isnull && DatumGetTimestampTz(datum) < now)
+		*expired = true;
+	ReleaseSysCache(tup);
+}
+
+/*
+ * Does the authentication method of the connection compare the client's
+ * answer with pg_authid.rolpassword?  These methods (get_role_password() in
+ * libpq/crypt.c, PG 13 to 18) also refuse a role whose rolvaliduntil is in
+ * the past, whatever the password: such a failure proves nothing about the
+ * password and is not counted.  LDAP, PAM, RADIUS and BSD ignore
+ * rolvaliduntil.
  */
 static bool
-ppp_role_exists(const char *rolename)
+ppp_auth_method_checks_valid_until(const Port *port)
 {
-	if (!IsTransactionState())
-		return true;
-	return OidIsValid(get_role_oid(rolename, true));
+	if (port->hba == NULL)
+		return false;
+
+	switch (port->hba->auth_method)
+	{
+		case uaPassword:
+		case uaMD5:
+		case uaSCRAM:
+			return true;
+		default:
+			return false;
+	}
 }
 
 /*
@@ -462,7 +511,13 @@ ppp_auth_method_checks_secret(const Port *port)
  *   whether the role exists (like the mock SCRAM exchange of PostgreSQL).
  *   Its entry is flagged role_missing, which makes it always evictable;
  * - STATUS_EOF (client closed the connection when asked for a password, as
- *   psql does before prompting) is NOT counted: no password was tried.
+ *   psql does before prompting) is NOT counted: no password was tried;
+ * - STATUS_ERROR of a password method (ppp_auth_method_checks_valid_until)
+ *   for a role whose rolvaliduntil is in the past is NOT counted either:
+ *   PostgreSQL refuses it even with the right password, so counting would
+ *   lock an expired role whose owner keeps typing the right password (and
+ *   the connection is refused anyway).  The refusal of a locked role still
+ *   applies.
  */
 static void
 ppp_client_auth_hook(Port *port, int status)
@@ -496,12 +551,18 @@ ppp_client_auth_hook(Port *port, int status)
 	count_failure = (status == STATUS_ERROR &&
 					 ppp_auth_method_checks_secret(port));
 
+	now = GetCurrentTimestamp();
+
 	/* catalog lookup and recovery state before taking the LWLock */
 	if (count_failure)
-		role_missing = !ppp_role_exists(key.rolename);
-	in_recovery = RecoveryInProgress();
+	{
+		bool		expired;
 
-	now = GetCurrentTimestamp();
+		ppp_role_lookup(key.rolename, now, &role_missing, &expired);
+		if (expired && ppp_auth_method_checks_valid_until(port))
+			count_failure = false;
+	}
+	in_recovery = RecoveryInProgress();
 
 	LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
 
@@ -568,6 +629,16 @@ ppp_client_auth_hook(Port *port, int status)
 					else
 						entry->locked_until = TimestampTzPlusMilliseconds(now,
 																		  (int64) entry->lock_duration_secs * 1000);
+					/*
+					 * A previous automatic lock whose role_locked row has
+					 * not been written yet (worker late, standby) is
+					 * overwritten: audit_lock_seq numbers the episodes, so
+					 * that the worker reports how many were not audited
+					 * one by one (SPEC 6.3).
+					 */
+					if (!entry->lock_pending_audit)
+						entry->audit_acked_seq = entry->audit_lock_seq;
+					entry->audit_lock_seq++;
 					entry->lock_pending_audit = true;
 					entry->audit_locked_until = entry->locked_until;
 					entry->lock_set_at = now;

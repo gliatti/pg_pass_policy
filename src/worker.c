@@ -94,6 +94,10 @@ typedef struct pppPendingRow
 	TimestampTz last_failure_at;
 	TimestampTz locked_until;
 	TimestampTz audit_locked_until; /* lock to audit (lock_pending_audit) */
+	uint32		audit_lock_seq; /* its episode number */
+	uint32		lost_episodes;	/* earlier episodes overwritten unaudited */
+	uint64		lock_seq;		/* entry->lock_seq when copied */
+	bool		state_written;	/* role_state upserted with locked_until */
 	bool		role_missing;	/* non-existent user name (authentication hook) */
 } pppPendingRow;
 
@@ -285,6 +289,14 @@ ppp_sync_pending(void)
 		rows[nrows].last_failure_at = entry->last_failure_at;
 		rows[nrows].locked_until = entry->locked_until;
 		rows[nrows].audit_locked_until = entry->audit_locked_until;
+		rows[nrows].audit_lock_seq = entry->audit_lock_seq;
+		rows[nrows].lost_episodes = 0;
+		if (entry->lock_pending_audit &&
+			entry->audit_lock_seq - entry->audit_acked_seq > 1)
+			rows[nrows].lost_episodes = entry->audit_lock_seq -
+				entry->audit_acked_seq - 1;
+		rows[nrows].lock_seq = entry->lock_seq;
+		rows[nrows].state_written = false;
 		rows[nrows].role_missing = entry->role_missing;
 		nrows++;
 	}
@@ -307,7 +319,7 @@ ppp_sync_pending(void)
 			ghost_names++;
 			ghost_attempts += Max(r->pending_failures, 0);
 			if (r->lock_pending_audit && r->audit_locked_until != 0)
-				ghost_locks++;
+				ghost_locks += 1 + r->lost_episodes;
 			if (r->last_failure_at > ghost_last)
 				ghost_last = r->last_failure_at;
 			continue;
@@ -336,9 +348,9 @@ ppp_sync_pending(void)
 
 		if (r->lock_pending_audit && r->audit_locked_until != 0)
 		{
-			Oid			argtypes[4] = {TEXTOID, TIMESTAMPTZOID, INT4OID, BOOLOID};
-			Datum		values[4];
-			char		nulls[4] = {' ', ' ', ' ', ' '};
+			Oid			argtypes[5] = {TEXTOID, TIMESTAMPTZOID, INT4OID, BOOLOID, INT8OID};
+			Datum		values[5];
+			char		nulls[5] = {' ', ' ', ' ', ' ', ' '};
 
 			/*
 			 * The lock was lifted (unlock_role()) or replaced (lock_role())
@@ -351,7 +363,13 @@ ppp_sync_pending(void)
 			values[1] = TimestampTzGetDatum(r->audit_locked_until); /* DT_NOEND = infinity */
 			values[2] = Int32GetDatum(r->failed_count);
 			values[3] = BoolGetDatum(!still_locked);
+			values[4] = Int64GetDatum((int64) r->lost_episodes);
 
+			/*
+			 * lost_episodes: earlier automatic locks of the role whose own
+			 * row could not be written before this one overwrote them (worker
+			 * late or stopped, standby before promotion; SPEC 6.3).
+			 */
 			ret = SPI_execute_with_args(
 										"SELECT pass_policy.audit('role_locked', $1, "
 										"pg_catalog.jsonb_build_object('locked_until', $2, 'failed_count', $3, "
@@ -359,8 +377,11 @@ ppp_sync_pending(void)
 										"'reason', 'too many failed authentication attempts') "
 										"OPERATOR(pg_catalog.||) CASE WHEN $4 THEN "
 										"pg_catalog.jsonb_build_object('lifted_before_audit', true) "
+										"ELSE '{}'::pg_catalog.jsonb END "
+										"OPERATOR(pg_catalog.||) CASE WHEN $5 OPERATOR(pg_catalog.>) 0 THEN "
+										"pg_catalog.jsonb_build_object('lost_episodes', $5) "
 										"ELSE '{}'::pg_catalog.jsonb END)",
-										4, argtypes, values, nulls, false, 0);
+										5, argtypes, values, nulls, false, 0);
 			if (ret != SPI_OK_SELECT)
 				elog(ERROR, "audit('role_locked') returned SPI code %d", ret);
 		}
@@ -390,7 +411,47 @@ ppp_sync_pending(void)
 										2, argtypes, values, nulls, false, 0);
 			if (ret != SPI_OK_INSERT)
 				elog(ERROR, "role_state upsert returned SPI code %d", ret);
+			r->state_written = true;
 		}
+	}
+
+	/*
+	 * The upsert above wrote values copied at the start of this step.  A
+	 * lock_role() / unlock_role() committed in between (or whose row lock
+	 * the upsert waited for) would be overwritten: role_state would show
+	 * the automatic lock again, and the reload of this very cycle would copy
+	 * it back to shared memory (its lock_seq is older than the snapshot).
+	 * Such a change always bumps the lock_seq of the entry before its row
+	 * lock is released (XACT_EVENT_COMMIT callbacks run before the locks are
+	 * released), so comparing lock_seq now, before our COMMIT, is enough:
+	 * on a change the transaction is rolled back, nothing is acknowledged,
+	 * and the next cycle starts again from fresh values.  lock_inflight
+	 * covers a lock applied at PRE_COMMIT, not yet committed.
+	 */
+	{
+		const char *changed = NULL;
+
+		LWLockAcquire(ppp_shared->lock, LW_SHARED);
+		for (i = 0; i < nrows && changed == NULL; i++)
+		{
+			pppRoleKey	key;
+
+			if (!rows[i].state_written)
+				continue;
+			ppp_make_key(&key, rows[i].rolename);
+			entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key,
+												 HASH_FIND, NULL);
+			if (entry == NULL || entry->lock_seq != rows[i].lock_seq ||
+				entry->lock_inflight > 0)
+				changed = rows[i].rolename;
+		}
+		LWLockRelease(ppp_shared->lock);
+
+		if (changed != NULL)
+			ereport(ERROR,
+					(errmsg(PPP_LOG_PREFIX "lock of role \"%s\" changed while its automatic lock was being written",
+							changed),
+					 errdetail("The pending audit rows are written again at the next cycle.")));
 	}
 
 	if (ghost_names > 0)
@@ -449,10 +510,17 @@ ppp_ack_pending(void)
 		entry->pending_failures -= r->pending_failures;
 		if (entry->pending_failures < 0)
 			entry->pending_failures = 0;
-		/* a lock set again since (other audit_locked_until) stays pending */
-		if (r->lock_pending_audit &&
-			entry->audit_locked_until == r->audit_locked_until)
-			entry->lock_pending_audit = false;
+		/*
+		 * A lock set again since (later episode) stays pending; the
+		 * episodes up to the one written are acknowledged.
+		 */
+		if (r->lock_pending_audit)
+		{
+			if (entry->audit_lock_seq == r->audit_lock_seq)
+				entry->lock_pending_audit = false;
+			if ((int32) (r->audit_lock_seq - entry->audit_acked_seq) > 0)
+				entry->audit_acked_seq = r->audit_lock_seq;
+		}
 	}
 	LWLockRelease(ppp_shared->lock);
 
@@ -769,6 +837,8 @@ ppp_sync_reload(void)
 		 * audited is written from audit_locked_until, and only copied to
 		 * role_state while locked_until still equals it.
 		 */
+		if (entry->locked_until != locks[i].locked_until)
+			entry->lock_set_at = now;
 		entry->locked_until = locks[i].locked_until;
 		entry->lock_from_state = true;
 	}

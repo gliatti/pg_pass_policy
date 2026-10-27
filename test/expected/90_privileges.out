@@ -384,6 +384,13 @@ SELECT ppp_test.try($$SELECT count(*) FROM pass_policy.run_maintenance()$$) AS r
  ok
 (1 row)
 
+-- rebind_restored_roles() : superutilisateur seulement (aucun GRANT)
+SELECT ppp_test.try($$SELECT count(*) FROM pass_policy.rebind_restored_roles()$$) AS rebind_restored;
+ rebind_restored 
+-----------------
+ 42501
+(1 row)
+
 SELECT ppp_test.try($$SELECT * FROM pass_policy.v_role_status$$) AS sel_status;
  sel_status 
 ------------

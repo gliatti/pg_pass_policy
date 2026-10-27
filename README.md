@@ -211,7 +211,9 @@ appeler `run_maintenance()` soi-même.
 
 Autres fonctions : `purge_audit(interval DEFAULT '365 days')`,
 `load_dictionary(text[])`, `audit(event_type, role_name, details jsonb)`
-(réservée à `pass_policy_admin`). Aucune fonction ni le schéma ne sont
+(réservée à `pass_policy_admin`). `rebind_restored_roles()` (superutilisateur
+seulement) rattache par nom les lignes d'un rôle après une restauration dans
+un autre cluster (voir « Avertissements de sécurité »). Aucune fonction ni le schéma ne sont
 accordés à `PUBLIC` : un utilisateur ordinaire change son propre mot de passe
 par `ALTER ROLE … PASSWORD`, les requêtes internes du hook s'exécutant avec
 les droits du superutilisateur.
@@ -275,6 +277,23 @@ compte comme « spécial ».
   remettre à `on` : le `run_maintenance()` suivant réconcilie l'historique avec
   `pg_authid.rolpassword` et prend la date de la restauration comme date de
   changement des rôles restaurés (le compte à rebours de `max_age` repart de là).
+- **Restauration dans un autre cluster** : les OID des rôles changent, et
+  l'ancien OID d'un rôle peut appartenir à un autre. `run_maintenance()` suit
+  les OID (dans un cluster vivant, un OID existant sous un autre nom est un
+  renommage) : laissé seul, il réétiquetterait les verrous, profils et
+  historiques d'un rôle au nom de celui qui a hérité de son OID. Procédure :
+  1. `pg_pass_policy.enabled = off` et `pg_pass_policy.worker_interval = 0`
+     (`ALTER SYSTEM` + `pg_reload_conf()`) : ni contrôle des mots de passe
+     pré-hachés, ni passe de maintenance pendant la restauration ;
+  2. restaurer les rôles (`pg_dumpall --roles-only`) puis la base
+     (`pg_restore`) ;
+  3. en superutilisateur, `SELECT * FROM pass_policy.rebind_restored_roles();`
+     **avant** le premier `run_maintenance()` : chaque ligne de `role_state`,
+     `role_profile` et `password_history` dont le couple (OID, nom) ne
+     correspond à aucun rôle est rattachée au rôle de ce nom (`rebind`), ou
+     supprimée si aucun rôle ne porte ce nom (`purge`) ; une ligne
+     `maintenance` est écrite dans l'audit ;
+  4. remettre `enabled` et `worker_interval` à leurs valeurs.
 - **Superutilisateur** : un superutilisateur peut être verrouillé comme n'importe
   quel rôle, et les profils (`default` compris) s'appliquent à lui : un membre
   de `pass_policy_admin` non superutilisateur ne peut pas le viser avec

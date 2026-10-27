@@ -274,6 +274,85 @@ SELECT pg_reload_conf();
 SELECT pg_sleep(0.5);
 SHOW pg_pass_policy.manage_valid_until;
 
+-- Restauration dans un autre cluster : les OID changent et l'ancien OID d'un
+-- rôle peut appartenir à un autre. Simulation par UPDATE direct : les lignes
+-- de regress_rx et de regress_ry échangent leurs OID (passage par l'OID 1,
+-- qui n'est pas un rôle), plus des lignes d'un rôle absent du cluster.
+-- rebind_restored_roles() les rattache par nom, en une passe, quel que soit
+-- l'ordre ; le test S3 ci-dessus (renommage) n'est pas concerné : il ne
+-- passe que par run_maintenance().
+CREATE ROLE regress_rx LOGIN;
+CREATE ROLE regress_ry LOGIN;
+ALTER ROLE regress_rx PASSWORD 'Rebind-Rx#2024ab';
+ALTER ROLE regress_ry PASSWORD 'Rebind-Ry#2024ab';
+INSERT INTO ppp_test.secrets VALUES ('rx', 'Rebind-Rx#2024ab'), ('ry', 'Rebind-Ry#2024ab');
+SELECT pass_policy.assign_profile('regress_rx', 'p_never');
+SELECT pass_policy.assign_profile('regress_ry', 'p_short');
+SELECT pass_policy.lock_role('regress_rx', NULL, 'rebind test') = 'infinity' AS locked;
+CREATE TEMP TABLE rb_oids AS
+SELECT 'regress_rx'::regrole::oid AS x, 'regress_ry'::regrole::oid AS y;
+DO $$
+DECLARE
+    t text;
+    x oid := (SELECT x FROM rb_oids);
+    y oid := (SELECT y FROM rb_oids);
+BEGIN
+    FOREACH t IN ARRAY ARRAY['role_state', 'role_profile', 'password_history']
+    LOOP
+        EXECUTE format('UPDATE pass_policy.%I SET role_oid = 1 WHERE role_oid = $1', t) USING x;
+        EXECUTE format('UPDATE pass_policy.%I SET role_oid = $1 WHERE role_oid = $2', t) USING x, y;
+        EXECUTE format('UPDATE pass_policy.%I SET role_oid = $1 WHERE role_oid = 1', t) USING y;
+    END LOOP;
+END $$;
+INSERT INTO pass_policy.role_state (role_oid, role_name) VALUES (4000000001, 'regress_absent');
+INSERT INTO pass_policy.password_history (role_oid, role_name, verifier)
+SELECT y, 'regress_absent', 'SCRAM-SHA-256$4096:dummy' FROM rb_oids;
+-- les couples (role_oid, role_name) ne correspondent plus à pg_authid
+SELECT s.role_name, s.role_oid = (SELECT y FROM rb_oids) AS has_ry_oid
+  FROM pass_policy.role_state s WHERE s.role_name = 'regress_rx';
+CREATE TEMP TABLE rb AS SELECT * FROM pass_policy.rebind_restored_roles();
+SELECT action, role_name, details->>'table' AS tbl, details->>'reason' AS reason,
+       details->>'rows' AS nrows
+  FROM rb WHERE role_name IN ('regress_rx', 'regress_ry', 'regress_absent')
+ ORDER BY 2, 3, 1;
+SELECT s.role_name, s.role_oid = s.role_name::regrole::oid AS oid_ok,
+       s.locked_until = 'infinity' AS locked, s.lock_reason
+  FROM pass_policy.role_state s WHERE s.role_name IN ('regress_rx', 'regress_ry')
+ ORDER BY 1;
+SELECT p.role_name, p.role_oid = p.role_name::regrole::oid AS oid_ok, f.name AS profile
+  FROM pass_policy.role_profile p JOIN pass_policy.profile f USING (profile_id)
+ WHERE p.role_name IN ('regress_rx', 'regress_ry') ORDER BY 1;
+SELECT h.role_name, count(*) AS history_rows,
+       bool_and(h.role_oid = h.role_name::regrole::oid) AS oid_ok
+  FROM pass_policy.password_history h WHERE h.role_name IN ('regress_rx', 'regress_ry')
+ GROUP BY 1 ORDER BY 1;
+SELECT (SELECT count(*) FROM pass_policy.role_state WHERE role_name = 'regress_absent') AS absent_state,
+       (SELECT count(*) FROM pass_policy.password_history WHERE role_name = 'regress_absent') AS absent_history;
+SELECT event_type, details ? 'rebind_restored_roles' AS rebind_audit
+  FROM pass_policy.audit_log ORDER BY id DESC LIMIT 1;
+-- une seconde passe ne trouve plus rien
+SELECT count(*) AS second_rebind FROM pass_policy.rebind_restored_roles();
+-- run_maintenance() ne défait rien
+CREATE TEMP TABLE rb_m AS SELECT * FROM pass_policy.run_maintenance();
+SELECT s.role_name, s.role_oid = s.role_name::regrole::oid AS oid_ok
+  FROM pass_policy.role_state s WHERE s.role_name IN ('regress_rx', 'regress_ry')
+ ORDER BY 1;
+SELECT pass_policy.unlock_role('regress_rx');
+SELECT pass_policy.unassign_profile(r) FROM unnest(ARRAY['regress_rx', 'regress_ry']) r;
+DROP TABLE rb_oids;
+
+-- Étape a : une ligne d'historique encore sans OID dont le rôle existe n'est
+-- pas purgée (elle est rattachée par a0, ou à la passe suivante si le rôle
+-- n'est devenu visible qu'après a0) ; sans rôle de ce nom, elle l'est.
+INSERT INTO pass_policy.password_history (role_oid, role_name, verifier)
+VALUES (NULL, 'regress_rx', 'SCRAM-SHA-256$4096:dummy-null'),
+       (NULL, 'regress_nobody', 'SCRAM-SHA-256$4096:dummy-null');
+CREATE TEMP TABLE m_null AS SELECT * FROM pass_policy.run_maintenance();
+SELECT role_name, role_oid = 'regress_rx'::regrole::oid AS mapped
+  FROM pass_policy.password_history
+ WHERE verifier = 'SCRAM-SHA-256$4096:dummy-null' ORDER BY 1;
+DELETE FROM pass_policy.password_history WHERE verifier = 'SCRAM-SHA-256$4096:dummy-null';
+
 -- Exclusion mutuelle : run_maintenance() prend un verrou consultatif de
 -- transaction (pg_advisory_xact_lock) ; deux passes successives dans la même
 -- transaction (verrou réentrant) réussissent, le verrou est tenu jusqu'au

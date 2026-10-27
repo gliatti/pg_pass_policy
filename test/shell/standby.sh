@@ -252,6 +252,13 @@ else
 fi
 n_locked_after=$(sb_admin "SELECT count(*) FROM pass_policy.audit_log WHERE event_type = 'role_locked' AND role_name = 'regress_sb_auto'")
 check_eq "nouveau primaire : audit role_locked du verrou local écrit" "1" "$( [ "$n_locked_after" -gt "$n_locked_before" ] && echo 1 || echo 0)"
+# Deux verrous locaux sur le standby (le premier levé par shmem_unlock_role()
+# avant promotion) : une seule ligne est écrite, pour le dernier, et elle
+# compte l'épisode antérieur resté sans ligne (revue finale 3)
+out=$(sb_admin "SELECT details->>'lost_episodes' FROM pass_policy.audit_log
+                 WHERE event_type = 'role_locked' AND role_name = 'regress_sb_auto'
+                 ORDER BY id DESC LIMIT 1")
+check_eq "nouveau primaire : épisode de verrouillage antérieur compté (lost_episodes)" "1" "$out"
 out=$(sb_admin "SELECT coalesce(sum((details->>'count')::int), 0) >= 2 FROM pass_policy.audit_log
                  WHERE event_type = 'auth_failed' AND role_name = 'regress_sb_auto' AND event_time > now() - interval '1 minute'")
 check_eq "nouveau primaire : échecs comptés sur le standby audités (auth_failed)" "t" "$out"

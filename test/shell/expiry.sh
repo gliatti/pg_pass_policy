@@ -81,4 +81,25 @@ wait_worker_run 30 || true
 out=$(psql_as regress_exp "$newpwd") && rc=0 || rc=$?
 check_eq "expire_password : toujours refusé après un tour du worker" "1" "$( [ "$rc" -ne 0 ] && echo 1 || echo 0)"
 
+
+# Rôle expiré (rolvaliduntil passé) : PostgreSQL refuse même le bon mot de
+# passe (STATUS_ERROR). Ces refus ne sont pas comptés comme des échecs : sinon
+# le titulaire qui retape le bon mot de passe verrouillerait son rôle.
+PWD2='Expiry-NoLock#2024'
+psql_admin "CREATE ROLE regress_exp_nolock LOGIN PASSWORD '$PWD2'"
+psql_admin "SELECT pass_policy.expire_password('regress_exp_nolock')" >/dev/null
+out=$(psql_admin "SELECT max_failures FROM pass_policy.effective_profile('regress_exp_nolock')")
+check_eq "profil par défaut : max_failures = 5" "5" "$out"
+for i in 1 2 3 4 5 6; do
+	out=$(psql_as regress_exp_nolock "$PWD2") && fail "rôle expiré : connexion $i acceptée" || true
+done
+check_contains "rôle expiré, 6e tentative : refus d'authentification" "password authentication failed" "$out"
+check_not_contains "rôle expiré, 6e tentative : pas « locked »" "locked" "$out"
+out=$(psql_admin "SELECT count(*) FROM pass_policy.failed_attempts() WHERE role_name = 'regress_exp_nolock' AND (failed_count > 0 OR locked_until IS NOT NULL)")
+check_eq "rôle expiré : aucun échec compté (failed_attempts vide)" "0" "$out"
+# Après rotation, la connexion passe : le rôle n'a pas été verrouillé
+newpwd2=$(psql_admin "SELECT pass_policy.rotate_password('regress_exp_nolock')")
+out=$(psql_as regress_exp_nolock "$newpwd2" "SELECT current_user") || true
+check_eq "rôle expiré puis rotation : connexion acceptée (non verrouillé)" "regress_exp_nolock" "$out"
+
 ppp_finish

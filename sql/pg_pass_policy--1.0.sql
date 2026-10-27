@@ -135,12 +135,14 @@ COMMENT ON TABLE password_history IS 'Previous password verifiers (SCRAM/MD5 has
  * bytes are taken with decode(..., 'escape') (IMMUTABLE, no encoding
  * conversion; backslashes doubled first) rather than convert_to(), which is
  * only STABLE and cannot be used in a generated column, or textsend(), which
- * converts to the client encoding.
+ * converts to the client encoding.  The backslash is written chr(92): a
+ * '\' literal would mean one or two characters depending on
+ * standard_conforming_strings, and CREATE EXTENSION fails when it is off.
  */
 CREATE TABLE dictionary (
     word        text PRIMARY KEY CHECK (word = lower(word) AND word <> ''),
     word_sha256 bytea NOT NULL
-                GENERATED ALWAYS AS (sha256(decode(replace(word, '\', '\\'), 'escape'))) STORED
+                GENERATED ALWAYS AS (sha256(decode(replace(word, chr(92), chr(92) || chr(92)), 'escape'))) STORED
 );
 CREATE UNIQUE INDEX dictionary_sha256_idx ON dictionary (word_sha256);
 COMMENT ON TABLE dictionary IS 'Blocklist of common passwords, stored in lower case';
@@ -1557,9 +1559,14 @@ BEGIN
         v_actions := v_actions + 1;
         RETURN NEXT;
     END LOOP;
+    -- A row still without OID (CREATE ROLE ... PASSWORD) whose role is
+    -- visible now but was not when step a0 ran (READ COMMITTED: every
+    -- statement takes a new snapshot) is kept: the next pass maps it.
     DELETE FROM pass_policy.password_history h
-     WHERE h.role_oid IS NULL
-        OR NOT EXISTS (SELECT FROM pg_catalog.pg_authid a WHERE a.oid = h.role_oid);
+     WHERE (h.role_oid IS NULL
+            AND NOT EXISTS (SELECT FROM pg_catalog.pg_authid a WHERE a.rolname = h.role_name))
+        OR (h.role_oid IS NOT NULL
+            AND NOT EXISTS (SELECT FROM pg_catalog.pg_authid a WHERE a.oid = h.role_oid));
     GET DIAGNOSTICS v_n = ROW_COUNT;
     IF v_n > 0 THEN
         v_summary := v_summary || jsonb_build_object('purged_history_rows', v_n);
@@ -1755,6 +1762,143 @@ END
 $$;
 COMMENT ON FUNCTION run_maintenance() IS 'One maintenance pass (worker or pg_cron): reconciliation, expiry, VALID UNTIL, alerts, unlocks';
 
+/*
+ * rebind_restored_roles(): explicit repair after restoring the extension
+ * tables into ANOTHER cluster (pg_dump / pg_restore), where the role OIDs
+ * differ.  run_maintenance() step a0 cannot do it: in a live cluster OIDs
+ * are stable, so a row whose OID exists under another name is a rename and
+ * the OID wins (SPEC §11 S3).  After a restore, the former OID of a role X
+ * may belong to another role Y: a0 would relabel the rows of X as rows of Y.
+ *
+ * Every row of role_state, role_profile and password_history whose pair
+ * (role_oid, role_name) matches no pg_authid row is rebound BY NAME: the
+ * name exists under another OID -> the row takes that OID ('rebind'); the
+ * name does not exist -> the row is purged ('purge').  A rebound row whose
+ * target OID already holds a matching row is purged too (the matching row
+ * wins).  For role_state and role_profile (primary key role_oid), all the
+ * mismatched rows are first removed (DELETE ... RETURNING, kept in an
+ * array) and then inserted again (INSERT ... ON CONFLICT DO NOTHING), so
+ * that two rows exchanging their OIDs are handled whatever the order.
+ * rotation_pair holds role names only: nothing to rebind (run_maintenance()
+ * purges the pairs whose roles do not exist).
+ *
+ * To be called once, right after the restore and BEFORE the first
+ * run_maintenance() (worker_interval = 0 and enabled = off meanwhile, see
+ * README).  Superuser only: it rewrites the rows of every role.
+ */
+CREATE FUNCTION rebind_restored_roles()
+RETURNS TABLE (action text, role_name text, details jsonb)
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+#variable_conflict use_column
+DECLARE
+    v_tbl     text;
+    v_rows    jsonb[];
+    v_kept    oid[];
+    j         jsonb;
+    r         record;
+    v_rebound int := 0;
+    v_purged  int := 0;
+BEGIN
+    PERFORM pass_policy._require_admin();
+    IF NOT coalesce((SELECT x.rolsuper FROM pg_catalog.pg_roles x WHERE x.rolname = session_user), false) THEN
+        RAISE EXCEPTION 'pg_pass_policy: permission denied'
+              USING ERRCODE = 'insufficient_privilege',
+                    HINT = 'rebind_restored_roles() requires a superuser.';
+    END IF;
+    -- not concurrently with a maintenance pass (same lock as run_maintenance)
+    PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('pg_pass_policy.run_maintenance'));
+
+    FOREACH v_tbl IN ARRAY ARRAY['role_state', 'role_profile']
+    LOOP
+        EXECUTE format(
+            'WITH c AS (SELECT t.role_oid AS old_oid, a.oid AS new_oid'
+            '             FROM pass_policy.%1$I t'
+            '             LEFT JOIN pg_catalog.pg_authid a ON a.rolname = t.role_name'
+            '            WHERE NOT EXISTS (SELECT FROM pg_catalog.pg_authid o'
+            '                               WHERE o.oid = t.role_oid AND o.rolname = t.role_name)),'
+            '     d AS (DELETE FROM pass_policy.%1$I t USING c WHERE t.role_oid = c.old_oid'
+            '           RETURNING pg_catalog.to_jsonb(t) OPERATOR(pg_catalog.||)'
+            '                     pg_catalog.jsonb_build_object(''new_oid'', c.new_oid) AS j)'
+            ' SELECT pg_catalog.array_agg(d.j) FROM d', v_tbl)
+          INTO v_rows;
+        IF v_rows IS NULL THEN
+            CONTINUE;
+        END IF;
+        -- all the mismatched rows are gone: insert them again under their new OID
+        EXECUTE format(
+            'WITH i AS (INSERT INTO pass_policy.%1$I'
+            '           SELECT (pg_catalog.jsonb_populate_record(NULL::pass_policy.%1$I,'
+            '                   u.j OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_object(''role_oid'', u.j->''new_oid''))).*'
+            '             FROM pg_catalog.unnest($1) u(j)'
+            '            WHERE u.j->>''new_oid'' IS NOT NULL'
+            '           ON CONFLICT (role_oid) DO NOTHING'
+            '           RETURNING role_oid)'
+            ' SELECT pg_catalog.array_agg(i.role_oid) FROM i', v_tbl)
+          INTO v_kept USING v_rows;
+        FOREACH j IN ARRAY v_rows
+        LOOP
+            role_name := j->>'role_name';
+            IF j->>'new_oid' IS NOT NULL AND (j->>'new_oid')::oid = ANY (coalesce(v_kept, '{}')) THEN
+                action := 'rebind';
+                details := jsonb_build_object('table', v_tbl, 'old_oid', (j->>'role_oid')::oid,
+                                              'new_oid', (j->>'new_oid')::oid);
+                v_rebound := v_rebound + 1;
+                -- the same OID cannot be reported twice (one row kept per OID)
+                v_kept := array_remove(v_kept, (j->>'new_oid')::oid);
+            ELSE
+                action := 'purge';
+                details := jsonb_build_object('table', v_tbl, 'old_oid', (j->>'role_oid')::oid,
+                                              'reason', CASE WHEN j->>'new_oid' IS NULL
+                                                             THEN 'role does not exist'
+                                                             ELSE 'role already has a row' END);
+                v_purged := v_purged + 1;
+            END IF;
+            RETURN NEXT;
+        END LOOP;
+    END LOOP;
+
+    -- password_history: no key on role_oid, plain UPDATE / DELETE
+    FOR r IN
+        WITH u AS (
+            UPDATE pass_policy.password_history h SET role_oid = a.oid
+              FROM pg_catalog.pg_authid a
+             WHERE a.rolname = h.role_name AND h.role_oid IS DISTINCT FROM a.oid
+            RETURNING h.role_name AS rname)
+        SELECT u.rname, count(*) AS n FROM u GROUP BY u.rname ORDER BY u.rname
+    LOOP
+        action := 'rebind'; role_name := r.rname;
+        details := jsonb_build_object('table', 'password_history', 'rows', r.n);
+        v_rebound := v_rebound + r.n;
+        RETURN NEXT;
+    END LOOP;
+    FOR r IN
+        WITH d AS (
+            DELETE FROM pass_policy.password_history h
+             WHERE NOT EXISTS (SELECT FROM pg_catalog.pg_authid a WHERE a.rolname = h.role_name)
+            RETURNING h.role_name AS rname)
+        SELECT d.rname, count(*) AS n FROM d GROUP BY d.rname ORDER BY d.rname
+    LOOP
+        action := 'purge'; role_name := r.rname;
+        details := jsonb_build_object('table', 'password_history', 'rows', r.n,
+                                      'reason', 'role does not exist');
+        v_purged := v_purged + r.n;
+        RETURN NEXT;
+    END LOOP;
+
+    IF v_rebound > 0 OR v_purged > 0 THEN
+        PERFORM pass_policy._audit('maintenance', NULL,
+                jsonb_build_object('rebind_restored_roles',
+                                   jsonb_build_object('rebound_rows', v_rebound, 'purged_rows', v_purged)));
+        -- locks and profiles are keyed by name in shared memory
+        PERFORM pass_policy._shmem('reload');
+    END IF;
+    RETURN;
+END
+$$;
+COMMENT ON FUNCTION rebind_restored_roles() IS 'After a restore into another cluster: rebinds by role name the rows whose (role_oid, role_name) matches no role, purges those of missing roles (superuser)';
+
 -------------------------------------------------------------------------------
 -- 7. Views (SPEC §4)
 -------------------------------------------------------------------------------
@@ -1781,7 +1925,7 @@ SELECT q.role_name, q.profile, q.password_changed_at, q.expires_at, q.grace_unti
                     ELSE s.password_changed_at + e.max_age END AS expires_at,
                CASE WHEN s.must_change THEN s.grace_until
                     ELSE s.password_changed_at + e.max_age + e.grace_period END AS grace_until,
-               nullif(greatest(s.locked_until, f.locked_until), '-infinity') AS locked_until,
+               greatest(s.locked_until, f.locked_until) AS locked_until,
                coalesce(f.failed_count, 0) AS failed_count
           FROM pg_catalog.pg_roles r
           JOIN _role_effective_profile e ON e.role_oid = r.oid
