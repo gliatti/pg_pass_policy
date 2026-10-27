@@ -1,0 +1,22 @@
+<form id="profile-form" class="profile-form" method="post"
+      hx-post="{{ path_for('profile_update', name=profile.name) if profile else path_for('profile_create') }}"
+      hx-target="#profile-form" hx-swap="outerHTML"
+      action="{{ path_for('profile_update', name=profile.name) if profile else path_for('profile_create') }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  {% include "_alert.html" %}
+  <label class="field">Name
+    <input type="text" name="name" value="{{ values.name or '' }}" pattern="[A-Za-z0-9_.-]{1,63}" required{% if profile %} readonly{% endif %}>
+  </label>
+  <div class="fields">
+  {% for key, kind in fields %}
+    {% if kind == 'bool' %}
+    <label class="field check"><input type="checkbox" name="{{ key }}" value="true"{% if values[key] %} checked{% endif %}> {{ labels[key] }}</label>
+    {% elif kind == 'int' %}
+    <label class="field">{{ labels[key] }}<input type="number" name="{{ key }}" value="{{ values[key] if values[key] is not none else '' }}" min="0" required></label>
+    {% else %}
+    <label class="field">{{ labels[key] }}<input type="text" name="{{ key }}" value="{{ values[key] or '' }}" placeholder="e.g. 90 days"{% if kind == 'interval' %} required{% endif %}></label>
+    {% endif %}
+  {% endfor %}
+  </div>
+  <button class="btn">{% if profile %}Save{% else %}Create{% endif %}</button>
+</form>

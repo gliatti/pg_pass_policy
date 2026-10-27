@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Audit{% endblock %}
+{% block content %}
+<h1>Audit log</h1>
+<form class="filters" hx-get="{{ path_for('audit_table') }}" hx-target="#audit-table" hx-swap="innerHTML"
+      hx-trigger="change, keyup changed delay:300ms from:#role, keyup changed delay:300ms from:#since, submit"
+      action="{{ path_for('audit') }}" method="get">
+  <label>Role <input type="search" id="role" name="role" value="{{ filters.role or '' }}" autocomplete="off"></label>
+  <label>Type
+    <select name="type">
+      <option value="">all</option>
+      {% for t in event_types %}<option value="{{ t }}"{% if filters.type == t %} selected{% endif %}>{{ t }}</option>{% endfor %}
+    </select></label>
+  <label>Since <input type="text" id="since" name="since" value="{{ filters.since or '' }}" placeholder="2026-10-01 or 7 days" autocomplete="off"></label>
+  <button class="btn">Filter</button>
+  <span class="htmx-indicator">loading…</span>
+</form>
+<div id="audit-table">{% include "audit/_table.html" %}</div>
+{% endblock %}

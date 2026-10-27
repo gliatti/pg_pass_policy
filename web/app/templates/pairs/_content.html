@@ -1,0 +1,36 @@
+{% include "_alert.html" %}
+{% if switched %}
+<div class="alert alert-ok">Pair <strong>{{ switched.pair }}</strong> switched: active role is now <code>{{ switched.active_role }}</code>{% if switched.previous_role %}, <code>{{ switched.previous_role }}</code> stays valid until {{ switched.previous_valid_until|ts }}{% endif %}.</div>
+{% with reveal_role = switched.active_role, password = switched.password %}{% include "_reveal.html" %}{% endwith %}
+{% endif %}
+<table class="pairs">
+  <thead><tr><th>pair</th><th>role A</th><th>role B</th><th>group</th><th>active</th><th>previous</th><th>switched</th><th>previous valid until</th><th>actions</th></tr></thead>
+  <tbody>
+  {% for p in pairs %}
+  <tr>
+    <td><strong>{{ p.pair_name }}</strong></td><td>{{ p.role_a }}</td><td>{{ p.role_b }}</td><td>{{ p.group_role }}</td>
+    <td>{{ p.active_role or '—' }}</td><td>{{ p.previous_role or '—' }}</td>
+    <td class="nowrap">{{ p.switched_at|ts }}</td><td class="nowrap">{{ p.previous_valid_until|ts }}</td>
+    <td class="actions">
+      <form hx-post="{{ path_for('pair_switch', pair=p.pair_name) }}" hx-target="#pairs-content" hx-swap="innerHTML"
+            hx-confirm="Switch pair {{ p.pair_name }}? The inactive role gets a new password and becomes active.">
+        <input type="number" name="length" value="24" min="8" max="128" title="password length" class="w-len">
+        <button class="btn">Switch</button>
+      </form>
+    </td>
+  </tr>
+  {% else %}
+  <tr><td colspan="9" class="muted">No rotation pair yet.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<h2>New pair</h2>
+<form class="inline" hx-post="{{ path_for('pair_create') }}" hx-target="#pairs-content" hx-swap="innerHTML">
+  <label>Pair name <input type="text" name="pair_name" value="{{ form.pair_name or '' }}" required maxlength="128"></label>
+  <label>Role A <input type="text" name="role_a" value="{{ form.role_a or '' }}" required maxlength="128"></label>
+  <label>Role B <input type="text" name="role_b" value="{{ form.role_b or '' }}" required maxlength="128"></label>
+  <label>Group role <input type="text" name="group_role" value="{{ form.group_role or '' }}" required maxlength="128" placeholder="existing NOLOGIN role"></label>
+  <button class="btn">Create</button>
+</form>
+<p class="muted">Missing login roles are created as members of the group role; the group role must exist.</p>

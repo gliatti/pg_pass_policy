@@ -1,0 +1,13 @@
+{% if truncated %}<div class="alert alert-warn">Only the first {{ roles|length }} roles are shown: refine the search.</div>{% endif %}
+<table class="roles">
+  <thead><tr>
+    <th>role</th><th>profile</th><th>status</th><th>changed</th><th>expires</th><th>days left</th>
+    <th>locked until</th><th>failures</th><th>actions</th>
+  </tr></thead>
+  {# one <tbody class="role"> per role: an action replaces the whole group
+     (role row + optional note), so a revealed password never outlives the
+     next action on the same role #}
+  {% for r in roles %}{% include "roles/_row.html" %}{% else %}
+  <tbody><tr><td colspan="9" class="muted">No role matches.</td></tr></tbody>
+  {% endfor %}
+</table>

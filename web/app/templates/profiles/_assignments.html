@@ -1,0 +1,25 @@
+{% include "_alert.html" %}
+<form class="inline" hx-post="{{ path_for('profile_assign') }}" hx-target="#assignments" hx-swap="innerHTML">
+  <label>Role
+    <select name="role" required>
+      {% for name in login_roles %}<option value="{{ name }}">{{ name }}</option>{% endfor %}
+    </select></label>
+  <label>Profile
+    <select name="profile" required>
+      {% for name in profile_names %}<option value="{{ name }}">{{ name }}</option>{% endfor %}
+    </select></label>
+  <button class="btn">Assign</button>
+</form>
+<table>
+  <thead><tr><th>role</th><th>profile</th><th>assigned</th><th>by</th><th></th></tr></thead>
+  <tbody>
+  {% for a in assignments %}
+  <tr><td>{{ a.role_name }}</td><td>{{ a.profile }}</td><td class="nowrap">{{ a.assigned_at|ts }}</td><td>{{ a.assigned_by or '' }}</td>
+      <td><form hx-post="{{ path_for('profile_unassign') }}" hx-target="#assignments" hx-swap="innerHTML"
+                hx-confirm="Put {{ a.role_name }} back on the default profile?">
+            <input type="hidden" name="role" value="{{ a.role_name }}"><button class="btn btn-quiet">Unassign</button></form></td></tr>
+  {% else %}
+  <tr><td colspan="5" class="muted">Every role uses the default profile.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>

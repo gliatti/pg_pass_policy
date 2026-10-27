@@ -1,0 +1,8 @@
+{# one-time password display: present in this response only, never in a URL, a log or the session #}
+<div class="reveal" id="reveal-{{ uid }}">
+  <p><strong>New password for <code>{{ reveal_role }}</code></strong> — shown once, it is not stored anywhere. Copy it now.</p>
+  <p class="secret-line"><code id="pw-{{ uid }}" class="secret">{{ password }}</code>
+    <button type="button" class="btn" data-copy-target="pw-{{ uid }}">Copy</button>
+    <button type="button" class="btn btn-quiet" data-dismiss="reveal-{{ uid }}">Hide</button></p>
+  {% if reveal_extra %}<p class="muted">{{ reveal_extra }}</p>{% endif %}
+</div>

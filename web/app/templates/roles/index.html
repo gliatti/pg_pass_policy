@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Roles{% endblock %}
+{% block content %}
+<h1>Roles</h1>
+<form class="filters" id="roles-filter" hx-get="{{ path_for('roles_table') }}" hx-target="#roles-table" hx-swap="innerHTML"
+      hx-trigger="change, keyup changed delay:300ms from:#q, submit" action="{{ path_for('roles') }}" method="get">
+  <label>Status
+    <select name="status">
+      <option value="">all</option>
+      {% for s in statuses %}<option value="{{ s }}"{% if filters.status == s %} selected{% endif %}>{{ s }}</option>{% endfor %}
+    </select></label>
+  <label>Profile
+    <select name="profile">
+      <option value="">all</option>
+      {% for p in profiles %}<option value="{{ p }}"{% if filters.profile == p %} selected{% endif %}>{{ p }}</option>{% endfor %}
+    </select></label>
+  <label>Search <input type="search" id="q" name="q" value="{{ filters.q or '' }}" placeholder="role name" autocomplete="off"></label>
+  <button class="btn">Filter</button>
+  <span class="htmx-indicator">loading…</span>
+</form>
+<div id="roles-table">{% include "roles/_table.html" %}</div>
+{% endblock %}

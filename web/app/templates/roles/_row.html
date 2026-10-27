@@ -1,0 +1,54 @@
+<tbody class="role">
+{% if r %}
+<tr class="role-row">
+  <td><strong>{{ r.role_name }}</strong>{% if r.must_change %} <span class="badge must-change" title="must change at next login">must change</span>{% endif %}</td>
+  <td>{{ r.profile }}</td>
+  <td><span class="badge status-{{ r.status }}">{{ r.status.replace('_', ' ') }}</span></td>
+  <td class="nowrap">{{ r.password_changed_at|ts }}</td>
+  <td class="nowrap">{{ r.expires_at|ts }}</td>
+  <td>{{ r.days_left if r.days_left is not none else '—' }}</td>
+  <td class="nowrap">{{ r.locked_until|ts }}{% if r.lock_reason %}<br><small class="muted">{{ r.lock_reason }}</small>{% endif %}</td>
+  <td>{{ r.failed_count }}</td>
+  <td class="actions">
+    <form hx-post="{{ path_for('role_rotate', role=r.role_name) }}" hx-target="closest tbody" hx-swap="outerHTML"
+          hx-confirm="Generate a new password for {{ r.role_name }}? The current password stops working immediately.">
+      <input type="number" name="length" value="24" min="8" max="128" title="password length" class="w-len">
+      <button class="btn">Rotate</button>
+    </form>
+    {% if r.status == 'locked' %}
+    <form hx-post="{{ path_for('role_unlock', role=r.role_name) }}" hx-target="closest tbody" hx-swap="outerHTML"
+          hx-confirm="Unlock {{ r.role_name }} and reset its failure counter?">
+      <button class="btn">Unlock</button>
+    </form>
+    {% else %}
+    <form hx-post="{{ path_for('role_lock', role=r.role_name) }}" hx-target="closest tbody" hx-swap="outerHTML"
+          hx-confirm="Lock {{ r.role_name }}? New connections will be refused.">
+      <select name="duration" title="lock duration">
+        <option value="">until unlock</option>
+        <option value="15 minutes">15 min</option>
+        <option value="1 hour">1 hour</option>
+        <option value="1 day">1 day</option>
+        <option value="7 days">7 days</option>
+      </select>
+      <input type="text" name="reason" placeholder="reason" maxlength="500" class="w-reason">
+      <button class="btn btn-warn">Lock</button>
+    </form>
+    {% endif %}
+    {% if r.status != 'expired' %}
+    <form hx-post="{{ path_for('role_expire', role=r.role_name) }}" hx-target="closest tbody" hx-swap="outerHTML"
+          hx-confirm="Expire the password of {{ r.role_name }} now? The role must get a new password before connecting again.">
+      <button class="btn btn-warn">Expire</button>
+    </form>
+    {% endif %}
+  </td>
+</tr>
+{% else %}
+<tr class="role-row"><td colspan="9"><div class="alert alert-error">Role {{ role_name }} is not a login role or does not exist any more.</div></td></tr>
+{% endif %}
+{% if error or notice or password %}
+<tr class="row-note"><td colspan="9">
+  {% include "_alert.html" %}
+  {% if password %}{% with reveal_role = role_name %}{% include "_reveal.html" %}{% endwith %}{% endif %}
+</td></tr>
+{% endif %}
+</tbody>
