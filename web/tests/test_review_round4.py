@@ -172,13 +172,13 @@ class _Conn:
 
 def test_run_returns_the_result_or_the_error():
     conn = _Conn()
-    assert roles._run(conn, lambda c, x: x * 2, 21) == (42, None)
+    assert db.run_action(conn, lambda c, x: x * 2, 21) == (42, None)
     assert conn.commits == 1
 
     def fail(c):
         raise psycopg.errors.InsufficientPrivilege("refused")
 
-    assert roles._run(conn, fail) == (None, "refused")
+    assert db.run_action(conn, fail) == (None, "refused")
     assert conn.commits == 1
 
 

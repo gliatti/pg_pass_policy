@@ -121,7 +121,11 @@ def test_profile_create_commits_before_redirect(monkeypatch, htmx):
     headers = {"X-CSRF-Token": token, **({"HX-Request": "true"} if htmx else {})}
     response = client.post("/profiles", data={"name": "p1"}, headers=headers)
     assert response.status_code == (204 if htmx else 303)
-    assert events == ["create", "commit", f"response {response.status_code}"]
+    # db.run_action() commits right after the action; the request's own
+    # commit (an empty transaction by then) also comes before the response
+    assert events[:2] == ["create", "commit"]
+    assert events[-1] == f"response {response.status_code}"
+    assert "rollback" not in events
 
 
 @pytest.mark.parametrize(

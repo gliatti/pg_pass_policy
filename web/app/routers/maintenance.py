@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import psycopg
 from fastapi import APIRouter, Request
 from psycopg import Connection
 
@@ -19,11 +18,9 @@ def maintenance_page(request: Request, conn: Connection = db.CONN):
 
 @router.post("/run", name="maintenance_run")
 def maintenance_run(request: Request, conn: Connection = db.CONN):
-    try:
-        with conn.transaction():
-            actions = db.run_maintenance(conn)
-    except psycopg.Error as exc:
-        return render(request, "_alert.html", {"error": db.error_message(exc)}, 422)
+    actions, error = db.run_action(conn, db.run_maintenance)
+    if error is not None:
+        return render(request, "_alert.html", {"error": error}, 422)
     return render(
         request,
         "maintenance/_result.html",

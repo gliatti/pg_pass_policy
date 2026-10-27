@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import secrets
-from collections.abc import Callable
-from typing import Any, TypeVar
+from typing import Any
 
-import psycopg
 from fastapi import APIRouter, Depends, Form, Query, Request
 from psycopg import Connection
 
@@ -16,7 +14,6 @@ from app.templating import NO_STORE, render
 
 router = APIRouter(prefix="/roles")
 log = get_logger("roles")
-T = TypeVar("T")
 
 REREAD_WARNING = (
     "The password was changed, but the role could not be read back: reload the page"
@@ -112,26 +109,6 @@ def _row_response(
 # "x/lock" cannot be mistaken for the lock action on "x"
 
 
-def _run(conn: Connection, action: Callable[..., T], *args: Any) -> tuple[T | None, str | None]:
-    """Run one action in a savepoint and commit it: (result, None) on
-    success, (None, error message) on failure."""
-    try:
-        with conn.transaction():
-            result = action(conn, *args)
-    except psycopg.Error as exc:
-        return None, db.error_message(exc)
-    _commit(conn)
-    return result, None
-
-
-def _commit(conn: Connection) -> None:
-    """Commit before re-reading the row: the extension applies its
-    shared-memory changes (lock, unlock, failure counter) at commit, so
-    v_role_status read in the same transaction would still show the old
-    state."""
-    conn.commit()
-
-
 @router.post("/{role:path}/rotate", name="role_rotate")
 def rotate(
     request: Request,
@@ -139,7 +116,7 @@ def rotate(
     length: int = Form(default=24, ge=8, le=128),
     conn: Connection = db.CONN,
 ):
-    password, error = _run(conn, db.rotate_password, role, length)
+    password, error = db.run_action(conn, db.rotate_password, role, length)
     if error is not None:
         return _row_response(request, conn, role, error=error)
     # the password exists only in this response (no-store), never in a log or a URL
@@ -154,14 +131,14 @@ def lock(
     reason: str = Form(default="", max_length=500),
     conn: Connection = db.CONN,
 ):
-    _, error = _run(conn, db.lock_role, role, duration.strip(), reason.strip())
+    _, error = db.run_action(conn, db.lock_role, role, duration.strip(), reason.strip())
     notice = None if error else ("Role locked" + (" until unlock" if not duration.strip() else ""))
     return _row_response(request, conn, role, error=error, notice=notice)
 
 
 @router.post("/{role:path}/unlock", name="role_unlock")
 def unlock(request: Request, role: str, conn: Connection = db.CONN):
-    _, error = _run(conn, db.unlock_role, role)
+    _, error = db.run_action(conn, db.unlock_role, role)
     return _row_response(
         request, conn, role, error=error, notice=None if error else "Role unlocked"
     )
@@ -169,7 +146,7 @@ def unlock(request: Request, role: str, conn: Connection = db.CONN):
 
 @router.post("/{role:path}/expire", name="role_expire")
 def expire(request: Request, role: str, conn: Connection = db.CONN):
-    _, error = _run(conn, db.expire_password, role)
+    _, error = db.run_action(conn, db.expire_password, role)
     return _row_response(
         request, conn, role, error=error, notice=None if error else "Password expired"
     )

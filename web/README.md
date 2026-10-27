@@ -23,7 +23,8 @@ Pages :
 
 ## Installation
 
-Prérequis : Python ≥ 3.11, une base où `pg_pass_policy` est installée
+Prérequis : Python ≥ 3.11, FastAPI ≥ 0.118 (dépendances déclarées avec
+`Depends(..., scope="function")`), une base où `pg_pass_policy` est installée
 (`shared_preload_libraries`, `CREATE EXTENSION pg_pass_policy`).
 
 ```sh
@@ -93,6 +94,11 @@ export PGPP_WEB_BASIC_USERS='alice:$2b$12$...,bob:$2b$12$...'
 Le nom de l'utilisateur web est enregistré dans `pass_policy.audit_log`
 (colonne `application_name`, valeur `pgpp-web:alice`) : chaque action reste
 attribuable à une personne même si tous passent par le même rôle PostgreSQL.
+PostgreSQL limite `application_name` à 63 octets et y remplace tout octet non
+ASCII par `?` : le nom est donc encodé en pourcentage (`Émilie` devient
+`pgpp-web:%C3%89milie`, `%` lui-même devient `%25`) puis raccourci, sans
+jamais couper une séquence d'échappement, pour tenir en 63 octets avec le
+préfixe.
 
 ## Lancement
 
@@ -243,13 +249,16 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
   de toucher aux rôles privilégiés (`_require_target_allowed()`), et l'erreur
   est affichée telle quelle (422) : l'application ne refait pas ce contrôle.
   Si le rôle de service n'est pas superutilisateur, les rôles privilégiés sont
-  simplement absents du formulaire d'assignation ; ce filtre d'affichage
-  (`db._PRIVILEGED_ROLE`) reprend la règle de l'extension, qui n'est pas
-  exécutable par `pass_policy_admin` : `SUPERUSER`, `REPLICATION`,
-  `BYPASSRLS`, rôles `pg_*` sauf `pg_database_owner`, `CREATEROLE` jusqu'à
-  PostgreSQL 15, appartenance même indirecte (`pg_has_role`) à l'un de ces
-  rôles. Un test d'intégration vérifie qu'il donne le même verdict que
-  l'extension sur un jeu de rôles.
+  simplement absents du formulaire d'assignation. Ce filtre d'affichage
+  (`db.login_roles()`) n'a pas de copie de la règle : il appelle le prédicat
+  de l'extension, `pass_policy._is_privileged(oid)` (exécutable par
+  `pass_policy_viewer` et `pass_policy_admin`), sur le rôle et sur chacun des
+  rôles dont il est membre, même indirectement (`pg_has_role`), comme
+  `_require_target_allowed()`. L'ensemble des rôles privilégiés est calculé
+  une fois par requête (une évaluation de la fonction `STABLE` par rôle),
+  puis chaque rôle de connexion est comparé à cette courte liste : environ
+  35 ms pour 2 000 rôles. Un test d'intégration vérifie que le formulaire
+  propose exactement les rôles que l'extension accepte sur un jeu de rôles.
 - **Rôles renommés** : après `ALTER ROLE … RENAME`, les colonnes `role_name` de
   `role_state` et `role_profile` gardent l'ancien nom jusqu'au passage suivant
   de `run_maintenance()`. L'application les joint par OID (`role_oid`) : le
@@ -261,6 +270,11 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
   FastAPI 0.118, une dépendance `yield` ordinaire n'est fermée qu'après l'envoi).
   La requête qui suit un 303 ou un `HX-Redirect` voit donc la modification, et
   un échec du `COMMIT` donne une page 500 au lieu d'une redirection trompeuse.
+  Chaque action passe par `db.run_action()` : appel de la fonction
+  `pass_policy.*` dans un point de sauvegarde (une erreur est annulée seule et
+  affichée en 422, la connexion reste utilisable pour la réponse), puis
+  `COMMIT` immédiat, avant toute relecture : l'extension n'applique qu'au
+  `COMMIT` ses changements en mémoire partagée (verrou, compteur d'échecs).
 - **Affichage unique** : le fragment d'une rotation remplace tout le `<tbody>`
   du rôle (ligne + note) ; la prochaine action sur le même rôle, ou tout autre
   échange HTMX sur la page, retire le mot de passe affiché (`htmx:beforeSwap`
@@ -275,7 +289,8 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
 
 ```sh
 ruff check .
-pytest                     # tests unitaires seuls (auth, CSRF, filtre de log, configuration)
+ruff format --check .
+pytest                     # tests unitaires seuls : 159 (23 tests d'intégration ignorés)
 ```
 
 Les tests d'intégration ont besoin d'une base réelle avec l'extension
@@ -291,7 +306,7 @@ sans ce marqueur est refusé, à `start` comme à `stop` :
 
 ```sh
 eval "$(scripts/test-instance.sh start /tmp/pgpp-web-test 54332)"
-pytest                     # 168 tests : unitaires + intégration
+pytest                     # 182 tests : unitaires + intégration
 scripts/test-instance.sh stop /tmp/pgpp-web-test
 ```
 
@@ -303,8 +318,8 @@ figure dans la réponse et nulle part ailleurs : ni dans les journaux capturés,
 ni dans l'audit, et il permet réellement de se connecter), lock / unlock /
 expire, les profils (création visible dès la requête suivante, modification,
 assignation, suppression, noms réservés, refus d'assignation sur un rôle
-privilégié, règle des rôles privilégiés identique à celle de l'extension,
-rôle renommé),
+privilégié, formulaire d'assignation limité aux rôles que l'extension
+accepte, rôle renommé),
 l'audit (filtres, pagination), les
 paires de rotation, la maintenance et le refus CSRF.
 

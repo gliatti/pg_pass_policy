@@ -5,7 +5,6 @@ from __future__ import annotations
 import secrets
 from typing import Any
 
-import psycopg
 from fastapi import APIRouter, Form, Request
 from psycopg import Connection
 
@@ -80,15 +79,11 @@ def pair_create(
         "role_b": role_b.strip(),
         "group_role": group_role.strip(),
     }
-    try:
-        if not all(values.values()):
-            raise ValueError("every field is required")
-        with conn.transaction():
-            db.create_pair(conn, **values)
-    except (ValueError, psycopg.Error) as exc:
-        return _content(
-            request, conn, "pairs/_content.html", error=db.error_message(exc), form=values
-        )
+    error = None if all(values.values()) else "every field is required"
+    if error is None:
+        _, error = db.run_action(conn, lambda c: db.create_pair(c, **values))
+    if error is not None:
+        return _content(request, conn, "pairs/_content.html", error=error, form=values)
     return _content(
         request, conn, "pairs/_content.html", notice=f"Rotation pair {values['pair_name']} created"
     )
@@ -102,13 +97,10 @@ def pair_switch(
     length: int = Form(default=24, ge=8, le=128),
     conn: Connection = db.CONN,
 ):
-    try:
-        with conn.transaction():
-            result = db.switch_pair(conn, pair, length)
-    except psycopg.Error as exc:
-        return _content(request, conn, "pairs/_content.html", error=db.error_message(exc))
-    # committed before anything is shown: a password is displayed only once it
-    # is durable (the request's own commit would come after the rendering)
-    conn.commit()
+    # run_action() commits before anything is shown: a password is displayed
+    # only once it is durable (the request's own commit would come later)
+    result, error = db.run_action(conn, db.switch_pair, pair, length)
+    if error is not None:
+        return _content(request, conn, "pairs/_content.html", error=error)
     # the password is in this response only (no-store); never logged nor stored
     return _content(request, conn, "pairs/_content.html", switched={"pair": pair, **result})

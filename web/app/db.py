@@ -95,9 +95,34 @@ def make_pool(settings: Settings) -> ConnectionPool:
     )
 
 
+# application_name is limited to NAMEDATALEN - 1 = 63 bytes and the server
+# replaces every non-ASCII byte of it with '?': the web user name is
+# percent-encoded (ASCII only, "Émilie" -> "%C3%89milie", '%' itself encoded)
+# and the whole value is cut at 63 bytes, never inside an escape sequence
+APPLICATION_NAME_MAX = 63
+_ACTOR_SAFE = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:@+=,;!~*'()[]{}/ "
+)
+
+
+def application_name(prefix: str, user: str | None) -> str:
+    """The application_name of a request: "<prefix>:<user>", ASCII only,
+    at most 63 bytes (the user part is shortened first, by whole escapes)."""
+    parts = [
+        ch if ch in _ACTOR_SAFE else "".join(f"%{b:02X}" for b in ch.encode())
+        for ch in (user or "anonymous")
+    ]
+    name = prefix.encode("ascii", "replace").decode() + ":"
+    for part in parts:
+        if len(name) + len(part) > APPLICATION_NAME_MAX:
+            break
+        name += part
+    return name[:APPLICATION_NAME_MAX]
+
+
 def set_actor(conn: Connection, settings: Settings, user: str | None) -> None:
     """Record the web user in application_name (copied into audit_log by the extension)."""
-    name = f"{settings.app_name}:{user or 'anonymous'}"[:63]
+    name = application_name(settings.app_name, user)
     conn.execute("SELECT set_config('application_name', %s, false)", (name,))
 
 
@@ -121,6 +146,27 @@ def get_conn(request: Request) -> Iterator[Connection]:
 CONN: Any = Depends(get_conn, scope="function")
 
 T = TypeVar("T")
+
+
+def run_action(
+    conn: Connection, action: Callable[..., T], *args: Any
+) -> tuple[T | None, str | None]:
+    """Run one pass_policy action in a savepoint, then commit it: (result,
+    None) on success, (None, error message) on a PostgreSQL error (the
+    savepoint is rolled back, the connection stays usable for the response).
+
+    The commit comes before anything is re-read or shown: the extension
+    applies its shared-memory changes (lock, unlock, failure counter) at
+    commit, so a view read in the same transaction would still show the old
+    state, and a one-time password is displayed only once it is durable.  A
+    failing commit propagates (the generic 500 page)."""
+    try:
+        with conn.transaction():
+            result = action(conn, *args)
+    except psycopg.Error as exc:
+        return None, error_message(exc)
+    conn.commit()
+    return result, None
 
 
 def reread_after_commit(
@@ -303,35 +349,28 @@ def session_is_superuser(request: Request, conn: Connection) -> bool:
 # need no check here: every pass_policy.* function that takes a target role
 # (assign_profile() and unassign_profile() included) refuses a privileged one
 # through pass_policy._require_target_allowed(), and that error is shown.
-# This predicate is a copy of _require_target_allowed() (not executable by
-# pass_policy_admin): SUPERUSER / REPLICATION / BYPASSRLS, predefined pg_*
-# roles except pg_database_owner, CREATEROLE on PostgreSQL <= 15, and
-# membership, even indirect, in any such role.  tests/test_integration.py
-# checks that it agrees with the extension (expire_password() as the oracle).
-_PRIVILEGED_ROLE = (
-    "(r.rolsuper OR r.rolreplication OR r.rolbypassrls"
-    " OR (starts_with(r.rolname, 'pg_') AND r.rolname <> 'pg_database_owner')"
-    " OR (r.rolcreaterole AND current_setting('server_version_num')::int < 160000)"
-    " OR EXISTS (SELECT FROM pg_catalog.pg_roles x"
-    "             WHERE x.oid <> r.oid"
-    "               AND (x.rolsuper OR x.rolreplication OR x.rolbypassrls"
-    "                    OR (starts_with(x.rolname, 'pg_') AND x.rolname <> 'pg_database_owner'))"
-    "               AND pg_catalog.pg_has_role(r.oid, x.oid, 'MEMBER')))"
+# The filter applies the extension's own predicate, pass_policy._is_privileged()
+# (executable by pass_policy_admin), as _require_target_allowed() does: to the
+# role itself and to every role it belongs to, even indirectly.  The privileged
+# roles are computed once (one _is_privileged() call per role, a STABLE SQL
+# function), then each login role is checked against that short list (pg_*
+# roles and the few roles with an attribute) instead of against every role.
+LOGIN_ROLES_SQL = (
+    "WITH privileged AS MATERIALIZED ("
+    "  SELECT p.oid FROM pg_catalog.pg_roles p WHERE pass_policy._is_privileged(p.oid))"
+    " SELECT r.rolname FROM pg_catalog.pg_roles r"
+    "  WHERE r.rolcanlogin"
+    "    AND (%s OR NOT EXISTS (SELECT FROM privileged x"
+    "                            WHERE x.oid = r.oid"
+    "                               OR pg_catalog.pg_has_role(r.oid, x.oid, 'MEMBER')))"
+    "  ORDER BY r.rolname"
 )
 
 
 def login_roles(conn: Connection, superuser: bool) -> list[str]:
     """Login roles offered in the assignment form: the privileged ones
-    (see _PRIVILEGED_ROLE) only when the service role is a superuser."""
-    return [
-        r["rolname"]
-        for r in conn.execute(
-            "SELECT r.rolname FROM pg_catalog.pg_roles r"
-            f" WHERE r.rolcanlogin AND (%s OR NOT {_PRIVILEGED_ROLE})"
-            " ORDER BY r.rolname",
-            (superuser,),
-        )
-    ]
+    (see LOGIN_ROLES_SQL) only when the service role is a superuser."""
+    return [r["rolname"] for r in conn.execute(LOGIN_ROLES_SQL, (superuser,))]
 
 
 # --- profiles ----------------------------------------------------------------

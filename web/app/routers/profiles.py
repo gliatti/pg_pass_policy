@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import psycopg
 from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import Response
 from psycopg import Connection
@@ -85,29 +84,29 @@ async def _read_form(request: Request) -> FormData:
 FORM: Any = Depends(_read_form)
 
 
-def _page(request: Request, conn: Connection, **extra: Any) -> Response:
-    profiles = db.list_profiles(conn)
-    context = {
-        "profiles": profiles,
+def _assignment_context(
+    request: Request, conn: Connection, profile_names: list[str] | None = None
+) -> dict[str, Any]:
+    """The context of the assignments block, shared by the full page and the
+    fragment returned by assign / unassign."""
+    return {
         "assignments": db.assignments(conn),
         "login_roles": db.login_roles(conn, db.session_is_superuser(request, conn)),
-        # same order as profile_names(): derived, no second query
-        "profile_names": [p["name"] for p in profiles],
-        **extra,
+        "profile_names": db.profile_names(conn) if profile_names is None else profile_names,
     }
-    return render(request, "profiles/index.html", context)
+
+
+def _page(request: Request, conn: Connection) -> Response:
+    profiles = db.list_profiles(conn)
+    # same order as profile_names(): derived, no second query
+    context = _assignment_context(request, conn, [p["name"] for p in profiles])
+    return render(request, "profiles/index.html", {"profiles": profiles, **context})
 
 
 def _assignments_fragment(
     request: Request, conn: Connection, error: str | None = None, notice: str | None = None
 ) -> Response:
-    context = {
-        "assignments": db.assignments(conn),
-        "login_roles": db.login_roles(conn, db.session_is_superuser(request, conn)),
-        "profile_names": db.profile_names(conn),
-        "error": error,
-        "notice": notice,
-    }
+    context = {**_assignment_context(request, conn), "error": error, "notice": notice}
     return render(request, "profiles/_assignments.html", context, 422 if error else 200)
 
 
@@ -143,7 +142,9 @@ def profiles_page(request: Request, conn: Connection = db.CONN):
 
 @router.get("/new", name="profile_new")
 def profile_new(request: Request, conn: Connection = db.CONN):
-    defaults = db.get_profile(conn, "default") or {}
+    # the settings of the default profile as a starting point, but not its
+    # name: the new profile must be named by the user
+    defaults = {**(db.get_profile(conn, "default") or {}), "name": ""}
     return render(
         request,
         "profiles/form.html",
@@ -162,10 +163,11 @@ def profile_create(request: Request, form: FormData = FORM, conn: Connection = d
         if name in RESERVED_NAMES:
             raise ValueError(RESERVED_MESSAGE.format(name))
         settings = settings_from_form(form)
-        with conn.transaction():
-            db.create_profile(conn, name, settings)
-    except (ValueError, psycopg.Error) as exc:
-        return _form_response(request, None, values, error=db.error_message(exc))
+    except ValueError as exc:
+        return _form_response(request, None, values, error=str(exc))
+    _, error = db.run_action(conn, db.create_profile, name, settings)
+    if error is not None:
+        return _form_response(request, None, values, error=error)
     return redirect_to(request, "profiles")
 
 
@@ -180,11 +182,9 @@ def profile_assign(
     role, profile = role.strip(), profile.strip()
     # a forged privileged target is refused by the extension itself
     # (_require_target_allowed()), its message is shown as is
-    try:
-        with conn.transaction():
-            db.assign_profile(conn, role, profile)
-    except psycopg.Error as exc:
-        return _assignments_fragment(request, conn, error=db.error_message(exc))
+    _, error = db.run_action(conn, db.assign_profile, role, profile)
+    if error is not None:
+        return _assignments_fragment(request, conn, error=error)
     return _assignments_fragment(request, conn, notice=f"Profile {profile} assigned to {role}")
 
 
@@ -193,11 +193,9 @@ def profile_unassign(
     request: Request, role: str = Form(max_length=128), conn: Connection = db.CONN
 ):
     role = role.strip()
-    try:
-        with conn.transaction():
-            db.unassign_profile(conn, role)
-    except psycopg.Error as exc:
-        return _assignments_fragment(request, conn, error=db.error_message(exc))
+    _, error = db.run_action(conn, db.unassign_profile, role)
+    if error is not None:
+        return _assignments_fragment(request, conn, error=error)
     return _assignments_fragment(request, conn, notice=f"{role} is back on the default profile")
 
 
@@ -228,25 +226,23 @@ def profile_update(request: Request, name: str, form: FormData = FORM, conn: Con
         raise HTTPException(status_code=404, detail="Profile not found")
     values = {k: form.get(k) for k, _ in db.PROFILE_FIELDS}
     values["name"] = name
-    error = notice = None
+    notice = None
     try:
         if name in RESERVED_NAMES:
             raise ValueError(RESERVED_MESSAGE.format(name))
         settings = settings_from_form(form)
-        with conn.transaction():
-            db.alter_profile(conn, name, settings)
+    except ValueError as exc:
+        return _form_response(request, profile, values, error=str(exc))
+    _, error = db.run_action(conn, db.alter_profile, name, settings)
+    if error is None:
         notice = "Profile updated"
         values = db.get_profile(conn, name) or values
-    except (ValueError, psycopg.Error) as exc:
-        error = db.error_message(exc)
     return _form_response(request, profile, values, error=error, notice=notice)
 
 
 @router.post("/{name}/delete", name="profile_delete")
 def profile_delete(request: Request, name: str, conn: Connection = db.CONN):
-    try:
-        with conn.transaction():
-            db.drop_profile(conn, name)
-    except psycopg.Error as exc:
-        return render(request, "_alert.html", {"error": db.error_message(exc)}, 422)
+    _, error = db.run_action(conn, db.drop_profile, name)
+    if error is not None:
+        return render(request, "_alert.html", {"error": error}, 422)
     return redirect_to(request, "profiles")

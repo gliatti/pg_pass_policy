@@ -178,6 +178,8 @@ def test_profiles_crud_and_assignment(client, super_conn):
     form = client.get("/profiles/new")
     assert form.status_code == 200
     assert 'name="min_length"' in form.text
+    # the settings of "default" are proposed, not its name
+    assert 'name="name" value=""' in form.text
 
     data = {
         "name": "web_t_created",
@@ -633,9 +635,10 @@ EXPECTED_REFUSED = {
 
 
 def test_privileged_rule_agrees_with_the_extension(client, super_conn, test_url):
-    """db._PRIVILEGED_ROLE (filter of the assignment form) must agree with
-    pass_policy._require_target_allowed(): expire_password() is the oracle,
-    called by the service role in a transaction that is rolled back."""
+    """login_roles() (filter of the assignment form) applies
+    pass_policy._is_privileged() to a role and to the roles it belongs to,
+    as pass_policy._require_target_allowed() does: expire_password() is the
+    oracle, called by the service role in a transaction that is rolled back."""
     from psycopg import sql
 
     from app import db
@@ -668,6 +671,9 @@ def test_privileged_rule_agrees_with_the_extension(client, super_conn, test_url)
 
         with psycopg.connect(test_url, row_factory=dict_row) as conn:
             offered = set(db.login_roles(conn, superuser=False))
+            # a superuser service role is offered every login role
+            everyone = set(db.login_roles(conn, superuser=True))
+            assert superuser not in offered and superuser in everyone
             for role in candidates:
                 try:
                     with conn.transaction(force_rollback=True):
@@ -675,15 +681,11 @@ def test_privileged_rule_agrees_with_the_extension(client, super_conn, test_url)
                     extension_refuses = False
                 except psycopg.errors.InsufficientPrivilege:
                     extension_refuses = True
-                web_refuses = conn.execute(
-                    f"SELECT {db._PRIVILEGED_ROLE} AS p FROM pg_roles r WHERE r.rolname = %s",
-                    (role,),
-                ).fetchone()["p"]
-                assert web_refuses is extension_refuses, role
                 login = super_conn.execute(
                     "SELECT rolcanlogin FROM pg_roles WHERE rolname = %s", (role,)
                 ).fetchone()[0]
                 assert (role in offered) is (login and not extension_refuses), role
+                assert (role in everyone) is login, role
                 assert extension_refuses is (role in EXPECTED_REFUSED or role == superuser), role
         token = csrf_token(client, "/profiles")
         response = client.post(

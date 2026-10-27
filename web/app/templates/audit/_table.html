@@ -1,5 +1,7 @@
 {% include "_alert.html" %}
-{% set base = path_for('audit_table') ~ '?role=' ~ (filters.role or '')|urlencode ~ '&type=' ~ (filters.type or '')|urlencode ~ '&since=' ~ (filters.since or '')|urlencode %}
+{% set qs = '?role=' ~ (filters.role or '')|urlencode ~ '&type=' ~ (filters.type or '')|urlencode ~ '&since=' ~ (filters.since or '')|urlencode %}
+{% set table_url = path_for('audit_table') ~ qs %}
+{% set page_url = path_for('audit') ~ qs %}
 <p class="muted">{{ total }} event{{ 's' if total != 1 else '' }} — page {{ page }} / {{ pages }}</p>
 <table class="audit">
   <thead><tr><th>id</th><th>time</th><th>event</th><th>role</th><th>actor</th><th>database</th><th>client</th><th>application</th><th>details</th></tr></thead>
@@ -16,8 +18,8 @@
 </table>
 {% if pages > 1 %}
 <nav class="pager">
-  {% if page > 1 %}<a hx-get="{{ base }}&page={{ page - 1 }}" hx-target="#audit-table" href="{{ path_for('audit') }}?role={{ (filters.role or '')|urlencode }}&type={{ (filters.type or '')|urlencode }}&since={{ (filters.since or '')|urlencode }}&page={{ page - 1 }}">← previous</a>{% endif %}
+  {% if page > 1 %}<a hx-get="{{ table_url }}&page={{ page - 1 }}" hx-target="#audit-table" href="{{ page_url }}&page={{ page - 1 }}">← previous</a>{% endif %}
   <span>page {{ page }} / {{ pages }}</span>
-  {% if page < pages %}<a hx-get="{{ base }}&page={{ page + 1 }}" hx-target="#audit-table" href="{{ path_for('audit') }}?role={{ (filters.role or '')|urlencode }}&type={{ (filters.type or '')|urlencode }}&since={{ (filters.since or '')|urlencode }}&page={{ page + 1 }}">next →</a>{% endif %}
+  {% if page < pages %}<a hx-get="{{ table_url }}&page={{ page + 1 }}" hx-target="#audit-table" href="{{ page_url }}&page={{ page + 1 }}">next →</a>{% endif %}
 </nav>
 {% endif %}

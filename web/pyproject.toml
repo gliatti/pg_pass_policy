@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "PostgreSQL" }
 dependencies = [
-    "fastapi>=0.115",
+    "fastapi>=0.118",
     "jinja2>=3.1",
     "psycopg[binary]>=3.2",
     "psycopg_pool>=3.2",
