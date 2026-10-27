@@ -101,6 +101,8 @@ SB_DATA=$PPP_TMP/standby
 	cat "$PPP_TMP/basebackup.log"
 	exit 1
 }
+# hash minimal sur le standby (verrous expirés non audités, voir plus bas)
+echo "pg_pass_policy.max_tracked_roles = 16" >>"$SB_DATA/postgresql.conf"
 started=0
 for attempt in 1 2 3 4 5; do
 	SB_PORT=$(ppp_free_port)
@@ -194,6 +196,34 @@ check_eq "primaire : le verrou local du standby ne s'y applique pas" "regress_sb
 sb_admin "SELECT pass_policy.shmem_unlock_role('regress_sb_auto')" >/dev/null
 out=$(sb_as regress_sb_auto "$GOOD" "SELECT current_user") || true
 check_eq "standby : shmem_unlock_role() lève le verrou local" "regress_sb_auto" "$out"
+
+# --- standby : verrous expirés non audités évincables (revue finale 2, F3) ---
+# L'audit role_locked d'un verrou posé sur le standby ne peut pas être écrit
+# avant une promotion. Une fois le verrou expiré, l'entrée doit redevenir
+# évincable : sinon 16 vrais rôles verrouillés une fois rempliraient le hash
+# (max_tracked_roles = 16 sur le standby) et les échecs d'un 17e rôle ne
+# seraient plus comptés. Les profils gardent leur entrée : on passe par le
+# profil default (2 échecs, verrou de 1 s), rétabli ensuite.
+psql_admin "SELECT pass_policy.alter_profile('default', '{\"max_failures\": 2, \"lock_duration\": \"1 second\"}')" >/dev/null
+for n in $(seq -w 1 16); do
+	psql_admin "CREATE ROLE regress_sb_f$n LOGIN PASSWORD '$GOOD'"
+done
+sb_catch_up || fail "F3 : le standby n'a pas rejoué les rôles"
+sleep 3 # rechargement forcé à chaque tour du worker du standby (2 s)
+for n in $(seq -w 1 15); do
+	for i in 1 2; do sb_as "regress_sb_f$n" "$BAD" >/dev/null || true; done
+done
+out=$(sb_admin "SELECT tracked_roles FROM pass_policy.worker_status()")
+check_eq "F3 : hash du standby plein (16 entrées)" "16" "$out"
+sleep 2 # les verrous de 1 s expirent ; leur audit reste en attente
+for i in 1 2; do sb_as regress_sb_f16 "$BAD" >/dev/null || true; done
+out=$(sb_as regress_sb_f16 "$GOOD") || true
+check_contains "F3 : 17e rôle compté et verrouillé (un verrou expiré non audité a été évincé)" "is locked by pg_pass_policy" "$out"
+n=$(grep -c 'cannot track authentication failures of role "regress_sb_f16"' "$PPP_TMP/standby.log" || true)
+check_eq "F3 : aucun refus de comptage pour le 17e rôle" "0" "$n"
+n=$(grep -c 'evicted before its lock was audited' "$PPP_TMP/standby.log" || true)
+check_eq "F3 : perte d'audit journalisée (LOG)" "1" "$( [ "$n" -ge 1 ] && echo 1 || echo 0)"
+psql_admin "SELECT pass_policy.alter_profile('default', '{\"max_failures\": 5, \"lock_duration\": \"30 minutes\"}')" >/dev/null
 
 # --- lecture seule : aucune erreur d'écriture du worker du standby -----------
 n=$(grep -cE 'pg_pass_policy: worker .* failed|read-only transaction' "$PPP_TMP/standby.log" || true)

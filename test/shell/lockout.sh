@@ -215,6 +215,47 @@ out=$(printf '%s\n' "BEGIN;" "SAVEPOINT s;" "SELECT pass_policy.unlock_role('reg
 out=$(psql_as regress_lock "$GOOD" "SELECT current_user") || true
 check_eq "unlock_role dans un SAVEPOINT validé : déverrouillé au COMMIT" "regress_lock" "$out"
 
+# --- run_maintenance() ne lève pas un verrou automatique plus récent ----------
+# (revue finale 2, F4) role_state porte un verrou automatique expiré ; avant la
+# maintenance suivante, 5 nouveaux échecs posent un nouveau verrou automatique
+# que role_state ne connaît pas encore (le worker dort). L'étape f de
+# run_maintenance() lève le verrou expiré de role_state, mais pas, en shmem,
+# le verrou actif (shmem_unlock_role(…, expired_only => true)).
+psql_admin "SELECT pass_policy.alter_profile('p_lock', '{\"failure_window\": \"1 minute\", \"lock_duration\": \"6 seconds\"}')" >/dev/null
+t0=$(psql_admin "SELECT clock_timestamp()")
+psql_admin "SELECT pass_policy.shmem_reload()" >/dev/null
+wait_reload "$t0" || fail "F4 : pas de rechargement après alter_profile"
+for i in 1 2 3 4 5; do psql_as regress_lock "$BAD" >/dev/null || true; done
+if wait_for 30 "SELECT coalesce((SELECT locked_until > now() FROM pass_policy.role_state WHERE role_name = 'regress_lock'), false)"; then
+	ok "F4 : premier verrou automatique copié dans role_state"
+else
+	fail "F4 : premier verrou automatique absent de role_state"
+fi
+t0=$(psql_admin "SELECT clock_timestamp()")
+psql_admin "ALTER SYSTEM SET pg_pass_policy.worker_interval = 600"
+psql_admin "SELECT pg_reload_conf()" >/dev/null
+wait_for 30 "SELECT coalesce(max(last_run) > '$t0'::timestamptz, false) FROM pass_policy.worker_status()" || fail "F4 : pas de tour du worker après le passage à 600 s"
+sleep 7 # le premier verrou expire ; role_state le porte encore (le worker dort)
+out=$(psql_admin "SELECT locked_until < now() FROM pass_policy.role_state WHERE role_name = 'regress_lock'")
+check_eq "F4 : role_state porte un verrou expiré" "t" "$out"
+for i in 1 2 3 4 5; do psql_as regress_lock "$BAD" >/dev/null || true; done
+out=$(psql_admin "SELECT action FROM pass_policy.run_maintenance() WHERE role_name = 'regress_lock'")
+check_contains "F4 : run_maintenance() lève le verrou expiré de role_state" "role_unlocked" "$out"
+out=$(psql_as regress_lock "$GOOD") || true
+check_contains "F4 : le nouveau verrou automatique survit à run_maintenance()" "is locked by pg_pass_policy" "$out"
+out=$(psql_admin "SELECT locked_until > now() FROM pass_policy.failed_attempts() WHERE role_name = 'regress_lock'")
+check_eq "F4 : verrou actif en shmem après la maintenance" "t" "$out"
+psql_admin "ALTER SYSTEM RESET pg_pass_policy.worker_interval"
+psql_admin "SELECT pg_reload_conf()" >/dev/null
+if wait_for 30 "SELECT coalesce((SELECT locked_until > now() FROM pass_policy.role_state WHERE role_name = 'regress_lock'), false)"; then
+	ok "F4 : le nouveau verrou est copié dans role_state par le worker"
+else
+	fail "F4 : le nouveau verrou n'a pas été copié dans role_state"
+fi
+psql_admin "SELECT pass_policy.unlock_role('regress_lock')" >/dev/null
+out=$(psql_as regress_lock "$GOOD" "SELECT current_user") || true
+check_eq "F4 : unlock_role() lève le nouveau verrou" "regress_lock" "$out"
+
 # --- exempt_roles ---------------------------------------------------------------
 psql_admin "CREATE ROLE regress_exempt LOGIN PASSWORD '$GOOD'"
 psql_admin "ALTER SYSTEM SET pg_pass_policy.exempt_roles = 'regress_exempt'"
@@ -230,6 +271,71 @@ check_eq "rôle exempté : aucun verrou en shmem" "0" "$out"
 for i in 1 2 3 4 5 6; do psql_as regress_nobody "$BAD" >/dev/null || true; done
 out=$(psql_admin "SELECT 1")
 check_eq "le serveur répond après des échecs sur un rôle inexistant" "1" "$out"
+
+# --- noms inexistants : une seule ligne d'audit agrégée par tour -------------
+# (revue finale 2, F5) le worker dort (600 s) ; les échecs de regress_nobody
+# ci-dessus sont d'abord journalisés par le tour du SIGHUP, puis 3 noms
+# inexistants × 2 échecs, puis un seul tour (réveil par run_maintenance()).
+t0=$(psql_admin "SELECT clock_timestamp()")
+psql_admin "ALTER SYSTEM SET pg_pass_policy.worker_interval = 600"
+psql_admin "SELECT pg_reload_conf()" >/dev/null
+wait_for 30 "SELECT coalesce(max(last_run) > '$t0'::timestamptz, false) FROM pass_policy.worker_status()" || fail "F5 : pas de tour du worker après le passage à 600 s"
+id0=$(psql_admin "SELECT coalesce(max(id), 0) FROM pass_policy.audit_log")
+for n in regress_ghost_a regress_ghost_b regress_ghost_c; do
+	for i in 1 2; do psql_as "$n" "$BAD" >/dev/null || true; done
+done
+t0=$(psql_admin "SELECT clock_timestamp()")
+psql_admin "SELECT count(*) FROM pass_policy.run_maintenance()" >/dev/null
+wait_for 30 "SELECT coalesce(max(last_run) > '$t0'::timestamptz, false) FROM pass_policy.worker_status()" || fail "F5 : pas de tour du worker après run_maintenance()"
+out=$(psql_admin "SELECT count(*) FROM pass_policy.audit_log WHERE id > $id0 AND role_name LIKE 'regress_ghost%'")
+check_eq "F5 : aucune ligne d'audit par nom inexistant" "0" "$out"
+out=$(psql_admin "SELECT count(*) || ':' || string_agg((details->>'unknown_roles') || '/' || (details->>'attempts'), ',')
+                    FROM pass_policy.audit_log WHERE id > $id0 AND event_type = 'auth_failed' AND role_name IS NULL")
+check_eq "F5 : une seule ligne auth_failed agrégée (3 noms, 6 tentatives)" "1:3/6" "$out"
+psql_admin "ALTER SYSTEM RESET pg_pass_policy.worker_interval"
+psql_admin "SELECT pg_reload_conf()" >/dev/null
+
+# --- méthodes sans mot de passe : échecs non comptés -------------------------
+# (revue finale 2, F1) seuls les échecs des méthodes qui vérifient un mot de
+# passe ou un secret sont comptés. ident sans serveur identd (connexion
+# refusée sur 127.0.0.1:113) échoue avec STATUS_ERROR sans que le client ait
+# fourni de mot de passe : avant la correction, 6 échecs verrouillaient le
+# rôle. Les lignes reject (par rôle, par base) n'atteignent pas le hook
+# (FATAL dans ClientAuthentication() avant l'appel) : non comptées non plus.
+psql_admin "CREATE ROLE regress_ident LOGIN PASSWORD '$GOOD'"
+psql_admin "CREATE ROLE regress_rejected LOGIN PASSWORD '$GOOD'"
+psql_admin "CREATE DATABASE regress_rejectdb"
+cp "$PPP_TMP/data/pg_hba.conf" "$PPP_TMP/pg_hba.conf.orig"
+{
+	echo "host all              regress_ident    127.0.0.1/32 ident"
+	echo "host all              regress_rejected 127.0.0.1/32 reject"
+	echo "host regress_rejectdb all              127.0.0.1/32 reject"
+	cat "$PPP_TMP/pg_hba.conf.orig"
+} >"$PPP_TMP/data/pg_hba.conf"
+psql_admin "SELECT pg_reload_conf()" >/dev/null
+sleep 1
+n_lock0=$(psql_admin "SELECT coalesce((SELECT failed_count FROM pass_policy.failed_attempts() WHERE role_name = 'regress_lock'), 0)")
+for i in 1 2 3 4 5 6; do
+	out_ident=$(psql_as regress_ident "$BAD") || true
+	out_rej=$(psql_as regress_rejected "$BAD") || true
+	out_db=$(PGPASSWORD=$BAD "$PPP_BINDIR/psql" -X -q -At -w -h 127.0.0.1 -p "$PPP_PORT" \
+		-U regress_lock -d regress_rejectdb -c "SELECT 1" 2>&1) || true
+done
+check_contains "F1 : ident refusé (aucun identd)" "Ident authentication failed" "$out_ident"
+check_contains "F1 : ligne reject par rôle" "pg_hba.conf rejects connection" "$out_rej"
+check_contains "F1 : ligne reject par base" "pg_hba.conf rejects connection.*regress_rejectdb" "$out_db"
+check_not_contains "F1 : jamais « locked » pour une méthode sans mot de passe" "is locked by pg_pass_policy" "$out_ident$out_rej$out_db"
+out=$(psql_admin "SELECT count(*) FROM pass_policy.failed_attempts() WHERE role_name IN ('regress_ident', 'regress_rejected')")
+check_eq "F1 : failed_attempts() vide pour ident et reject" "0" "$out"
+out=$(psql_admin "SELECT coalesce((SELECT failed_count FROM pass_policy.failed_attempts() WHERE role_name = 'regress_lock'), 0)")
+check_eq "F1 : reject sur une base : compteur de regress_lock inchangé" "$n_lock0" "$out"
+cp "$PPP_TMP/pg_hba.conf.orig" "$PPP_TMP/data/pg_hba.conf"
+psql_admin "SELECT pg_reload_conf()" >/dev/null
+sleep 1
+out=$(psql_as regress_ident "$GOOD" "SELECT current_user") || true
+check_eq "F1 : regress_ident non verrouillé (6 échecs ident)" "regress_ident" "$out"
+out=$(psql_as regress_rejected "$GOOD" "SELECT current_user") || true
+check_eq "F1 : regress_rejected non verrouillé (6 refus pg_hba)" "regress_rejected" "$out"
 
 # --- aucun WARNING du worker pendant le test ---------------------------------
 n=$(grep -c 'pg_pass_policy: worker .* failed' "$PPP_TMP/server.log" || true)

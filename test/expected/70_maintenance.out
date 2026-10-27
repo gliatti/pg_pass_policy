@@ -673,6 +673,44 @@ SHOW pg_pass_policy.manage_valid_until;
  on
 (1 row)
 
+-- Exclusion mutuelle : run_maintenance() prend un verrou consultatif de
+-- transaction (pg_advisory_xact_lock) ; deux passes successives dans la même
+-- transaction (verrou réentrant) réussissent, le verrou est tenu jusqu'au
+-- COMMIT puis relâché
+BEGIN;
+SELECT count(*) >= 0 AS first_pass FROM pass_policy.run_maintenance();
+ first_pass 
+------------
+ t
+(1 row)
+
+SELECT count(*) >= 0 AS second_pass FROM pass_policy.run_maintenance();
+ second_pass 
+-------------
+ t
+(1 row)
+
+SELECT count(*) AS advisory_held FROM pg_locks
+ WHERE locktype = 'advisory' AND pid = pg_backend_pid() AND granted;
+ advisory_held 
+---------------
+             1
+(1 row)
+
+COMMIT;
+SELECT count(*) AS advisory_released FROM pg_locks
+ WHERE locktype = 'advisory' AND pid = pg_backend_pid();
+ advisory_released 
+-------------------
+                 0
+(1 row)
+
+SELECT count(*) >= 0 AS third_pass FROM pass_policy.run_maintenance();
+ third_pass 
+------------
+ t
+(1 row)
+
 SELECT ppp_test.leaks();
  leaks 
 -------

@@ -399,6 +399,43 @@ ppp_secure_zero(void *p, size_t len)
 }
 
 /*
+ * See pg_pass_policy.h.  The checks are those of InitMaterializedSRF() (PG
+ * 15+), which does not exist in PG 14.
+ */
+void
+ppp_begin_materialize(FunctionCallInfo fcinfo, TupleDesc *tupdesc,
+					  Tuplestorestate **tupstore, int expected_natts)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	MemoryContext oldcontext;
+	TupleDesc	desc;
+
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+	if (!(rsinfo->allowedModes & SFRM_Materialize))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("materialize mode required, but it is not allowed in this context")));
+	if (get_call_result_type(fcinfo, NULL, &desc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	if (expected_natts > 0 && desc->natts != expected_natts)
+		elog(ERROR, "function must be declared with %d output columns",
+			 expected_natts);
+
+	oldcontext = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
+	desc = CreateTupleDescCopy(desc);
+	*tupstore = tuplestore_begin_heap(true, false, work_mem);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = *tupstore;
+	rsinfo->setDesc = desc;
+	MemoryContextSwitchTo(oldcontext);
+
+	*tupdesc = desc;
+}
+
+/*
  * pass_policy.worker_status()
  *		RETURNS TABLE(pid int, last_run timestamptz, last_reload timestamptz,
  *					  tracked_roles int)
@@ -406,11 +443,8 @@ ppp_secure_zero(void *p, size_t len)
 Datum
 ppp_worker_status(PG_FUNCTION_ARGS)
 {
-	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	TupleDesc	tupdesc;
 	Tuplestorestate *tupstore;
-	MemoryContext per_query_ctx;
-	MemoryContext oldcontext;
 	Datum		values[4];
 	bool		nulls[4];
 	pid_t		pid;
@@ -423,25 +457,7 @@ ppp_worker_status(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("pg_pass_policy must be loaded via shared_preload_libraries")));
 
-	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("set-valued function called in context that cannot accept a set")));
-	if (!(rsinfo->allowedModes & SFRM_Materialize))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("materialize mode required, but it is not allowed in this context")));
-	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
-		elog(ERROR, "return type must be a row type");
-
-	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
-	oldcontext = MemoryContextSwitchTo(per_query_ctx);
-	tupdesc = CreateTupleDescCopy(tupdesc);
-	tupstore = tuplestore_begin_heap(true, false, work_mem);
-	rsinfo->returnMode = SFRM_Materialize;
-	rsinfo->setResult = tupstore;
-	rsinfo->setDesc = tupdesc;
-	MemoryContextSwitchTo(oldcontext);
+	ppp_begin_materialize(fcinfo, &tupdesc, &tupstore, 4);
 
 	LWLockAcquire(ppp_shared->lock, LW_SHARED);
 	pid = ppp_shared->worker_pid;

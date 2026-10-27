@@ -274,6 +274,20 @@ SELECT pg_reload_conf();
 SELECT pg_sleep(0.5);
 SHOW pg_pass_policy.manage_valid_until;
 
+-- Exclusion mutuelle : run_maintenance() prend un verrou consultatif de
+-- transaction (pg_advisory_xact_lock) ; deux passes successives dans la même
+-- transaction (verrou réentrant) réussissent, le verrou est tenu jusqu'au
+-- COMMIT puis relâché
+BEGIN;
+SELECT count(*) >= 0 AS first_pass FROM pass_policy.run_maintenance();
+SELECT count(*) >= 0 AS second_pass FROM pass_policy.run_maintenance();
+SELECT count(*) AS advisory_held FROM pg_locks
+ WHERE locktype = 'advisory' AND pid = pg_backend_pid() AND granted;
+COMMIT;
+SELECT count(*) AS advisory_released FROM pg_locks
+ WHERE locktype = 'advisory' AND pid = pg_backend_pid();
+SELECT count(*) >= 0 AS third_pass FROM pass_policy.run_maintenance();
+
 SELECT ppp_test.leaks();
 
 -- Nettoyage des profils (les rôles sont supprimés dans 99_teardown)

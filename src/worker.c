@@ -94,6 +94,7 @@ typedef struct pppPendingRow
 	TimestampTz last_failure_at;
 	TimestampTz locked_until;
 	TimestampTz audit_locked_until; /* lock to audit (lock_pending_audit) */
+	bool		role_missing;	/* non-existent user name (authentication hook) */
 } pppPendingRow;
 
 /* lockout parameters of a role, read from the profiles */
@@ -256,6 +257,10 @@ ppp_sync_pending(void)
 	int			nrows = 0;
 	int			maxrows = ppp_max_tracked_roles > 0 ? ppp_max_tracked_roles : 1;
 	int			i;
+	int			ghost_names = 0;
+	int64		ghost_attempts = 0;
+	int			ghost_locks = 0;
+	TimestampTz ghost_last = 0;
 
 	Assert(ppp_pending_rows == NULL);
 	rows = (pppPendingRow *) MemoryContextAlloc(ppp_worker_cxt,
@@ -280,6 +285,7 @@ ppp_sync_pending(void)
 		rows[nrows].last_failure_at = entry->last_failure_at;
 		rows[nrows].locked_until = entry->locked_until;
 		rows[nrows].audit_locked_until = entry->audit_locked_until;
+		rows[nrows].role_missing = entry->role_missing;
 		nrows++;
 	}
 	LWLockRelease(ppp_shared->lock);
@@ -289,6 +295,23 @@ ppp_sync_pending(void)
 	{
 		pppPendingRow *r = &rows[i];
 		int			ret;
+
+		/*
+		 * Non-existent user names: one aggregated auth_failed row per cycle
+		 * (below) instead of one row, and one NOTIFY, per invented name.
+		 * Their pseudo-locks are counted there too: role_state has no row
+		 * for them.  They are acknowledged like the others.
+		 */
+		if (r->role_missing)
+		{
+			ghost_names++;
+			ghost_attempts += Max(r->pending_failures, 0);
+			if (r->lock_pending_audit && r->audit_locked_until != 0)
+				ghost_locks++;
+			if (r->last_failure_at > ghost_last)
+				ghost_last = r->last_failure_at;
+			continue;
+		}
 
 		if (r->pending_failures > 0)
 		{
@@ -370,8 +393,32 @@ ppp_sync_pending(void)
 		}
 	}
 
+	if (ghost_names > 0)
+	{
+		Oid			argtypes[4] = {INT4OID, INT8OID, INT4OID, TIMESTAMPTZOID};
+		Datum		values[4];
+		char		nulls[4] = {' ', ' ', ' ', ' '};
+		int			ret;
+
+		values[0] = Int32GetDatum(ghost_names);
+		values[1] = Int64GetDatum(ghost_attempts);
+		values[2] = Int32GetDatum(ghost_locks);
+		values[3] = TimestampTzGetDatum(ghost_last);
+		if (ghost_last == 0)
+			nulls[3] = 'n';
+
+		ret = SPI_execute_with_args(
+									"SELECT pass_policy.audit('auth_failed', NULL, "
+									"pg_catalog.jsonb_build_object('unknown_roles', $1, 'attempts', $2, "
+									"'pseudo_locks', $3, 'last_failure_at', $4, 'source', 'auth_hook'))",
+									4, argtypes, values, nulls, false, 0);
+		if (ret != SPI_OK_SELECT)
+			elog(ERROR, "audit('auth_failed') of unknown roles returned SPI code %d", ret);
+	}
+
 	if (nrows > 0)
-		elog(DEBUG1, PPP_LOG_PREFIX "wrote %d pending shared memory entries", nrows);
+		elog(DEBUG1, PPP_LOG_PREFIX "wrote %d pending shared memory entries (%d of non-existent roles, aggregated)",
+			 nrows, ghost_names);
 }
 
 /*
@@ -437,31 +484,23 @@ ppp_sync_cleanup(void)
 														   -(int64) PPP_PURGE_AFTER_SECS * 1000);
 	int			purged = 0;
 	int			purged_missing = 0;
+	bool		in_recovery = RecoveryInProgress();
 
 	LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
 	hash_seq_init(&seq, ppp_role_hash);
 	while ((entry = (pppRoleEntry *) hash_seq_search(&seq)) != NULL)
 	{
 		pppEntryClass c;
+		bool		pending;
 
 		/*
-		 * Expired lock (once its role_locked audit row has been written).
-		 * The authentication hook may already have counted new failures
-		 * after the expiry while locked_until was still set: those belong to
-		 * a new episode (first_failure_at >= locked_until) and are kept.
+		 * Expired lock (cleared once its role_locked audit row has been
+		 * written).  The authentication hook may already have counted new
+		 * failures after the expiry while locked_until was still set: those
+		 * belong to a new episode (first_failure_at >= locked_until) and are
+		 * kept.
 		 */
-		if (entry->locked_until != 0 && entry->locked_until != DT_NOEND &&
-			entry->locked_until <= now && !entry->lock_pending_audit &&
-			entry->lock_inflight == 0)
-		{
-			if (entry->first_failure_at < entry->locked_until)
-			{
-				entry->failed_count = 0;
-				entry->first_failure_at = 0;
-			}
-			entry->locked_until = 0;
-			entry->lock_from_state = false;
-		}
+		(void) ppp_expire_lock(entry, now, true);
 
 		/*
 		 * Purge (removing the current element during a hash_seq_search scan
@@ -474,9 +513,15 @@ ppp_sync_cleanup(void)
 		 *	 than their failure window (PPP_PURGE_AFTER_SECS if <= 0), unless
 		 *	 they still hold an active (pseudo-)lock or something to audit.
 		 * Entries carrying profile parameters are kept (they are rebuilt on
-		 * reload anyway).
+		 * reload anyway).  An entry with something to audit is never purged
+		 * here, even when its class makes it evictable (expired lock whose
+		 * audit is stale, PPP_STALE_AUDIT_SECS): it is only given up when
+		 * the room is needed.
 		 */
-		c = ppp_entry_real_class(entry, now);
+		c = ppp_entry_real_class(entry, now, in_recovery);
+		pending = entry->lock_pending_audit || entry->pending_failures > 0;
+		if (pending)
+			continue;
 		if (entry->role_missing)
 		{
 			int64		window_secs = entry->failure_window_secs > 0 ?
@@ -521,13 +566,15 @@ ppp_getint(HeapTuple tup, TupleDesc desc, int col, int32 dflt)
 /* add an eviction made by ppp_enter_role() to the totals of a reload */
 static void
 ppp_count_eviction(const pppEviction *ev, int *n_evicted, int *lost_failed,
-				   int *lost_pending)
+				   int *lost_pending, int *lost_lock_audits)
 {
 	if (!ev->evicted)
 		return;
 	(*n_evicted)++;
 	*lost_failed += ev->lost_failed_count;
 	*lost_pending += ev->lost_pending_failures;
+	if (ev->lost_lock_audit)
+		(*lost_lock_audits)++;
 }
 
 static void
@@ -549,9 +596,11 @@ ppp_sync_reload(void)
 	int			n_evicted = 0;
 	int			lost_failed = 0;
 	int			lost_pending = 0;
+	int			lost_lock_audits = 0;
 	int			n_lifted = 0;
 	TimestampTz now;
 	uint64		seq_snap;
+	bool		in_recovery;
 
 	/*
 	 * Durations (PPP_SQL_WINDOW_SECS, PPP_SQL_LOCK_SECS) are clamped to
@@ -672,6 +721,7 @@ ppp_sync_reload(void)
 	 * by the insertions of this very reload.
 	 */
 	now = GetCurrentTimestamp();
+	in_recovery = RecoveryInProgress();
 
 	LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
 
@@ -697,8 +747,10 @@ ppp_sync_reload(void)
 		if (locks[i].rolename[0] == '\0' || locks[i].locked_until == 0)
 			continue;
 
-		entry = ppp_enter_role(locks[i].rolename, PPP_ENTER_PRIORITY, now, &ev);
-		ppp_count_eviction(&ev, &n_evicted, &lost_failed, &lost_pending);
+		entry = ppp_enter_role(locks[i].rolename, PPP_ENTER_PRIORITY, now,
+							   in_recovery, &ev);
+		ppp_count_eviction(&ev, &n_evicted, &lost_failed, &lost_pending,
+						   &lost_lock_audits);
 		if (entry == NULL)
 		{
 			not_tracked++;
@@ -729,8 +781,10 @@ ppp_sync_reload(void)
 		if (profiles[i].rolename[0] == '\0')
 			continue;
 
-		entry = ppp_enter_role(profiles[i].rolename, PPP_ENTER_PRIORITY, now, &ev);
-		ppp_count_eviction(&ev, &n_evicted, &lost_failed, &lost_pending);
+		entry = ppp_enter_role(profiles[i].rolename, PPP_ENTER_PRIORITY, now,
+							   in_recovery, &ev);
+		ppp_count_eviction(&ev, &n_evicted, &lost_failed, &lost_pending,
+						   &lost_lock_audits);
 		if (entry == NULL)
 		{
 			not_tracked++;
@@ -788,10 +842,10 @@ ppp_sync_reload(void)
 						not_tracked),
 				 errdetail("Every entry holds a lock or profile parameters."),
 				 errhint("Increase pg_pass_policy.max_tracked_roles.")));
-	if (lost_failed > 0 || lost_pending > 0)
+	if (lost_failed > 0 || lost_pending > 0 || lost_lock_audits > 0)
 		ereport(LOG,
-				(errmsg(PPP_LOG_PREFIX "shared memory full: %d entries evicted to load locks and profiles (%d counted failures, %d failures not yet audited lost)",
-						n_evicted, lost_failed, lost_pending),
+				(errmsg(PPP_LOG_PREFIX "shared memory full: %d entries evicted to load locks and profiles (%d counted failures, %d failures not yet audited, %d expired locks not yet audited lost)",
+						n_evicted, lost_failed, lost_pending, lost_lock_audits),
 				 errhint("Increase pg_pass_policy.max_tracked_roles.")));
 	else if (n_evicted > 0)
 		elog(DEBUG1, PPP_LOG_PREFIX "shared memory full: %d inactive entries evicted to load locks and profiles",

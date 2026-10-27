@@ -121,6 +121,19 @@ SELECT name, context FROM pg_settings
 
 -- Worker : une seule ligne, le pid peut être NULL selon le timing de démarrage
 SELECT count(*) AS worker_rows FROM pass_policy.worker_status();
+-- Le worker démarre dès l'état cohérent, avant que pg_regress ait créé
+-- contrib_regression : ce premier démarrage échoue (FATAL « database does not
+-- exist ») et il revient après bgw_restart_time (10 s, plus sous charge).
+-- Attente bornée (60 x 0,5 s) de son pid : les tests suivants qui dépendent
+-- du worker (verrou réinjecté dans 70_maintenance) ne dépendent plus de ce
+-- délai. Une instruction par tour, sortie masquée.
+\set ECHO none
+\o /dev/null
+SELECT 'SELECT pg_sleep(0.5) WHERE (SELECT pid FROM pass_policy.worker_status()) IS NULL'
+  FROM generate_series(1, 60) \gexec
+\o
+\set ECHO all
+SELECT pid IS NOT NULL AS worker_up FROM pass_policy.worker_status();
 
 -- Outils de test (schéma ppp_test, supprimé dans 99_teardown)
 CREATE SCHEMA ppp_test;

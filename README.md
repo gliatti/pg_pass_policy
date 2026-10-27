@@ -152,6 +152,14 @@ est verrouillé pour `lock_duration` (NULL = jusqu'à déverrouillage manuel). U
 rôle verrouillé est refusé **même avec le bon mot de passe** : le client reçoit
 `FATAL: role "x" is locked by pg_pass_policy`.
 
+Seuls les échecs des méthodes où le client présente un mot de passe ou un
+secret sont comptés : `password`, `md5`, `scram-sha-256`, `ldap`, `pam`,
+`radius`, `bsd`. Un échec `peer`, `ident`, `cert`, `gss` ou `sspi` n'est pas
+compté : sinon un client autorisé à joindre le serveur pourrait verrouiller
+n'importe quel rôle par son nom. Les connexions refusées par une ligne
+`reject` de `pg_hba.conf` (ou faute de ligne) ne sont pas comptées non plus.
+Le refus d'un rôle verrouillé, lui, s'applique quelle que soit la méthode.
+
 ```sql
 SELECT pass_policy.lock_role('app_user');                              -- manuel, sans fin : renvoie infinity
 SELECT pass_policy.lock_role('app_user', interval '1 hour', 'incident');  -- renvoie la fin du verrou
@@ -162,7 +170,12 @@ SELECT pass_policy.unlock_role('app_user');                            -- remet 
 moins une seconde : la mémoire partagée les reçoit en secondes entières.
 Un verrou automatique levé par `unlock_role()` avant le passage du worker est
 tout de même journalisé (`role_locked`, `details.lifted_before_audit = true`),
-sans être recopié dans `role_state`. Si la bibliothèque a été retirée de
+sans être recopié dans `role_state`. À l'inverse, un nouveau verrou automatique
+posé juste avant ou pendant un `unlock_role()` ou un `run_maintenance()` (qui
+lève les verrous expirés) n'est pas levé par eux. Les échecs sur des noms de
+rôles inexistants sont journalisés en une seule ligne `auth_failed` par tour
+du worker (`role_name` NULL, `details.unknown_roles` et `details.attempts`).
+Si la bibliothèque a été retirée de
 `shared_preload_libraries` après l'installation, `lock_role()` et
 `unlock_role()` échouent (ERROR) au lieu de valider `role_state` sans effet sur
 l'authentification.
@@ -190,7 +203,9 @@ alertes `expiry_warning`, événements `password_expired`, déverrouillages
 automatiques, purge des rôles supprimés, réconciliation de
 `pg_authid.rolpassword` avec l'historique, rechargement des paramètres de
 verrouillage en mémoire partagée. La fonction est aussi appelable à la main (ou
-par pg_cron) et renvoie les actions effectuées. Avec `worker_interval = 0`, le
+par pg_cron) et renvoie les actions effectuées ; deux passes simultanées
+(worker et pg_cron par exemple) s'attendent (verrou consultatif de
+transaction). Avec `worker_interval = 0`, le
 worker ne fait plus que la synchronisation de la mémoire partagée : il faut
 appeler `run_maintenance()` soi-même.
 

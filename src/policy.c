@@ -1400,7 +1400,7 @@ ppp_check_secret(FunctionCallInfo fcinfo, const char *username, Oid roleid,
 }
 
 /*
- * pass_policy.check_password(role text, password text) RETURNS text
+ * pass_policy.check_password(role text, password text) RETURNS text (STRICT)
  *
  * NULL if the password complies with the effective profile of the role,
  * otherwise "PPP-0xx: reason".  No side effect, no audit.
@@ -1425,9 +1425,6 @@ ppp_check_password(PG_FUNCTION_ARGS)
 	int			save_sec_context;
 	pppSpiState st;
 	text	   *volatile result = NULL;
-
-	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
-		PG_RETURN_NULL();
 
 	/* identity of the caller, before the SPI session elevates it */
 	caller_is_super = superuser();

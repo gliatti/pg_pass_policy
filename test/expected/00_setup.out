@@ -299,6 +299,19 @@ SELECT count(*) AS worker_rows FROM pass_policy.worker_status();
            1
 (1 row)
 
+-- Le worker démarre dès l'état cohérent, avant que pg_regress ait créé
+-- contrib_regression : ce premier démarrage échoue (FATAL « database does not
+-- exist ») et il revient après bgw_restart_time (10 s, plus sous charge).
+-- Attente bornée (60 x 0,5 s) de son pid : les tests suivants qui dépendent
+-- du worker (verrou réinjecté dans 70_maintenance) ne dépendent plus de ce
+-- délai. Une instruction par tour, sortie masquée.
+\set ECHO none
+SELECT pid IS NOT NULL AS worker_up FROM pass_policy.worker_status();
+ worker_up 
+-----------
+ t
+(1 row)
+
 -- Outils de test (schéma ppp_test, supprimé dans 99_teardown)
 CREATE SCHEMA ppp_test;
 GRANT USAGE ON SCHEMA ppp_test TO PUBLIC;

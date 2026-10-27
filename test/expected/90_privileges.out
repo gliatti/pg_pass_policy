@@ -641,7 +641,9 @@ SELECT ppp_test.try($$ALTER ROLE regress_target PASSWORD 'Untrusted-Schema#2026'
 -- révélerait que la faiblesse du candidat, pas le mot de passe d'un autre).
 -- ALTER ROLE : refusé (42501) sur PG >= 16 sans ADMIN ; sur PG <= 15,
 -- CREATEROLE suffit à changer le mot de passe d'un non-superutilisateur, la
--- réponse PPP-031 n'apprend donc rien qu'il ne puisse déjà faire.
+-- réponse n'apprend donc rien qu'il ne puisse déjà faire : PPP-030 (min_age,
+-- contrôlé avant la réutilisation PPP-031, le mot de passe de regress_target
+-- venant d'être changé).
 -- ---------------------------------------------------------------------
 CREATE ROLE regress_creator LOGIN CREATEROLE;
 SET SESSION AUTHORIZATION regress_creator;
@@ -659,7 +661,7 @@ SELECT ppp_test.try($$CREATE ROLE regress_target PASSWORD 'weak'$$) AS create_ex
 
 SELECT ppp_test.try($$ALTER ROLE regress_target PASSWORD 'Untrusted-Schema#2026'$$)
        = CASE WHEN current_setting('server_version_num')::int >= 160000
-              THEN '42501' ELSE '28P01 PPP-031' END AS alter_other_current;
+              THEN '42501' ELSE '28P01 PPP-030' END AS alter_other_current;
  alter_other_current 
 ---------------------
  t

@@ -6,10 +6,13 @@
 #define PG_PASS_POLICY_H
 
 #include "postgres.h"
+#include "access/tupdesc.h"
 #include "datatype/timestamp.h"
+#include "fmgr.h"
 #include "port/atomics.h"
 #include "storage/lwlock.h"
 #include "utils/hsearch.h"
+#include "utils/tuplestore.h"
 
 #define PPP_SCHEMA        "pass_policy"
 #define PPP_LIBRARY_NAME  "pg_pass_policy"
@@ -72,6 +75,15 @@ typedef struct pppRoleEntry
 	TimestampTz audit_locked_until;
 
 	/*
+	 * When locked_until was last set to a new lock (authentication hook,
+	 * PRE_COMMIT of shmem_lock_role(), re-injection by the worker).  An
+	 * unlock committed afterwards only lifts a lock set before it was
+	 * requested (pppPendingOp.queued_at in lockout.c), so that a newer
+	 * automatic lock survives an unlock decided on older data.
+	 */
+	TimestampTz lock_set_at;
+
+	/*
 	 * Lock state.  lock_from_state: the lock is expected to be mirrored in
 	 * role_state (re-injected by the worker, or set by shmem_lock_role() on
 	 * a primary): a reload lifts it when role_state no longer holds it.
@@ -98,12 +110,25 @@ typedef enum pppEntryClass
 {
 	PPP_CLASS_GHOST = 0,		/* role_missing: always evictable */
 	PPP_CLASS_INACTIVE,			/* zero counter or elapsed window, nothing
-								 * pending, no lock, no profile */
+								 * pending, no lock, no profile; also an
+								 * expired lock whose audit is stale (see
+								 * PPP_STALE_AUDIT_SECS) */
 	PPP_CLASS_LIVE_COUNTER,		/* failure counter still inside its window */
 	PPP_CLASS_PENDING_AUDIT,	/* failures not yet written to audit_log */
 	PPP_CLASS_KEEP				/* active lock, lock not yet audited, or
 								 * profile parameters: never evicted */
 } pppEntryClass;
+
+/*
+ * An expired lock whose role_locked audit row is still pending
+ * (lock_pending_audit) stops being PPP_CLASS_KEEP once it ended more than
+ * this long ago, or at once on a hot standby (the row cannot be written
+ * before a promotion): otherwise a worker that cannot write (standby,
+ * pg_pass_policy.database misconfigured) would let such entries fill the
+ * hash for good.  The entry is then classified on its counter only, and
+ * the loss of its pending audit is logged if it is evicted.
+ */
+#define PPP_STALE_AUDIT_SECS	(24 * 60 * 60)
 
 /*
  * Entry creation when the hash is full (SPEC 6.3):
@@ -127,6 +152,8 @@ typedef struct pppEviction
 	char		rolename[NAMEDATALEN];
 	int32		lost_failed_count;		/* counter still inside its window */
 	int32		lost_pending_failures;	/* failures lost before being audited */
+	bool		lost_lock_audit;		/* role_locked row lost (stale, see
+										 * PPP_STALE_AUDIT_SECS) */
 	pppRoleEntry victim;				/* content of the evicted entry, so that
 										 * an aborted lock can put it back */
 } pppEviction;
@@ -195,6 +222,17 @@ typedef enum pppExtensionState
 } pppExtensionState;
 
 extern pppExtensionState ppp_extension_state(Oid *nspowner);
+
+/*
+ * Common start of a materialize-mode set-returning function: checks the
+ * call context, builds the result descriptor (expected_natts output
+ * columns, checked when > 0) and an empty tuplestore in the per-query
+ * context, and registers both in fcinfo->resultinfo.  Written by hand
+ * (rather than with InitMaterializedSRF) so that it works on PG 14 to 18.
+ */
+extern void ppp_begin_materialize(FunctionCallInfo fcinfo, TupleDesc *tupdesc,
+								  Tuplestorestate **tupstore,
+								  int expected_natts);
 /* efface une zone mémoire contenant un secret avant de la libérer */
 extern void ppp_secure_zero(void *p, size_t len);
 
@@ -209,15 +247,29 @@ extern void ppp_policy_init(void);		/* installe check_password_hook */
 extern void ppp_make_key(pppRoleKey *key, const char *rolename);
 extern void ppp_lockout_init(void);		/* installe ClientAuthentication_hook */
 extern void ppp_lockout_shmem_init(void); /* appelé depuis shmem_startup_hook */
-/* caller holds ppp_shared->lock exclusively; NULL when no room is left */
+/*
+ * Caller holds ppp_shared->lock exclusively; NULL when no room is left.
+ * in_recovery: RecoveryInProgress(), read before taking the lock (see
+ * PPP_STALE_AUDIT_SECS).
+ */
 extern pppRoleEntry *ppp_enter_role(const char *rolename, pppEnterMode mode,
-									TimestampTz now, pppEviction *ev);
+									TimestampTz now, bool in_recovery,
+									pppEviction *ev);
 extern void ppp_log_eviction(const pppEviction *ev);
 /* failure_window_secs > 0 and elapsed since first_failure_at */
 extern bool ppp_window_elapsed(const pppRoleEntry *entry, TimestampTz now);
 /* class of an entry; ppp_entry_real_class() ignores role_missing */
-extern pppEntryClass ppp_entry_class(const pppRoleEntry *entry, TimestampTz now);
-extern pppEntryClass ppp_entry_real_class(const pppRoleEntry *entry, TimestampTz now);
+extern pppEntryClass ppp_entry_class(const pppRoleEntry *entry, TimestampTz now,
+									 bool in_recovery);
+extern pppEntryClass ppp_entry_real_class(const pppRoleEntry *entry,
+										  TimestampTz now, bool in_recovery);
+
+/*
+ * Forget an expired lock (caller holds ppp_shared->lock exclusively); see
+ * lockout.c.  Returns true when locked_until was cleared.
+ */
+extern bool ppp_expire_lock(pppRoleEntry *entry, TimestampTz now,
+							bool check_inflight);
 
 /* Is the lock of an entry active at time "now"? */
 static inline bool

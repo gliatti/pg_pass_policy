@@ -342,11 +342,13 @@ AS 'MODULE_PATHNAME', 'ppp_shmem_lock_role'
 LANGUAGE C VOLATILE;
 COMMENT ON FUNCTION shmem_lock_role(text, timestamptz) IS 'Locks a role in shared memory until a timestamp (NULL = until manual unlock)';
 
-CREATE FUNCTION shmem_unlock_role(role text)
+-- expired_only: lift the lock only if it has expired at COMMIT (step f of
+-- run_maintenance(): never lift a newer automatic lock not yet in role_state)
+CREATE FUNCTION shmem_unlock_role(role text, expired_only boolean DEFAULT false)
 RETURNS void
 AS 'MODULE_PATHNAME', 'ppp_shmem_unlock_role'
 LANGUAGE C STRICT VOLATILE;
-COMMENT ON FUNCTION shmem_unlock_role(text) IS 'Removes the shared-memory lock of a role';
+COMMENT ON FUNCTION shmem_unlock_role(text, boolean) IS 'Removes the shared-memory lock of a role (expired_only: only if it has expired)';
 
 CREATE FUNCTION shmem_reset_failures(role text)
 RETURNS void
@@ -470,11 +472,29 @@ BEGIN
     IF coalesce((SELECT x.rolsuper FROM pg_catalog.pg_roles x WHERE x.rolname = session_user), false) THEN
         RETURN r.oid;
     END IF;
-    IF pass_policy._is_privileged(r.oid)
-       OR EXISTS (SELECT FROM pg_catalog.pg_authid x
-                   WHERE x.oid <> r.oid
-                     AND pass_policy._is_privileged(x.oid)
-                     AND pg_catalog.pg_has_role(r.oid, x.oid, 'MEMBER')) THEN
+    -- The target and its ancestors only, walked up pg_auth_members: the
+    -- same set as pg_has_role(target, x, 'MEMBER') (is_member_of_role():
+    -- every grant, whatever its INHERIT / SET options, any depth), with the
+    -- implicit membership of the owner of the current database in
+    -- pg_database_owner that roles_is_member_of() adds.  pg_database_owner
+    -- is not privileged itself, and since PG 16 it cannot be a member of any
+    -- role (no ancestor); the branch is kept so that the walk stays exactly
+    -- that of pg_has_role() whatever the version.  A superuser target is
+    -- privileged in itself.  UNION stops on cycles.
+    IF EXISTS (WITH RECURSIVE anc(oid) AS (
+                   SELECT r.oid
+                   UNION
+                   SELECT up.roleid
+                     FROM anc
+                    CROSS JOIN LATERAL (
+                          SELECT m.roleid FROM pg_catalog.pg_auth_members m
+                           WHERE m.member = anc.oid
+                          UNION ALL
+                          SELECT 'pg_database_owner'::pg_catalog.regrole::pg_catalog.oid
+                           WHERE anc.oid = (SELECT d.datdba FROM pg_catalog.pg_database d
+                                             WHERE d.datname = pg_catalog.current_database())
+                          ) up(roleid))
+               SELECT FROM anc WHERE pass_policy._is_privileged(anc.oid)) THEN
         RAISE EXCEPTION 'pg_pass_policy: only a superuser can manage privileged role "%"', p_role
               USING ERRCODE = 'insufficient_privilege',
                     DETAIL = 'The role has, or is a member of a role having, SUPERUSER, REPLICATION, BYPASSRLS, predefined (pg_*) or, on PostgreSQL 15 and older, CREATEROLE privileges.';
@@ -510,8 +530,9 @@ LANGUAGE C STABLE STRICT;
 COMMENT ON FUNCTION _is_exempt(text) IS 'Internal: true if the role is listed in pg_pass_policy.exempt_roles (same function as the C hooks)';
 
 /*
- * Calls to the C shared-memory functions.  'lock' and 'unlock' let their
- * errors through: role_state (and the audit row) must never claim a lock or
+ * Calls to the C shared-memory functions.  'lock', 'unlock' and
+ * 'unlock_expired' (unlock only if the lock has expired, see
+ * shmem_unlock_role) let their errors through: role_state (and the audit row) must never claim a lock or
  * an unlock that the shared memory did not receive, e.g. when the library is
  * not preloaded (fail-closed: lock_role() and unlock_role() fail and their
  * transaction is rolled back).  'reload' and 'reset' only optimise or tidy
@@ -529,6 +550,8 @@ BEGIN
         WHEN 'lock'   THEN PERFORM pass_policy.shmem_lock_role(p_role, p_until);
                            RETURN true;
         WHEN 'unlock' THEN PERFORM pass_policy.shmem_unlock_role(p_role);
+                           RETURN true;
+        WHEN 'unlock_expired' THEN PERFORM pass_policy.shmem_unlock_role(p_role, true);
                            RETURN true;
         ELSE NULL;
     END CASE;
@@ -1427,7 +1450,8 @@ COMMENT ON FUNCTION switch_rotation_pair(text, int) IS 'Rotates a pair: new pass
  *      sync) once the password has been changed ('unblock') ;
  *  e.  expiry_warning (max once a day) / password_expired (once), except
  *      for exempt roles ;
- *  f.  automatic unlock of expired locks (current role name) ;
+ *  f.  automatic unlock of expired locks (current role name; in shared
+ *      memory only if the lock there has expired too) ;
  *  g.  'maintenance' audit row only if something was done ;
  *  h.  shmem_reload() is ALWAYS called: the worker decides whether anything
  *      changed (simpler and cheap; no extra bookkeeping in SQL).
@@ -1448,6 +1472,12 @@ DECLARE
     v_exempt   oid[];
 BEGIN
     PERFORM pass_policy._require_admin();
+    -- One pass at a time (worker, pg_cron, manual call): two concurrent
+    -- passes would both act on the same rows (duplicate audit rows and
+    -- notifications, reconciliation of the same history row).  The second
+    -- one waits here, then sees the work of the first.  Transaction-level
+    -- lock: released at COMMIT / ROLLBACK, never leaked by an error.
+    PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('pg_pass_policy.run_maintenance'));
     -- step b updates password_history.verifier with pg_authid.rolpassword:
     -- keep auto_explain from logging those values (see _set_password)
     IF current_setting('auto_explain.log_min_duration', true) IS NOT NULL THEN
@@ -1694,6 +1724,9 @@ BEGIN
     -- pg_authid (role_state.role_name is refreshed by step a0 too, but the
     -- name used for the unlock and the audit must never be a stale one).
     -- Rows of dropped roles were purged by step a.
+    -- 'unlock_expired': the shared memory may hold a newer automatic lock
+    -- that role_state does not know yet (new failures after the expiry,
+    -- before or during this pass): only an expired lock is lifted there.
     FOR r IN
         UPDATE pass_policy.role_state s
            SET locked_until = NULL, locked_by = NULL, lock_reason = NULL,
@@ -1702,7 +1735,7 @@ BEGIN
          WHERE a.oid = s.role_oid AND s.locked_until < now()
         RETURNING a.rolname::text AS rname
     LOOP
-        PERFORM pass_policy._shmem('unlock', r.rname);
+        PERFORM pass_policy._shmem('unlock_expired', r.rname);
         PERFORM pass_policy._audit('role_unlocked', r.rname, '{"by":"auto"}');
         action := 'role_unlocked'; role_name := r.rname; details := '{"by":"auto"}';
         v_actions := v_actions + 1;
