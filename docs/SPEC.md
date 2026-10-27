@@ -37,7 +37,7 @@ pg_pass_policy` dans la base désignée par le GUC `pg_pass_policy.database`
 ```
 Makefile                      PGXS (MODULE_big = pg_pass_policy)
 pg_pass_policy.control
-sql/pg_pass_policy--1.0.sql   schéma, tables, fonctions SQL/PLpgSQL, vues, déclarations des fonctions C
+sql/pg_pass_policy--1.0.sql   schéma `pass_policy`, tables, fonctions SQL/PLpgSQL, vues, déclarations des fonctions C
 src/pg_pass_policy.h          en-tête partagé (contrat C)
 src/compat.h                  #ifdef par version
 src/pg_pass_policy.c          _PG_init, GUC, chaînage des hooks, shmem request/startup, fonctions utilitaires
@@ -52,11 +52,11 @@ web/                          back-office FastAPI + HTMX
 docs/                         documentation
 ```
 
-## 3. Modèle de données (schéma `pg_pass_policy`)
+## 3. Modèle de données (schéma `pass_policy`)
 
 Toutes les tables : `REVOKE ALL ON … FROM PUBLIC`. Lecture possible par le rôle
-`pg_pass_policy_viewer` (créé par l'extension, `NOLOGIN`), administration par
-superutilisateur ou membre de `pg_pass_policy_admin` (`NOLOGIN`, les fonctions
+`pass_policy_viewer` (créé par l'extension, `NOLOGIN`), administration par
+superutilisateur ou membre de `pass_policy_admin` (`NOLOGIN`, les fonctions
 d'administration sont `SECURITY DEFINER` et vérifient l'appartenance).
 
 ### 3.1 `profile` — profils de politique (modèle « le plus abouti », type Oracle)
@@ -141,7 +141,7 @@ génère un mot de passe pour le rôle inactif, le rend actif, et borne le
 `VALID UNTIL` de l'ancien à `now() + grace_period` du profil. L'application
 récupère le nouveau couple (rôle, mot de passe).
 
-## 4. API SQL (schéma `pg_pass_policy`)
+## 4. API SQL (schéma `pass_policy`)
 
 Fonctions PL/pgSQL sauf mention « C ». Les identifiants sont toujours passés
 dans `format('%I')` / `quote_ident()` : aucune concaténation brute.
@@ -186,7 +186,7 @@ Vues :
 
 Message JSON de `NOTIFY` : `{"event":"…","role":"…","at":"…","details":{…}}`.
 
-## 5. GUC (tous préfixés `pg_pass_policy.`)
+## 5. GUC (tous préfixés `pass_policy.`)
 
 | nom | type | défaut | contexte | rôle |
 |---|---|---|---|---|
@@ -229,13 +229,13 @@ static void ppp_check_password_hook(const char *username, const char *shadow_pas
 
 Algorithme :
 1. si `!ppp_enabled` ou rôle exempt → chaîner au hook précédent et sortir ;
-2. charger le profil effectif via SPI : `SELECT * FROM pg_pass_policy.effective_profile($1)` (si le schéma n'existe pas dans cette base → **ne rien bloquer**, juste `ereport(WARNING)` une fois par session : l'extension n'est installée que dans `pg_pass_policy.database` ; **ATTENTION** : le hook s'exécute dans la base courante de la session, pas dans `pg_pass_policy.database`. Décision : la politique n'est appliquée que lorsque `current_database() = ppp_database` **ou** si la table est accessible localement ; en dehors, refuser `ALTER ROLE … PASSWORD` avec un `ERROR` explicite si `ppp_enabled` (« password changes must be made while connected to database X »). Ce comportement est contrôlé par le GUC `pg_pass_policy.enforce_database` (bool, défaut on) ;
+2. charger le profil effectif via SPI : `SELECT * FROM pass_policy.effective_profile($1)` (si le schéma n'existe pas dans cette base → **ne rien bloquer**, juste `ereport(WARNING)` une fois par session : l'extension n'est installée que dans `pg_pass_policy.database` ; **ATTENTION** : le hook s'exécute dans la base courante de la session, pas dans `pg_pass_policy.database`. Décision : la politique n'est appliquée que lorsque `current_database() = ppp_database` **ou** si la table est accessible localement ; en dehors, refuser `ALTER ROLE … PASSWORD` avec un `ERROR` explicite si `ppp_enabled` (« password changes must be made while connected to database X »). Ce comportement est contrôlé par le GUC `pg_pass_policy.enforce_database` (bool, défaut on) ;
 3. si `password_type != PASSWORD_TYPE_PLAINTEXT` : `reject_prehashed` → ERROR `PPP-001` ; sinon enregistrer sans vérification de complexité ;
 4. vérifications de complexité (ordre et codes) : `PPP-010` longueur min, `PPP-011` longueur max, `PPP-012` classes (min_classes), `PPP-013` min_lower, `PPP-014` min_upper, `PPP-015` min_digit, `PPP-016` min_special, `PPP-017` contient le nom du rôle, `PPP-018` dictionnaire, `PPP-019` répétitions, `PPP-020` caractères non imprimables / espace en début-fin ;
 5. `min_age` : `PPP-030` si `now() - password_changed_at < min_age` (sauf superutilisateur appelant) ;
 6. historique : pour chaque vérificateur SCRAM des `history_count` derniers (et plus récents que `history_days`), `scram_verify_plain_password(username, password, verifier)` → `PPP-031` si égal ; vérificateurs MD5 : comparés via `pg_md5_encrypt` ;
 7. calcul du nouveau vérificateur : `encrypt_password(PASSWORD_TYPE_SCRAM_SHA_256, username, shadow_pass)` (PG 14-18 : `libpq/crypt.h`) ; si `password_type == PLAINTEXT` ; sinon `shadow_pass` tel quel ;
-8. SPI `SELECT pg_pass_policy.record_password_change($1, $2)` ;
+8. SPI `SELECT pass_policy.record_password_change($1, $2)` ;
 9. chaîner au hook précédent.
 
 Refus : `ereport(ERROR, (errcode(ERRCODE_INVALID_PASSWORD), errmsg("PPP-0xx: …"), errdetail(…), errhint(…)))`. Le mot de passe n'apparaît **jamais** dans un message, un log ou l'audit. Un refus est journalisé (`password_rejected`, details = code) via SPI dans une sous-transaction qui ne doit pas masquer l'erreur principale (ou simplement `ereport(LOG)` si l'audit échoue).
@@ -274,7 +274,7 @@ verrous manuels/actifs depuis `role_state` lors de son premier tour.
 
 - enregistré dans `_PG_init` via `RegisterBackgroundWorker` (`BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION`, `BgWorkerStart_RecoveryFinished`, `bgw_restart_time = 10`) ;
 - `ppp_worker_main` : `BackgroundWorkerInitializeConnection(ppp_database, NULL, 0)`, boucle `WaitLatch` avec `ppp_worker_interval` ; sur `reload_requested` ou SIGHUP → tour immédiat ;
-- chaque tour : `StartTransactionCommand` → si l'extension n'est pas installée (`get_extension_oid("pg_pass_policy", true) == InvalidOid`) → attendre ; sinon `SPI_execute("SELECT * FROM pg_pass_policy.run_maintenance()")`, puis synchronisation shmem (§6.3) ; `CommitTransactionCommand` ;
+- chaque tour : `StartTransactionCommand` → si l'extension n'est pas installée (`get_extension_oid("pg_pass_policy", true) == InvalidOid`) → attendre ; sinon `SPI_execute("SELECT * FROM pass_policy.run_maintenance()")`, puis synchronisation shmem (§6.3) ; `CommitTransactionCommand` ;
 - ne tourne pas sur un standby (`RecoveryInProgress()` → attendre) ;
 - `pg_pass_policy.worker_interval = 0` → le worker dort indéfiniment (réveil sur SIGHUP).
 
@@ -301,7 +301,7 @@ verrous manuels/actifs depuis `role_state` lors de son premier tour.
 1. Aucun mot de passe en clair n'est stocké, journalisé, ni inclus dans un message d'erreur, un `NOTIFY` ou l'audit.
 2. `rotate_password` / `switch_rotation_pair` retournent le mot de passe à l'appelant **une seule fois**. Le mot de passe est généré côté serveur et n'apparaît donc jamais dans le texte d'une requête (donc jamais dans `log_statement`), seulement dans le résultat.
 3. Toutes les constructions SQL dynamiques utilisent `format('%I'/'%L')`.
-4. Les fonctions d'administration vérifient `pg_has_role(session_user, 'pg_pass_policy_admin', 'MEMBER') OR rolsuper`.
+4. Les fonctions d'administration vérifient `pg_has_role(session_user, 'pass_policy_admin', 'MEMBER') OR rolsuper`.
 5. Les mémoires contenant un mot de passe en C sont effacées (`explicit_bzero` si dispo, sinon boucle volatile) avant `pfree`.
 6. `generate_password` utilise exclusivement `pg_strong_random`.
 
@@ -323,4 +323,16 @@ Pages : tableau de bord (compteurs ok/warning/grace/expired/locked), rôles
 (table filtrable, actions lock/unlock/expire/rotate avec affichage unique),
 profils (CRUD), audit (filtres, pagination), paires de rotation. Auth : HTTP
 basic ou en-tête reverse-proxy (`REMOTE_USER`), rôle PG dédié membre de
-`pg_pass_policy_admin`. Tests pytest contre une base de test.
+`pass_policy_admin`. Tests pytest contre une base de test.
+
+## 11. Décisions d'intégration (journal)
+
+- **Nom du schéma : `pass_policy`** (le préfixe `pg_` est réservé aux schémas système : `CREATE EXTENSION` échouait). Les rôles sont `pass_policy_admin` et `pass_policy_viewer` (même raison : `pg_` réservé pour les rôles). L'extension, la bibliothèque et le préfixe des GUC restent `pg_pass_policy`. En C, utiliser la macro `PPP_SCHEMA`.
+- `role_state` porte une contrainte UNIQUE/PK sur `role_oid` (le worker fait `ON CONFLICT (role_oid)`), et les colonnes `role_name`, `locked_until`, `locked_by`, `lock_reason`.
+- `lock_role` / `unlock_role` mettent à jour **d'abord** `role_state` puis la shmem : `run_maintenance()` appelle `shmem_reload()` et le worker réinjecte `role_state.locked_until` à chaque rechargement, donc un `shmem_unlock_role` sans mise à jour de `role_state` serait annulé au tour suivant.
+- Purge des rôles disparus : `role_profile`, `role_state`, `password_history`, `rotation_pair`.
+- `audit()` : `actor = 'worker'` quand `pg_backend_pid()` est le pid du worker (via `worker_status()`), sinon `session_user`.
+- Le hook d'authentification ne compte pas `STATUS_EOF` (client parti avant d'envoyer le mot de passe) : seuls les échecs réels (`STATUS_ERROR`) comptent.
+- `failure_window` ≤ 0 = pas de fenêtre (les échecs s'additionnent jusqu'au prochain succès).
+- Un superutilisateur peut être verrouillé : documenter `pg_pass_policy.exempt_roles = 'postgres'` dans le README.
+- `ppp_failed_attempts` est construite avec un tuplestore manuel (même code 14 → 18).

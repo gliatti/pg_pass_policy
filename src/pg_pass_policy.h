@@ -11,7 +11,7 @@
 #include "storage/lwlock.h"
 #include "utils/hsearch.h"
 
-#define PPP_SCHEMA        "pg_pass_policy"
+#define PPP_SCHEMA        "pass_policy"
 #define PPP_LIBRARY_NAME  "pg_pass_policy"
 #define PPP_LWLOCK_TRANCHE "pg_pass_policy"
 #define PPP_LOG_PREFIX    "pg_pass_policy: "
