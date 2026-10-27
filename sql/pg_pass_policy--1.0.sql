@@ -1158,21 +1158,19 @@ COMMENT ON FUNCTION unassign_profile(name) IS 'Removes the profile assignment of
  * record_password_change(); _ensure_recorded() covers the case where the
  * hook did not run.
  */
-CREATE FUNCTION _rotate_role(p_role name, p_oid oid, p_length int)
-RETURNS text
+CREATE FUNCTION _rotate_role(p_role name, p_oid oid, p_length int,
+                             OUT password text, OUT profile text)
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
-DECLARE
-    v_profile text;
-    v_pwd     text;
 BEGIN
-    SELECT p.name INTO v_profile FROM pass_policy.effective_profile(p_role) p;
-    v_pwd := pass_policy.generate_password(coalesce(p_length, 24), v_profile);
-    IF v_pwd IS NULL THEN
+    -- read once: the caller's audit row names the profile actually used
+    SELECT p.name INTO profile FROM pass_policy.effective_profile(p_role) p;
+    password := pass_policy.generate_password(coalesce(p_length, 24), profile);
+    IF password IS NULL THEN
         RAISE EXCEPTION 'pg_pass_policy: password generation failed';
     END IF;
-    PERFORM pass_policy._set_password(p_role, v_pwd);
+    PERFORM pass_policy._set_password(p_role, password);
     -- records the change (must_change cleared) if the hook did not
     PERFORM pass_policy._ensure_recorded(p_role);
 
@@ -1186,10 +1184,9 @@ BEGIN
               CASE WHEN pass_policy._guc_on('pg_pass_policy.manage_valid_until', true)
                         AND NOT pass_policy._is_exempt(p_role)
                    THEN 'force' ELSE 'unblock' END);
-    RETURN v_pwd;
 END
 $$;
-COMMENT ON FUNCTION _rotate_role(name, oid, int) IS 'Internal: generates, sets and records a new password for an already checked role; returns it';
+COMMENT ON FUNCTION _rotate_role(name, oid, int) IS 'Internal: generates, sets and records a new password for an already checked role; returns it and the profile used';
 
 /*
  * The password is generated and set by _rotate_role(); it is returned once
@@ -1209,9 +1206,9 @@ BEGIN
     PERFORM pass_policy._require_admin();
     v_oid := pass_policy._require_target_allowed(v_role);
 
-    v_pwd := pass_policy._rotate_role(v_role, v_oid, $2);
+    SELECT r.password, r.profile INTO v_pwd, v_profile
+      FROM pass_policy._rotate_role(v_role, v_oid, $2) r;
 
-    SELECT p.name INTO v_profile FROM pass_policy.effective_profile(v_role) p;
     PERFORM pass_policy._audit('password_rotated', v_role,
             jsonb_build_object('profile', v_profile, 'length', coalesce($2, 24),
                                'valid_until', (SELECT a.rolvaliduntil FROM pg_catalog.pg_authid a
@@ -1288,9 +1285,18 @@ DECLARE
 BEGIN
     PERFORM pass_policy._require_admin();
     v_oid := pass_policy._require_target_allowed(v_role);
-    -- v_role is the current name (looked up in pg_authid): refreshed here too
+    -- Like lock_role(), the role_state row is created if missing and locked
+    -- (also refreshes role_state.role_name, current name after a rename).
+    -- Without a row, the UPDATE below would lock nothing: an automatic lock
+    -- of the hook still waiting for its audit could then be written to
+    -- role_state by the worker (upsert) after this unlock has committed, and
+    -- re-injected by the next reload.  With the row (inserted or locked
+    -- here), the worker's upsert waits for this transaction, whose COMMIT
+    -- stamps lock_seq before the row lock is released: the worker sees the
+    -- stamp and gives up its copy (see SPEC 6.3).
+    PERFORM pass_policy._ensure_state(v_oid);
     UPDATE pass_policy.role_state s
-       SET locked_until = NULL, locked_by = NULL, lock_reason = NULL, role_name = v_role
+       SET locked_until = NULL, locked_by = NULL, lock_reason = NULL
      WHERE s.role_oid = v_oid;
     PERFORM pass_policy._shmem('unlock', v_role::text);
     PERFORM pass_policy._shmem('reset', v_role::text);
@@ -1419,7 +1425,7 @@ BEGIN
            previous_valid_until = NULL
      WHERE r.pair_name = rp.pair_name;
 
-    v_pwd := pass_policy._rotate_role(v_new, v_new_oid, $2);
+    SELECT r.password INTO v_pwd FROM pass_policy._rotate_role(v_new, v_new_oid, $2) r;
 
     IF v_old IS NOT NULL THEN
         SELECT now() + p.grace_period INTO v_bound FROM pass_policy.effective_profile(v_old) p;

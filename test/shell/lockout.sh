@@ -351,6 +351,124 @@ check_eq "F1 : regress_ident non verrouillé (6 échecs ident)" "regress_ident" 
 out=$(psql_as regress_rejected "$GOOD" "SELECT current_user") || true
 check_eq "F1 : regress_rejected non verrouillé (6 refus pg_hba)" "regress_rejected" "$out"
 
+# --- unlock_role() d'un verrou automatique sans ligne role_state ------------
+# (revue finale 5, K1) le worker dort ; un verrou automatique attend son audit
+# et le rôle n'a pas de ligne role_state. unlock_role() doit créer (et
+# verrouiller) cette ligne comme lock_role() : sinon son UPDATE ne prend aucun
+# verrou de ligne et l'upsert concurrent du worker peut valider le verrou
+# périmé après le déverrouillage, que le rechargement suivant réinjecte. La
+# course elle-même n'est pas reproductible à coup sûr : on vérifie la ligne
+# créée par unlock_role() et l'état après le tour du worker.
+psql_admin "SELECT pass_policy.create_profile('p_k1',
+  '{\"max_failures\": 2, \"failure_window\": \"1 minute\", \"lock_duration\": \"1 hour\", \"min_age\": \"0\"}')" >/dev/null
+psql_admin "SELECT pass_policy.create_profile('p_k2',
+  '{\"max_failures\": 2, \"failure_window\": \"1 minute\", \"lock_duration\": \"6 seconds\", \"min_age\": \"0\"}')" >/dev/null
+psql_admin "CREATE ROLE regress_k1 LOGIN PASSWORD '$GOOD'"
+psql_admin "CREATE ROLE regress_k2 LOGIN PASSWORD '$GOOD'"
+psql_admin "CREATE ROLE regress_k3 LOGIN PASSWORD '$GOOD'"
+t0=$(psql_admin "SELECT clock_timestamp()")
+psql_admin "SELECT pass_policy.assign_profile('regress_k1', 'p_k1'), pass_policy.assign_profile('regress_k2', 'p_k2'),
+                   pass_policy.assign_profile('regress_k3', 'p_k2')" >/dev/null
+wait_reload "$t0" || fail "K1 : pas de rechargement après assign_profile"
+# K2 : premier verrou de regress_k2, journalisé et copié dans role_state
+for i in 1 2; do psql_as regress_k2 "$BAD" >/dev/null || true; done
+if wait_for 30 "SELECT coalesce((SELECT locked_until IS NOT NULL FROM pass_policy.role_state WHERE role_name = 'regress_k2'), false)"; then
+	ok "K2 : premier verrou automatique copié dans role_state"
+else
+	fail "K2 : premier verrou automatique absent de role_state"
+fi
+t0=$(psql_admin "SELECT clock_timestamp()")
+psql_admin "ALTER SYSTEM SET pg_pass_policy.worker_interval = 600"
+psql_admin "SELECT pg_reload_conf()" >/dev/null
+wait_for 30 "SELECT coalesce(max(last_run) > '$t0'::timestamptz, false) FROM pass_policy.worker_status()" || fail "K1 : pas de tour du worker après le passage à 600 s"
+psql_admin "DELETE FROM pass_policy.role_state WHERE role_name = 'regress_k1'"
+for i in 1 2; do psql_as regress_k1 "$BAD" >/dev/null || true; done
+out=$(psql_as regress_k1 "$GOOD") || true
+check_contains "K1 : verrou automatique posé (le worker dort)" "is locked by pg_pass_policy" "$out"
+psql_admin "SELECT pass_policy.unlock_role('regress_k1')" >/dev/null
+out=$(psql_admin "SELECT count(*) || ':' || bool_and(locked_until IS NULL) FROM pass_policy.role_state WHERE role_name = 'regress_k1'")
+check_eq "K1 : unlock_role() crée la ligne role_state (non verrouillée)" "1:true" "$out"
+out=$(psql_as regress_k1 "$GOOD" "SELECT current_user") || true
+check_eq "K1 : déverrouillé avant le passage du worker" "regress_k1" "$out"
+
+# --- étape f de run_maintenance() et verrou expiré en attente d'audit -------
+# (revue finale 5, K2) role_state porte le premier verrou de regress_k2,
+# expiré ; un second verrou automatique, posé et expiré pendant que le worker
+# dort, attend son audit. L'étape f (shmem_unlock_role(…, expired_only))
+# ne doit pas effacer locked_until de ce second verrou : le worker l'audite
+# (sans lifted_before_audit) puis l'efface.
+sleep 7
+for i in 1 2; do psql_as regress_k2 "$BAD" >/dev/null || true; done
+out=$(psql_as regress_k2 "$GOOD") || true
+check_contains "K2 : second verrou automatique posé (le worker dort)" "is locked by pg_pass_policy" "$out"
+sleep 7
+out=$(psql_admin "SELECT locked_until < now() FROM pass_policy.role_state WHERE role_name = 'regress_k2'")
+check_eq "K2 : role_state porte le premier verrou, expiré" "t" "$out"
+# failed_attempts() ne montre pas un verrou expiré : l'effet de l'étape f se
+# lit dans la ligne role_locked que le worker écrira (lifted_before_audit).
+psql_admin "SELECT pass_policy._shmem('unlock_expired', 'regress_k2')" >/dev/null
+out=$(psql_as regress_k2 "$GOOD" "SELECT current_user") || true
+check_eq "K2 : le verrou expiré ne bloque pas" "regress_k2" "$out"
+n_k2=$(psql_admin "SELECT count(*) FROM pass_policy.audit_log WHERE event_type = 'role_locked' AND role_name = 'regress_k2'")
+check_eq "K2 : un seul role_locked avant le passage du worker" "1" "$n_k2"
+
+# Les deux tours suivants (K1, K2) : run_maintenance() lève le verrou expiré
+# de role_state et réveille le worker au COMMIT.
+t0=$(psql_admin "SELECT clock_timestamp()")
+out=$(psql_admin "SELECT string_agg(action, ',') FROM pass_policy.run_maintenance() WHERE role_name = 'regress_k2'")
+check_contains "K2 : run_maintenance() lève le premier verrou de role_state" "role_unlocked" "$out"
+wait_for 30 "SELECT coalesce(max(last_run) > '$t0'::timestamptz, false) FROM pass_policy.worker_status()" || fail "K1/K2 : pas de tour du worker après run_maintenance()"
+out=$(psql_as regress_k1 "$GOOD" "SELECT current_user") || true
+check_eq "K1 : toujours déverrouillé après le tour du worker" "regress_k1" "$out"
+out=$(psql_admin "SELECT count(*) || ':' || bool_and(locked_until IS NULL) FROM pass_policy.role_state WHERE role_name = 'regress_k1'")
+check_eq "K1 : role_state reste non verrouillé après le tour du worker" "1:true" "$out"
+out=$(psql_admin "SELECT count(*) FROM pass_policy.failed_attempts() WHERE role_name = 'regress_k1' AND locked_until IS NOT NULL")
+check_eq "K1 : aucun verrou réinjecté en mémoire partagée" "0" "$out"
+out=$(psql_admin "SELECT count(*) FROM pass_policy.audit_log WHERE event_type = 'role_locked' AND role_name = 'regress_k1'
+                     AND (details->>'lifted_before_audit')::boolean")
+check_eq "K1 : verrou automatique audité, levé avant l'audit" "1" "$out"
+out=$(psql_admin "SELECT coalesce(details->>'lifted_before_audit', 'absent') FROM pass_policy.audit_log
+                   WHERE event_type = 'role_locked' AND role_name = 'regress_k2' ORDER BY id DESC LIMIT 1")
+check_eq "K2 : second verrou audité sans lifted_before_audit" "absent" "$out"
+n=$(psql_admin "SELECT count(*) FROM pass_policy.audit_log WHERE event_type = 'role_locked' AND role_name = 'regress_k2'")
+check_eq "K2 : deux role_locked (un par verrou)" "2" "$n"
+out=$(psql_admin "SELECT locked_until < now() FROM pass_policy.role_state WHERE role_name = 'regress_k2'")
+check_eq "K2 : le second verrou (expiré) est copié dans role_state" "t" "$out"
+t0=$(psql_admin "SELECT clock_timestamp()")
+psql_admin "SELECT count(*) FROM pass_policy.run_maintenance()" >/dev/null
+out=$(psql_admin "SELECT locked_until IS NULL FROM pass_policy.role_state WHERE role_name = 'regress_k2'")
+check_eq "K2 : role_state cohérent (verrou expiré levé)" "t" "$out"
+wait_for 30 "SELECT coalesce(max(last_run) > '$t0'::timestamptz, false) FROM pass_policy.worker_status()" || true
+
+# --- enabled = off : le worker ne modifie rien ------------------------------
+# (revue finale 5, K3) un échec de regress_k3 attend son audit ; pendant que
+# pg_pass_policy.enabled = off, ni le tour du SIGHUP ni un shmem_reload()
+# n'écrivent l'audit (worker suspendu) ; il l'est au retour à on.
+psql_as regress_k3 "$BAD" >/dev/null || true
+t0=$(psql_admin "SELECT clock_timestamp()")
+psql_admin "ALTER SYSTEM SET pg_pass_policy.enabled = off"
+psql_admin "SELECT pg_reload_conf()" >/dev/null
+sleep 2
+psql_admin "SELECT pass_policy.shmem_reload()" >/dev/null
+sleep 3
+out=$(psql_admin "SELECT count(*) FROM pass_policy.audit_log WHERE role_name = 'regress_k3' AND event_type = 'auth_failed'")
+check_eq "K3 : enabled = off : aucun audit écrit par le worker" "0" "$out"
+out=$(psql_admin "SELECT coalesce(max(last_run) > '$t0'::timestamptz OR max(last_reload) > '$t0'::timestamptz, false) FROM pass_policy.worker_status()")
+check_eq "K3 : enabled = off : ni tour ni rechargement" "f" "$out"
+n=$(grep -c 'worker suspended: pg_pass_policy.enabled is off' "$PPP_TMP/server.log" || true)
+check_eq "K3 : LOG « worker suspended » écrit une fois" "1" "$n"
+psql_admin "ALTER SYSTEM RESET pg_pass_policy.enabled"
+psql_admin "SELECT pg_reload_conf()" >/dev/null
+if wait_for 30 "SELECT count(*) = 1 FROM pass_policy.audit_log WHERE role_name = 'regress_k3' AND event_type = 'auth_failed'"; then
+	ok "K3 : retour à on : l'échec en attente est journalisé"
+else
+	fail "K3 : l'échec en attente n'a pas été journalisé après le retour à on"
+fi
+n=$(grep -c 'worker resumed: pg_pass_policy.enabled is on' "$PPP_TMP/server.log" || true)
+check_eq "K3 : LOG « worker resumed »" "1" "$n"
+psql_admin "ALTER SYSTEM RESET pg_pass_policy.worker_interval"
+psql_admin "SELECT pg_reload_conf()" >/dev/null
+
 # --- aucun WARNING du worker pendant le test ---------------------------------
 n=$(grep -c 'pg_pass_policy: worker .* failed' "$PPP_TMP/server.log" || true)
 check_eq "aucun échec de cycle du worker dans le log" "0" "$n"

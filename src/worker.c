@@ -21,6 +21,13 @@
  *		   re-injected from role_state (locks mirrored there but no longer
  *		   in it are lifted), lockout parameters reloaded from the profiles.
  *
+ * With pg_pass_policy.enabled = off, the cycle is suspended altogether
+ * (ppp_worker_suspended): no maintenance, no audit row, no role_state
+ * write, no shared memory clean-up nor reload.  The failures and locks
+ * pending in shared memory stay pending, and a reload request is kept, until
+ * the extension is enabled again; the first cycle after that does all of
+ * it, with a forced reload.
+ *
  * On a hot standby (RecoveryInProgress()), a read-only cycle runs instead
  * (ppp_worker_cycle_standby): steps 1 and 2 write and are skipped (the
  * failures and locks counted locally stay pending and are audited by the
@@ -949,7 +956,7 @@ ppp_worker_cycle(bool run_full)
 {
 	pgstat_report_activity(STATE_RUNNING, "pg_pass_policy maintenance");
 
-	if (run_full && ppp_enabled)
+	if (run_full)
 		(void) ppp_run_in_xact("maintenance", ppp_step_maintenance);
 
 	CHECK_FOR_INTERRUPTS();
@@ -1018,6 +1025,42 @@ ppp_worker_cycle_standby(void)
 }
 
 /*
+ * pg_pass_policy.enabled = off: the worker modifies nothing (the GUC
+ * description promises it), neither the tables (run_maintenance(), pending
+ * audit rows, role_state) nor the shared memory (clean-up, reload).  A
+ * reload request is turned into ppp_reload_pending so that it is not lost;
+ * the first cycle once enabled again forces a reload anyway, since profiles
+ * or role_state may have changed meanwhile (restore).  worker_last_run is
+ * not updated: worker_status() shows when the worker last did its job.
+ * Logs the transitions once.
+ */
+static bool
+ppp_worker_suspended(void)
+{
+	static bool suspended = false;
+
+	if (!ppp_enabled)
+	{
+		if (pg_atomic_exchange_u32(&ppp_shared->reload_requested, 0) != 0)
+			ppp_reload_pending = true;
+		if (!suspended)
+			ereport(LOG,
+					(errmsg(PPP_LOG_PREFIX "worker suspended: pg_pass_policy.enabled is off"),
+					 errdetail("Pending audit rows and locks stay in shared memory until it is turned on again.")));
+		suspended = true;
+		return true;
+	}
+	if (suspended)
+	{
+		ereport(LOG,
+				(errmsg(PPP_LOG_PREFIX "worker resumed: pg_pass_policy.enabled is on")));
+		suspended = false;
+		ppp_reload_pending = true;
+	}
+	return false;
+}
+
+/*
  * Worker entry point.
  */
 PGDLLEXPORT void
@@ -1074,7 +1117,7 @@ ppp_worker_main(Datum main_arg)
 		if (pg_atomic_read_u32(&ppp_shared->reload_requested) != 0)
 			run_now = true;
 
-		if (run_now)
+		if (run_now && !ppp_worker_suspended())
 		{
 			MemoryContext oldcxt = MemoryContextSwitchTo(ppp_worker_cxt);
 

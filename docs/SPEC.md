@@ -162,7 +162,7 @@ dans `format('%I')` / `quote_ident()` : aucune concaténation brute.
 | `rotate_password(role name, length int DEFAULT 24)` | text | génère, `ALTER ROLE … PASSWORD`, `VALID UNTIL`, audit `password_rotated`, NOTIFY ; **retourne le mot de passe une seule fois** ; `SECURITY DEFINER` |
 | `expire_password(role name)` | void | `must_change = true`, `VALID UNTIL now()`, audit ; rafraîchit `role_state.role_name` (nom courant) |
 | `lock_role(role name, duration interval DEFAULT NULL, reason text DEFAULT NULL)` | timestamptz | NULL = manuel ; met à jour `role_state` (dont `role_name` = nom courant) + `shmem_lock_role` ; renvoie le `locked_until` posé (`infinity` pour un verrou manuel) |
-| `unlock_role(role name)` | void | `role_state` (dont `role_name` = nom courant) + `shmem_unlock_role` + `shmem_reset_failures` |
+| `unlock_role(role name)` | void | `_ensure_state()` (ligne `role_state` créée si absente, `role_name` = nom courant) puis `role_state` + `shmem_unlock_role` + `shmem_reset_failures` |
 | `record_password_change(role text, verifier text)` | void | appelée **par le hook C** via SPI après acceptation ; insère l'historique, tronque à `history_count`, met à jour `role_state`, audit `password_changed` |
 | `rebind_restored_roles()` | TABLE(action text, role_name text, details jsonb) | superutilisateur seulement : après une restauration dans un autre cluster, rattache par nom les lignes de `role_state`, `role_profile` et `password_history` dont le couple (`role_oid`, `role_name`) ne correspond à aucun rôle (nom inexistant → purge) ; à appeler avant le premier `run_maintenance()` (README) |
 | `run_maintenance()` | TABLE(action text, role_name text, details jsonb) | ce que fait le worker (appelable par pg_cron) : sync VALID UNTIL, alertes, expirations, déverrouillages auto, purge rôles disparus, réconciliation `pg_authid.rolpassword` vs historique, `shmem_reload()` ; une passe à la fois (`pg_advisory_xact_lock`) |
@@ -172,7 +172,7 @@ dans `format('%I')` / `quote_ident()` : aucune concaténation brute.
 | `load_dictionary(words text[])` | int | |
 | `audit(event_type text, role_name text, details jsonb DEFAULT '{}')` | void | insère + `pg_notify(current_setting('pg_pass_policy.notify_channel'), json)` ; utilisée par toutes les autres ; `EXECUTE` à `pass_policy_admin` seulement |
 | `failed_attempts()` | TABLE(role_name text, failed_count int, first_failure_at timestamptz, last_failure_at timestamptz, locked_until timestamptz) | **C** — lit la shmem |
-| `shmem_reload()` | void | **C** — demande, à la validation de la transaction appelante, au worker de recharger les paramètres de verrouillage dans la shmem (un ROLLBACK annule la demande) |
+| `shmem_reload()` | void | **C** — superutilisateur seulement (comme les autres `shmem_*`) ; demande, à la validation de la transaction appelante, au worker de recharger les paramètres de verrouillage dans la shmem (un ROLLBACK annule la demande) |
 | `shmem_lock_role(role text, until timestamptz)` | void | **C** — `until` NULL = manuel (DT_NOEND) ; écriture shmem différée au COMMIT (annulée par ROLLBACK / ROLLBACK TO SAVEPOINT) |
 | `shmem_unlock_role(role text, expired_only boolean DEFAULT false)` | void | **C** — différée au COMMIT ; ne lève pas un verrou automatique posé après la demande ; `expired_only` : ne lève qu'un verrou expiré (étape f de `run_maintenance()`) |
 | `shmem_reset_failures(role text)` | void | **C** — différée au COMMIT |
@@ -239,7 +239,7 @@ Message JSON de `NOTIFY` : `{"event":"…","role":"…","at":"…","details":{�
 
 | nom | type | défaut | contexte | rôle |
 |---|---|---|---|---|
-| enabled | bool | on | SIGHUP | désactive hooks (le worker tourne mais ne modifie rien) |
+| enabled | bool | on | SIGHUP | désactive hooks ; le worker est suspendu et ne modifie rien : ni `run_maintenance()`, ni audit en attente, ni `role_state`, ni nettoyage ou rechargement de la shmem (les échecs et verrous en attente y restent jusqu'au retour à `on`, voir §6.4) |
 | database | string | postgres | postmaster | base où est installée l'extension / où se connecte le worker |
 | worker_interval | int (s) | 60 | SIGHUP | 0 = worker désactivé (appel manuel `run_maintenance`) |
 | max_tracked_roles | int | 1024 | postmaster | taille du hash shmem |
@@ -450,7 +450,14 @@ en file pendant la transaction (annulées par `ROLLBACK [TO SAVEPOINT]`) :
   `run_maintenance()`, `_shmem('unlock_expired')`), seul un verrou expiré
   est levé : l'étape f lève les verrous expirés **dans `role_state`**, alors
   que la shmem peut porter un nouveau verrou automatique, posé avant ou
-  pendant la passe, que `role_state` ne connaît pas encore ;
+  pendant la passe, que `role_state` ne connaît pas encore. Un verrou expiré
+  n'y est pas effacé directement mais confié à `ppp_expire_lock()` : s'il
+  attend encore son audit (`lock_pending_audit`, nouveau verrou automatique
+  posé et expiré avant la passe), `locked_until` est conservé pour que le
+  worker écrive sa ligne `role_locked` (sans `lifted_before_audit`) et le
+  copie dans `role_state` avant de l'effacer ; les compteurs de l'épisode
+  sont remis à zéro comme lorsque le hook ou le worker rencontrent le verrou
+  expiré ;
 - si la transaction échoue entre PRE_COMMIT et COMMIT (très rare : erreur
   d'une étape ultérieure de `CommitTransaction()`, par exemple
   `PreCommit_on_commit_actions` ou `PreCommit_Notify`), le verrou reste en
@@ -528,6 +535,7 @@ verrous manuels/actifs depuis `role_state` lors de son premier tour.
 - chaque tour : `StartTransactionCommand` → si l'extension n'est pas installée (`get_extension_oid("pg_pass_policy", true) == InvalidOid`) → attendre ; sinon `SPI_execute("SELECT * FROM pass_policy.run_maintenance()")`, puis synchronisation shmem (§6.3) ; `CommitTransactionCommand`. `run_maintenance()` prend `pg_advisory_xact_lock(hashtext('pg_pass_policy.run_maintenance'))` en tête : une passe du worker, de pg_cron ou manuelle attend la fin d'une passe concurrente au lieu d'agir sur les mêmes lignes (audits et NOTIFY en double) ;
 - l'étape d'audit regroupe les noms inexistants (`role_missing`) en une ligne `auth_failed` par tour (§6.3) : un flot de noms inventés ne produit plus une ligne et un NOTIFY par nom ;
 - sur un hot standby (`RecoveryInProgress()`), tour en **lecture seule** (`ppp_worker_cycle_standby`) : ni `run_maintenance()` ni l'étape d'audit en attente (elles écrivent) ; les échecs et verrous comptés localement par le hook **ne sont pas acquittés** : `pending_failures` et `lock_pending_audit` restent posés (les entrées de vrais rôles concernées ne sont alors pas évincables par le hook, c'est voulu, sauf celles dont le verrou a expiré : sur un standby leur audit est aussitôt « périmé » et elles redeviennent évincables, voir « Perte bornée » §6.3 ; un verrou local expiré n'est pas effacé par le worker mais ne bloque plus, voir « verrou expiré » §6.3) et le premier tour après promotion les écrit dans `audit_log` et `role_state`. Puis nettoyage + rechargement **forcé à chaque tour** (`shmem_reload()` du primaire ne peut pas atteindre le worker du standby) : SELECT uniquement, dans une transaction que PostgreSQL force en lecture seule pendant la récupération. Intervalle : `worker_interval`, 60 s s'il vaut 0 (le standby doit sonder, rien ne le réveille). Un verrou réinjecté depuis `role_state` (`lock_from_state`) qui n'y figure plus est levé (unlock ou expiration sur le primaire) ; les verrous posés localement (hook, ou `shmem_lock_role()` sur le standby) ne sont pas levés par le rechargement : ils expirent selon `lock_duration`, ou un superutilisateur appelle `pass_policy.shmem_unlock_role()` sur le standby (fonctionne en lecture seule). Après promotion, le tour suivant est un tour normal avec audit des échecs et verrous en attente et rechargement complet ;
+- `pg_pass_policy.enabled = off` (`ppp_worker_suspended()`) : le tour entier est sauté, sur le primaire comme sur un standby (ni `run_maintenance()`, ni écriture d'audit ou de `role_state`, ni nettoyage ni rechargement de la shmem ; `worker_status().last_run` et `last_reload` n'avancent plus). Les échecs et verrous en attente restent en shmem (entrées `PENDING_AUDIT` / `KEEP`, éviction selon §6.3) ; une demande `shmem_reload()` est mémorisée. Le premier tour après le retour à `on` fait tout, avec un rechargement forcé (profils ou `role_state` ont pu changer, restauration par exemple). Un LOG à chaque transition (« worker suspended » / « worker resumed ») ;
 - sans `hot_standby`, aucune connexion n'est acceptée pendant la récupération : le worker démarre à la fin de celle-ci ;
 - `pg_pass_policy.worker_interval = 0` → le worker dort indéfiniment (réveil sur SIGHUP).
 
@@ -697,5 +705,48 @@ basic ou en-tête reverse-proxy (`REMOTE_USER`), rôle PG dédié membre de
 - (revue finale 4) H5 — `failed_attempts()` et `ppp_sync_pending()` allouaient `max_tracked_roles` lignes à chaque appel : `ppp_alloc_hash_copy()` (`lockout.c`) lit `hash_get_num_entries()` sous verrou partagé, alloue ce nombre + `PPP_HASH_COPY_MARGIN` (16) lignes, reprend le verrou et recommence si le hash a dépassé cette taille entre-temps ; la copie reste bornée par la taille allouée.
 - (revue finale 4) H6 — la copie de `ppp_sync_pending()` ne fait que lire (aucune écriture dans la boucle, l'acquittement est fait à part par `ppp_ack_pending()` après le COMMIT) : `LW_SHARED` au lieu de `LW_EXCLUSIVE`.
 - (revue finale 4) H7 — la demande de `shmem_reload()` (`ppp_reload_in_xact`, booléen) survivait à un `ROLLBACK TO SAVEPOINT`, contrairement à son commentaire et aux autres demandes différées. Remplacée par `ppp_reload_subxid` : sous-transaction propriétaire, transmise au parent par `SUBXACT_EVENT_COMMIT_SUB`, effacée par `SUBXACT_EVENT_ABORT_SUB` (traité avant le test « aucune écriture en file » du callback). Le propriétaire est toujours la sous-transaction courante ou un de ses ancêtres : un second appel garde celui déjà enregistré. Test : `lockout.sh` (worker à 600 s : `shmem_reload()` puis `ROLLBACK TO SAVEPOINT` → `last_reload` inchangé après 3 s ; avec `RELEASE SAVEPOINT` → worker réveillé au COMMIT).
-- (revue finale 4) H8 — `rotate_password()` et `switch_rotation_pair()` dupliquaient génération, `_set_password()`, `_ensure_recorded()`, `_refresh_role_state()` et la règle `VALID UNTIL` : fonction interne `_rotate_role(p_role name, p_oid oid, p_length int) RETURNS text` (plpgsql, `SET search_path`, ni `SECURITY DEFINER` ni GRANT : appelée seulement depuis ces deux fonctions `SECURITY DEFINER`, après `_require_admin()` et `_require_target_allowed()`). Dans `switch_rotation_pair()`, la mise à jour de `rotation_pair` précède désormais la génération (une ERROR annule tout de même la transaction).
+- (revue finale 4) H8 — `rotate_password()` et `switch_rotation_pair()` dupliquaient génération, `_set_password()`, `_ensure_recorded()`, `_refresh_role_state()` et la règle `VALID UNTIL` : fonction interne `_rotate_role(p_role name, p_oid oid, p_length int) RETURNS text` (*modifié* en (revue finale 5) K5 : `OUT password text, OUT profile text`) (plpgsql, `SET search_path`, ni `SECURITY DEFINER` ni GRANT : appelée seulement depuis ces deux fonctions `SECURITY DEFINER`, après `_require_admin()` et `_require_target_allowed()`). Dans `switch_rotation_pair()`, la mise à jour de `rotation_pair` précède désormais la génération (une ERROR annule tout de même la transaction).
 - (revue finale 4) H9 — `ppp_audit_rejection()` ouvrait une sous-transaction pour un `audit()` (INSERT + NOTIFY) toujours annulé par l'ERROR qui suit. Supprimée : `ppp_reject()` écrit directement une ligne `ereport(LOG)` `pg_pass_policy: password_rejected role=<rôle> {"code": "PPP-0xx"}` (format de la ligne LOG de `_audit()`, `errhidestmt`/`errhidecontext`, si `log_events`), plus de SPI ni de sous-transaction ; `PPP-003` passe par le même chemin. `audit()` n'accepte plus l'appel « depuis le hook » (`_in_password_hook()`), devenu inutile : administrateurs seulement. §4, §6.2 et README mis à jour. Test : `notify.sh` (trois refus `PPP-010`, ligne LOG exacte).
+- (revue finale 5) K1 — `unlock_role()` ne passait pas par `_ensure_state()` : pour un rôle sans ligne `role_state` (verrou automatique pas encore écrit par le worker), son UPDATE ne touchait aucune ligne et ne prenait aucun verrou de ligne ; l'upsert de `ppp_sync_pending()` pouvait alors valider le verrou périmé après le déverrouillage (la vérification de `lock_seq` avant le COMMIT du worker passait si le déverrouillage validait juste après), et le rechargement suivant reverrouillait le rôle. `unlock_role()` appelle désormais `_ensure_state()` comme `lock_role()` et `expire_password()` (qui le faisait déjà) : la ligne, insérée ou verrouillée, ordonne l'upsert du worker, qui attend la fin de la transaction et voit le `lock_seq` estampillé au COMMIT (avant la libération du verrou de ligne) ; ou bien `unlock_role()` attend l'upsert du worker et écrase son verrou. Test : `lockout.sh` (worker à 600 s, ligne `role_state` supprimée, verrou automatique, `unlock_role()` crée la ligne non verrouillée ; après le tour du worker : connexion acceptée, `role_state` non verrouillé, aucun verrou réinjecté, `role_locked` avec `lifted_before_audit`). La course elle-même n'est pas reproductible à coup sûr.
+- (revue finale 5) K2 — l'étape f de `run_maintenance()` (`shmem_unlock_role(…, expired_only)`) effaçait en shmem `locked_until` d'un verrou expiré, y compris d'un verrou automatique plus récent que celui de `role_state`, expiré mais encore en attente d'audit : l'invariant de `ppp_expire_lock()` était cassé et la ligne `role_locked` portait à tort `lifted_before_audit`. En mode `expired_only`, le verrou expiré est confié à `ppp_expire_lock(entry, now, true)` (conservé tant que `lock_pending_audit`, compteurs de l'épisode remis à zéro, entrée estampillée si `locked_until` est effacé) ; `ppp_unlock_allowed()` ne laisse passer qu'un verrou expiré dans ce mode. Test : `lockout.sh` (premier verrou copié dans `role_state` puis expiré, second verrou posé et expiré worker endormi, `_shmem('unlock_expired')` puis `run_maintenance()` : le second `role_locked` n'a pas `lifted_before_audit` et le verrou expiré est copié dans `role_state`, levé par la passe suivante). Vérifié en retirant la correction : ces deux contrôles échouent.
+- (revue finale 5) K3 — avec `pg_pass_policy.enabled = off`, seul `run_maintenance()` était sauté : `ppp_sync_pending()` écrivait encore audit et `role_state`, et le rechargement réinjectait, alors que la description du GUC et le README promettaient « le worker ne modifie rien ». Décision : `enabled = off` suspend tout le tour du worker (§5, §6.4) ; les entrées en attente restent en shmem jusqu'à la réactivation, dont le premier tour force un rechargement. Procédure de restauration du README mise à jour (`worker_interval = 0` n'est plus nécessaire pour le worker, seulement pour suspendre un `run_maintenance()` planifié ailleurs). Test : `lockout.sh` (échec en attente, `enabled = off` : ni audit, ni tour, ni rechargement malgré SIGHUP et `shmem_reload()`, un seul LOG « worker suspended » ; retour à `on` : échec journalisé, LOG « worker resumed »).
+- (revue finale 5) K4 — `shmem_reload()` ne vérifiait pas `superuser()`, contrairement aux autres `shmem_*` : `ppp_require_superuser("shmem_reload")` ajouté (défense en profondeur : `EXECUTE` n'est accordé à personne, tous les appelants SQL sont `SECURITY DEFINER`).
+- (revue finale 5) K5 — `rotate_password()` relisait `effective_profile()` après `_rotate_role()` pour le seul nom du profil de l'audit : un `assign_profile()` concurrent pouvait faire journaliser un autre profil que celui utilisé pour générer le mot de passe. `_rotate_role()` renvoie `OUT password text, OUT profile text` : une seule lecture, audit cohérent ; `switch_rotation_pair()` ne lit que `password`.
+
+## 12. Constats de revue acceptés
+
+Points relevés en revue et volontairement non corrigés :
+
+- **Oracle d'énumération sous saturation du hash** : en remplissant le hash
+  de noms inexistants, un attaquant fait évincer le pseudo-verrou d'un nom
+  inexistant alors que celui d'un vrai rôle reste (§6.3, « Noms
+  inexistants ») ; rendre les pseudo-verrous non évincables rouvrirait
+  l'occupation du hash par des noms fantômes, et l'attaque exige de l'ordre
+  de `max_tracked_roles` tentatives, visibles dans l'audit agrégé.
+- **`verifier_pending` avec `enforce_database = off`** : un changement fait
+  hors du hook juste après un changement passé par le hook est pris pour
+  l'écart de sel attendu (§11, H4) ; sans le mot de passe en clair, deux
+  vérificateurs SCRAM de sels différents ne se comparent pas, et les défauts
+  (`enforce_database = on`, `enabled = on`) limitent le cas aux rôles
+  exemptés.
+- **Perte bornée d'audit sur standby / éviction** : une entrée dont le
+  verrou a expiré et dont l'audit est en attente peut être évincée (tout de
+  suite sur un standby, après 24 h sur un primaire) avec un LOG (§6.3,
+  « Perte bornée ») ; la garder interdirait le comptage des vrais rôles une
+  fois le hash rempli par un worker qui ne peut pas écrire.
+- **Deux appels Vault au préflight (CLI, pour mémoire)** : le préflight de
+  `pgpp` interroge Vault deux fois ; le coût est négligeable pour une
+  commande d'administration ponctuelle, et le point relève de `cli/`, hors du
+  périmètre de l'extension.
+- **Copies non effacées dans les tampons des bibliothèques**
+  (sqlx/reqwest/PgRow côté CLI et web) : les mots de passe générés
+  transitent par des tampons internes que nous ne pouvons pas effacer ; les
+  effacer exigerait de réécrire ou de forker ces bibliothèques, pour un gain
+  faible face à un attaquant qui lit déjà la mémoire du processus.
+- **`_audit()` lève une erreur sans bibliothèque préchargée** : `_audit()`
+  appelle la fonction C `_worker_pid()`, dont le chargement échoue quand la
+  bibliothèque n'est pas dans `shared_preload_libraries` (`_PG_init()` le
+  refuse) ; toute action auditée échoue alors avec sa transaction, ce qui est
+  cohérent avec le choix fail-closed de §11 E6 : sans préchargement, ni le
+  hook ni le verrouillage ne fonctionnent, et journaliser comme si de rien
+  n'était masquerait la panne.

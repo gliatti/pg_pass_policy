@@ -1050,7 +1050,8 @@ ppp_stamp_entry(pppRoleEntry *entry)
  *   have expired in role_state): never an active lock.  The authentication
  *   hook may have set a new automatic lock after the old one expired,
  *   before or during the maintenance transaction: role_state does not
- *   know it yet (the worker copies it at its next cycle);
+ *   know it yet (the worker copies it at its next cycle).  An expired lock
+ *   is not lifted here but handed to ppp_expire_lock() by the caller;
  * - otherwise (unlock_role()): a lock mirrored in role_state
  *   (lock_from_state) is lifted, the role_state row lock orders the unlock
  *   and any lock_role() of the same role; an automatic lock of the hook is
@@ -1062,10 +1063,10 @@ static bool
 ppp_unlock_allowed(const pppPendingOp *op, const pppRoleEntry *entry,
 				   TimestampTz now)
 {
+	if (op->expired_only)
+		return !ppp_is_locked(entry, now);
 	if (!ppp_is_locked(entry, now))
 		return true;
-	if (op->expired_only)
-		return false;
 	return entry->lock_from_state || entry->lock_set_at <= op->queued_at;
 }
 
@@ -1124,6 +1125,24 @@ ppp_finish_pending_ops(bool commit)
 				{
 					op->kept_newer = true;
 					kept = true;
+					break;
+				}
+
+				/*
+				 * expired_only: the lock has expired; it may be a newer
+				 * automatic lock than the one role_state held, expired too
+				 * but still waiting for its role_locked row
+				 * (lock_pending_audit).  ppp_expire_lock() keeps
+				 * locked_until in that case, for the worker to audit it
+				 * (lifted_before_audit would be wrong) and clear it once
+				 * the row is written; it also resets the counters of the
+				 * episode that led to the lock, as when the hook or the
+				 * worker meets the expired lock first.
+				 */
+				if (op->expired_only)
+				{
+					if (ppp_expire_lock(entry, now, true))
+						ppp_stamp_entry(entry);
 					break;
 				}
 
@@ -1483,6 +1502,7 @@ ppp_failed_attempts(PG_FUNCTION_ARGS)
 Datum
 ppp_shmem_reload(PG_FUNCTION_ARGS)
 {
+	ppp_require_superuser("shmem_reload");
 	ppp_check_shmem();
 	ppp_register_xact_callbacks();
 	if (ppp_reload_subxid == InvalidSubTransactionId)

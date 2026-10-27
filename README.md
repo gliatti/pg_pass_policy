@@ -172,7 +172,9 @@ Un verrou automatique levé par `unlock_role()` avant le passage du worker est
 tout de même journalisé (`role_locked`, `details.lifted_before_audit = true`),
 sans être recopié dans `role_state`. À l'inverse, un nouveau verrou automatique
 posé juste avant ou pendant un `unlock_role()` ou un `run_maintenance()` (qui
-lève les verrous expirés) n'est pas levé par eux. Les échecs sur des noms de
+lève les verrous expirés) n'est pas levé par eux, et un verrou automatique
+expiré avant le passage du worker est journalisé normalement (sans
+`lifted_before_audit`), même si un `run_maintenance()` passe entre-temps. Les échecs sur des noms de
 rôles inexistants sont journalisés en une seule ligne `auth_failed` par tour
 du worker (`role_name` NULL, `details.unknown_roles` et `details.attempts`).
 Si la bibliothèque a été retirée de
@@ -226,7 +228,7 @@ Tous préfixés `pg_pass_policy.`. Contexte `postmaster` = redémarrage ;
 
 | paramètre | type | défaut | contexte | rôle |
 |---|---|---|---|---|
-| `enabled` | bool | `on` | SIGHUP | `off` : les hooks ne font rien et le worker ne modifie rien |
+| `enabled` | bool | `on` | SIGHUP | `off` : les hooks ne font rien et le worker est suspendu (ni maintenance, ni audit, ni `role_state`, ni rechargement de la mémoire partagée) ; les échecs et verrous déjà comptés restent en attente en mémoire partagée et sont journalisés au retour à `on` |
 | `database` | string | `postgres` | postmaster | base où l'extension est installée et où le worker se connecte |
 | `worker_interval` | int (s) | `60` | SIGHUP | `0` : pas de tour périodique (appeler `run_maintenance()` à la main) |
 | `max_tracked_roles` | int | `1024` | postmaster | taille du hash de verrouillage en mémoire partagée (16 à 1 048 576). Doit dépasser le nombre de rôles LOGIN qui ont un profil ou un verrou : ces entrées ne sont jamais évincées ; si le hash n'en contient plus d'autres, les échecs ne sont plus comptés (LOG « cannot track ») et `lock_role()` échoue (ERROR 53400, transaction annulée). Les entrées des noms de rôles inexistants et les compteurs inactifs sont évincés en premier. Recommandation : une valeur largement supérieure au nombre de rôles, avec une marge (voir « Énumération des rôles ») |
@@ -308,9 +310,11 @@ compte comme « spécial ».
   les OID (dans un cluster vivant, un OID existant sous un autre nom est un
   renommage) : laissé seul, il réétiquetterait les verrous, profils et
   historiques d'un rôle au nom de celui qui a hérité de son OID. Procédure :
-  1. `pg_pass_policy.enabled = off` et `pg_pass_policy.worker_interval = 0`
-     (`ALTER SYSTEM` + `pg_reload_conf()`) : ni contrôle des mots de passe
-     pré-hachés, ni passe de maintenance pendant la restauration ;
+  1. `pg_pass_policy.enabled = off` (`ALTER SYSTEM` + `pg_reload_conf()`) :
+     ni contrôle des mots de passe pré-hachés, ni tour du worker pendant la
+     restauration (le worker est suspendu : ni `run_maintenance()`, ni
+     écriture d'audit ou de `role_state`, ni rechargement) ; suspendre aussi
+     tout `run_maintenance()` planifié par ailleurs (pg_cron) ;
   2. restaurer les rôles (`pg_dumpall --roles-only`) puis la base
      (`pg_restore`) ;
   3. en superutilisateur, `SELECT * FROM pass_policy.rebind_restored_roles();`
@@ -319,7 +323,9 @@ compte comme « spécial ».
      correspond à aucun rôle est rattachée au rôle de ce nom (`rebind`), ou
      supprimée si aucun rôle ne porte ce nom (`purge`) ; une ligne
      `maintenance` est écrite dans l'audit ;
-  4. remettre `enabled` et `worker_interval` à leurs valeurs.
+  4. remettre `enabled` à `on` (et réactiver la planification éventuelle) :
+     le premier tour du worker recharge la mémoire partagée depuis les
+     tables restaurées.
 - **Superutilisateur** : un superutilisateur peut être verrouillé comme n'importe
   quel rôle, et les profils (`default` compris) s'appliquent à lui : un membre
   de `pass_policy_admin` non superutilisateur ne peut pas le viser avec
