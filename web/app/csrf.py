@@ -55,7 +55,8 @@ async def verify_csrf(request: Request) -> None:
     bound_user = request.session.get(SESSION_USER_KEY)
     supplied = request.headers.get(CSRF_HEADER)
     if supplied is None:
-        content_type = request.headers.get("content-type", "")
+        # media types are case-insensitive (RFC 9110 §8.3.1)
+        content_type = request.headers.get("content-type", "").lower()
         if content_type.startswith(("application/x-www-form-urlencoded", "multipart/form-data")):
             form = await request.form()
             value = form.get(CSRF_FIELD)

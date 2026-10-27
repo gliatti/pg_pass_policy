@@ -39,3 +39,40 @@ def test_record_factory_masks_every_logger(caplog):
     assert "Top-Secret-2" not in caplog.text
     assert MASK in caplog.text
     assert "bob" in caplog.text
+
+
+def test_template_with_placeholder_is_masked_after_formatting(caplog):
+    """'password=%s' is masked once formatted: the template is not masked
+    alone (its argument would be left over, TypeError, line lost)."""
+    install_log_masking()
+    caplog.set_level(logging.DEBUG)
+    logger = logging.getLogger("some.third.party")
+    logger.warning("connect user=%s password=%s host=%s", "bob", "Top-Secret-3", "db1")
+    assert "Top-Secret-3" not in caplog.text
+    assert f"connect user=bob password={MASK} host=db1" in caplog.text
+    record = caplog.records[-1]
+    assert record.getMessage() == f"connect user=bob password={MASK} host=db1"
+
+
+def test_placeholder_template_through_a_handler():
+    """The line reaches a real handler's output (no formatting error)."""
+    import io
+
+    install_log_masking()
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.addFilter(PasswordMaskFilter())
+    logger = logging.getLogger("pgpp_web.test.placeholder")
+    logger.addHandler(handler)
+    logger.propagate = False
+    try:
+        logger.error("token=%s for %s (%d tries)", "abcdef", "alice", 3)
+    finally:
+        logger.removeHandler(handler)
+    assert stream.getvalue() == f"token={MASK} for alice (3 tries)\n"
+
+
+def test_args_keep_their_types_when_nothing_is_secret():
+    record = logging.LogRecord("t", logging.INFO, __file__, 1, "%s %d", ("GET", 200), None)
+    assert PasswordMaskFilter().filter(record)
+    assert record.msg == "%s %d" and record.args == ("GET", 200)

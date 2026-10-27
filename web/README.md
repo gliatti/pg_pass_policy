@@ -207,8 +207,10 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
   `allowScriptTags: false`, `selfRequestsOnly: true`).
 - **Journaux** : un filtre de logging (fabrique de `LogRecord` + `Filter` sur
   les handlers) masque toute valeur associée à `password`, `passwd`, `pwd`,
-  `secret`, `token`, dans les messages, les arguments et les attributs `extra`,
-  quel que soit le logger (y compris ceux d'uvicorn). L'application elle-même
+  `secret`, `token`, dans les arguments, le message une fois formaté
+  (`"password=%s"` et son argument) et les attributs `extra`, quel que soit le
+  logger (y compris ceux d'uvicorn). Le gabarit n'est jamais masqué seul : il
+  perdrait son `%s` et la ligne avec lui. L'application elle-même
   ne journalise jamais de mot de passe ; le filtre est un filet de sécurité.
 - **Authentification** : bcrypt pour HTTP basic (comparaison à coût constant,
   même pour un utilisateur inconnu : il est comparé à une empreinte factice du
@@ -219,19 +221,32 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
   haut). En mode proxy, l'en-tête
   n'est accepté que depuis un pair de confiance. Aucune route de documentation
   OpenAPI n'est exposée.
-- **Erreurs** : les messages de l'extension (`pg_pass_policy: …`, `PPP-0xx`)
-  sont affichés tels quels dans les fragments d'action (422) ; toute autre
-  erreur PostgreSQL (vue, pool, droits) donne une page 500 générique, le texte
-  complet (noms de tables, détails de connexion libpq) n'allant qu'au journal
-  du serveur. Une erreur générique survenue pendant un échange HTMX (422 de
+- **Erreurs** : seuls les refus de l'extension sont affichés tels quels dans
+  les fragments d'action (422) : message préfixé `pg_pass_policy:` ou
+  `PPP-0xx`, SQLSTATE qu'elle lève (`42501`, `42704`, `42710`, `55006`,
+  `53400`, `28P01`, `P0001`) et erreurs dues aux valeurs saisies (classes
+  `22`, intervalle illisible par exemple, et `23`, contrainte `CHECK` d'un
+  profil). Toute autre erreur PostgreSQL (vue ou fonction absente, pool,
+  connexion perdue), y compris pendant une action, est journalisée en `ERROR`
+  et donne une page 500 générique : le texte complet (noms de tables, détails
+  de connexion libpq) ne va qu'au journal du serveur. Une erreur générique survenue pendant un échange HTMX (422 de
   validation, 404, 500, 503) est renvoyée avec `HX-Retarget: #alerts` et
   `HX-Reswap: innerHTML` : l'alerte s'affiche dans la zone d'alertes de la page
   et l'élément visé (ligne de rôle, formulaire) reste en place. Un client non
   identifié (404 ou 405 du routeur, levées avant l'authentification, 401, 403)
-  reçoit une page d'erreur minimale, sans navigation ni lien. Seules les
-  erreurs propres au worker (`55000`, bibliothèque non préchargée, et classe
-  `42`, fonction absente ou droit manquant) donnent « worker not running » sur
-  le tableau de bord : une connexion perdue reste une erreur 500.
+  reçoit une page d'erreur minimale, sans navigation ni lien. Seule l'erreur
+  `55000` de `worker_status()` (mémoire partagée absente) donne « worker not
+  running » sur le tableau de bord : une fonction absente, un droit manquant
+  ou une connexion perdue restent une erreur 500.
+- **Bibliothèque non préchargée** : sans `pg_pass_policy` dans
+  `shared_preload_libraries`, les vues (`v_role_status` appelle
+  `failed_attempts()`) et les actions échouent toutes avec le SQLSTATE `55000`.
+  La première requête de la page qui le reçoit interrompt la requête HTTP :
+  l'application affiche alors une page dédiée « pg_pass_policy is not
+  preloaded » (503) avec le message et le `HINT` du serveur, ou, pendant un
+  échange HTMX, une alerte dans la zone d'alertes. Seul ce cas est reconnu
+  (message ou `HINT` citant `shared_preload_libraries`, mémoire partagée non
+  initialisée) : tout autre `55000` donne la page 500 générique.
 - **Noms dans les URL** : un nom de rôle ou de paire peut contenir `/` ; il est
   encodé (`%2F`), le serveur le décode avant le routage et les routes
   `/{role:path}/action` le reconstituent. Les routes des profils gardent un
@@ -241,8 +256,10 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
   noms `new`, `assign` et `unassign` (routes fixes) ainsi que `.` et `..`
   (segments supprimés de l'URL par le navigateur) sont acceptés par
   l'extension mais injoignables par ces routes : l'interface refuse de créer ou
-  de modifier un profil portant l'un d'eux (422, message explicite) ; un tel
-  profil se gère en SQL.
+  de modifier un profil portant l'un d'eux (422, message explicite) et n'en
+  affiche pas le formulaire d'édition (`GET /profiles/assign` répond 404 avec
+  le même message, sans quoi le formulaire posterait vers la route
+  d'assignation) ; un tel profil se gère en SQL.
 - **Droits** : le rôle de service est seulement membre de `pass_policy_admin` ;
   les fonctions `SECURITY DEFINER` qui visent un rôle (rotation, expiration,
   verrouillage, paires, `assign_profile()` et `unassign_profile()`) refusent
@@ -271,8 +288,9 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
   La requête qui suit un 303 ou un `HX-Redirect` voit donc la modification, et
   un échec du `COMMIT` donne une page 500 au lieu d'une redirection trompeuse.
   Chaque action passe par `db.run_action()` : appel de la fonction
-  `pass_policy.*` dans un point de sauvegarde (une erreur est annulée seule et
-  affichée en 422, la connexion reste utilisable pour la réponse), puis
+  `pass_policy.*` dans un point de sauvegarde (un refus de l'extension est
+  annulé seul et affiché en 422, la connexion reste utilisable pour la
+  réponse ; toute autre erreur remonte en 500, voir Erreurs), puis
   `COMMIT` immédiat, avant toute relecture : l'extension n'applique qu'au
   `COMMIT` ses changements en mémoire partagée (verrou, compteur d'échecs).
 - **Affichage unique** : le fragment d'une rotation remplace tout le `<tbody>`
@@ -283,14 +301,15 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
   un mot de passe n'est montré qu'une fois appliqué. Si la relecture qui suit
   (ligne du rôle, liste des paires) échoue, le mot de passe est affiché quand
   même, avec un avertissement invitant à recharger la page : il n'existe nulle
-  part ailleurs.
+  part ailleurs. Les deux routes partagent `db.reread_after_commit()`, qui
+  journalise l'échec et renvoie le résultat ou l'avertissement.
 
 ## Tests
 
 ```sh
 ruff check .
 ruff format --check .
-pytest                     # tests unitaires seuls : 159 (23 tests d'intégration ignorés)
+pytest                     # tests unitaires seuls : 193 (27 tests d'intégration ignorés)
 ```
 
 Les tests d'intégration ont besoin d'une base réelle avec l'extension
@@ -306,7 +325,7 @@ sans ce marqueur est refusé, à `start` comme à `stop` :
 
 ```sh
 eval "$(scripts/test-instance.sh start /tmp/pgpp-web-test 54332)"
-pytest                     # 182 tests : unitaires + intégration
+pytest                     # 220 tests : unitaires + intégration
 scripts/test-instance.sh stop /tmp/pgpp-web-test
 ```
 
@@ -318,10 +337,12 @@ figure dans la réponse et nulle part ailleurs : ni dans les journaux capturés,
 ni dans l'audit, et il permet réellement de se connecter), lock / unlock /
 expire, les profils (création visible dès la requête suivante, modification,
 assignation, suppression, noms réservés, refus d'assignation sur un rôle
-privilégié, formulaire d'assignation limité aux rôles que l'extension
+privilégié, profil `assign` créé en SQL, formulaire d'assignation limité aux rôles que l'extension
 accepte, rôle renommé),
 l'audit (filtres, pagination), les
-paires de rotation, la maintenance et le refus CSRF.
+paires de rotation, la maintenance, le refus CSRF, la page « extension non
+préchargée » (erreur `55000` levée par le serveur avec son `HINT`) et la
+page 500 journalisée d'une erreur inattendue pendant une action.
 
 ## Arborescence
 

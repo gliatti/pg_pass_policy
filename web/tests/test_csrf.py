@@ -195,3 +195,19 @@ def test_session_cookie_uses_host_prefix_when_secure():
     assert re.search(r"secure", set_cookie, re.I)
     assert re.search(r"path=/", set_cookie, re.I)
     assert not re.search(r"domain=", set_cookie, re.I)
+
+
+def test_form_token_with_upper_case_content_type(unit_app):
+    """Media types are case-insensitive: the form field is read whatever the case.
+
+    (Without parameters only: python-multipart, used by Starlette to parse
+    the body, does not lower-case a media type followed by "; charset=...",
+    such a body is not read as a form at all and the request is refused.)"""
+    client = _client(unit_app)
+    token = client.get("/_csrf").json()["token"]
+    for content_type in ("Application/X-WWW-Form-Urlencoded", "APPLICATION/X-WWW-FORM-URLENCODED"):
+        response = client.post(
+            "/_echo", content=f"a=1&csrf_token={token}", headers={"Content-Type": content_type}
+        )
+        assert response.status_code == 200, (content_type, response.text)
+        assert response.json()["a"] == "1"

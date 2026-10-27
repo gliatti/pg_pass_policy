@@ -37,10 +37,10 @@ def _content(
     else:
         # the switch is committed: whatever happens to the re-read, this
         # response is the only place the new password will ever be shown
-        read, failed = db.reread_after_commit(
-            conn, db.list_pairs, log, f"pair {switched['pair']} switched"
+        read, warning = db.reread_after_commit(
+            conn, db.list_pairs, log, f"pair {switched['pair']} switched", REREAD_WARNING
         )
-        pairs, warning = (read or []), (REREAD_WARNING if failed else None)
+        pairs = read or []
     context = {
         "pairs": pairs,
         "warning": warning,

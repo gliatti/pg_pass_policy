@@ -284,15 +284,8 @@ class _WorkerConn(_Conn):
         raise self.exc
 
 
-@pytest.mark.parametrize(
-    "exc",
-    [
-        psycopg.errors.ObjectNotInPrerequisiteState("must be loaded via shared_preload_libraries"),
-        psycopg.errors.UndefinedFunction("function pass_policy.worker_status() does not exist"),
-        psycopg.errors.InsufficientPrivilege("permission denied for function worker_status"),
-    ],
-)
-def test_worker_status_unavailable_returns_none(exc):
+def test_worker_status_unavailable_returns_none():
+    exc = psycopg.errors.ObjectNotInPrerequisiteState("shared memory is not initialized")
     conn = _WorkerConn(exc)
     assert db.worker_status(conn) is None  # type: ignore[arg-type]
     assert conn.events == ["savepoint", "rollback"]
@@ -301,6 +294,9 @@ def test_worker_status_unavailable_returns_none(exc):
 @pytest.mark.parametrize(
     "exc",
     [
+        # 55000 only: a missing function or privilege is a deployment error
+        psycopg.errors.UndefinedFunction("function pass_policy.worker_status() does not exist"),
+        psycopg.errors.InsufficientPrivilege("permission denied for function worker_status"),
         psycopg.OperationalError("server closed the connection unexpectedly"),
         psycopg.errors.AdminShutdown("terminating connection due to administrator command"),
         psycopg.InterfaceError("the connection is closed"),

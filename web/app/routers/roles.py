@@ -80,22 +80,22 @@ def _row_response(
     notice: str | None = None,
     password: str | None = None,
 ) -> Any:
-    reread_failed = False
+    warning = None
     if password is None:
         row = db.get_role(conn, role)
     else:
         # the rotation is committed: whatever happens to the re-read, this
         # response is the only place the new password will ever be shown
-        row, reread_failed = db.reread_after_commit(
-            conn, lambda c: db.get_role(c, role), log, f"role {role} rotated"
+        row, warning = db.reread_after_commit(
+            conn, lambda c: db.get_role(c, role), log, f"role {role} rotated", REREAD_WARNING
         )
     context = {
         "r": row,
         "role_name": role,
         "error": error,
         "notice": notice,
-        "warning": REREAD_WARNING if reread_failed else None,
-        "reread_failed": reread_failed,
+        "warning": warning,
+        "reread_failed": warning is not None,
         "password": password,
         "uid": secrets.token_hex(4),
     }

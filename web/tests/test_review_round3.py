@@ -381,12 +381,12 @@ def test_reread_after_commit(caplog):
     caplog.set_level(logging.ERROR)
     conn = SimpleNamespace(transaction=lambda: _Tx(None))
     log = logging.getLogger("pgpp-web.test")
-    assert db.reread_after_commit(conn, lambda c: 42, log, "x") == (42, False)
+    assert db.reread_after_commit(conn, lambda c: 42, log, "x", "warn") == (42, None)
 
     def broken(c):
         raise psycopg.OperationalError("gone")
 
-    assert db.reread_after_commit(conn, broken, log, "role r rotated") == (None, True)
+    assert db.reread_after_commit(conn, broken, log, "role r rotated", "warn") == (None, "warn")
     assert "role r rotated, the re-read failed: gone" in caplog.text
 
 

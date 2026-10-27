@@ -135,6 +135,15 @@ def _form_response(
     return render(request, template, context, status_code=422 if error else 200)
 
 
+def _profile_or_404(conn: Connection, name: str) -> dict[str, Any]:
+    """The profile, or the generic 404 response: a page, or for htmx an
+    alert retargeted to #alerts (the form stays in place)."""
+    profile = db.get_profile(conn, name)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    return profile
+
+
 @router.get("", name="profiles")
 def profiles_page(request: Request, conn: Connection = db.CONN):
     return _page(request, conn)
@@ -145,11 +154,7 @@ def profile_new(request: Request, conn: Connection = db.CONN):
     # the settings of the default profile as a starting point, but not its
     # name: the new profile must be named by the user
     defaults = {**(db.get_profile(conn, "default") or {}), "name": ""}
-    return render(
-        request,
-        "profiles/form.html",
-        {"profile": None, "values": defaults, "fields": db.PROFILE_FIELDS, "labels": LABELS},
-    )
+    return _form_response(request, None, defaults)
 
 
 @router.post("", name="profile_create")
@@ -205,25 +210,17 @@ def profile_unassign(
 # on "x" (tests/test_integration.py checks that such a name is refused)
 @router.get("/{name}", name="profile_edit")
 def profile_edit(request: Request, name: str, conn: Connection = db.CONN):
-    profile = db.get_profile(conn, name)
-    if profile is None:
-        return render(
-            request, "error.html", {"status_code": 404, "detail": "Profile not found"}, 404
-        )
-    return render(
-        request,
-        "profiles/form.html",
-        {"profile": profile, "values": profile, "fields": db.PROFILE_FIELDS, "labels": LABELS},
-    )
+    if name in RESERVED_NAMES:
+        # GET /profiles/assign (or unassign) lands here, but the form would
+        # post to the fixed POST route of the same path: never offered
+        raise HTTPException(status_code=404, detail=RESERVED_MESSAGE.format(name))
+    profile = _profile_or_404(conn, name)
+    return _form_response(request, profile, profile)
 
 
 @router.post("/{name}", name="profile_update")
 def profile_update(request: Request, name: str, form: FormData = FORM, conn: Connection = db.CONN):
-    profile = db.get_profile(conn, name)
-    if profile is None:
-        # the generic error response: a page, or for htmx an alert retargeted
-        # to #alerts (the form stays in place)
-        raise HTTPException(status_code=404, detail="Profile not found")
+    profile = _profile_or_404(conn, name)
     values = {k: form.get(k) for k, _ in db.PROFILE_FIELDS}
     values["name"] = name
     notice = None

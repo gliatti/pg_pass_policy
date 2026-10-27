@@ -431,12 +431,36 @@ def test_role_name_needing_url_encoding(client, super_conn):
     assert "does not exist" in response.text and "web_t_x/y" in response.text
 
 
-def test_worker_status_unavailable(client, monkeypatch):
-    """worker_status() failing (library not preloaded, W2): the pages render
+NOT_PRELOADED_HINT = "Add pg_pass_policy to shared_preload_libraries and restart the server."
+
+
+@pytest.fixture
+def raising_55000(super_conn):
+    """Functions raising 55000 like the extension does without its shared
+    memory (worker_status()) or without being preloaded (v_role_status)."""
+    from psycopg import sql
+
+    super_conn.execute(
+        sql.SQL(
+            "CREATE FUNCTION public.web_t_no_shmem() RETURNS SETOF record LANGUAGE plpgsql AS $$"
+            " BEGIN RAISE EXCEPTION 'pg_pass_policy shared memory is not initialized'"
+            "   USING ERRCODE = 'object_not_in_prerequisite_state', HINT = {}; END $$"
+        ).format(sql.Literal(NOT_PRELOADED_HINT))
+    )
+    try:
+        yield
+    finally:
+        super_conn.execute("DROP FUNCTION IF EXISTS public.web_t_no_shmem()")
+
+
+def test_worker_status_unavailable(client, monkeypatch, raising_55000):
+    """worker_status() raising 55000 (no shared memory): the pages render
     the "not running" branch and the rest of the transaction still works."""
     from app import db
 
-    monkeypatch.setattr(db, "WORKER_STATUS_SQL", "SELECT * FROM pass_policy.no_such_function()")
+    monkeypatch.setattr(
+        db, "WORKER_STATUS_SQL", "SELECT * FROM public.web_t_no_shmem() AS t(pid int)"
+    )
     response = client.get("/")
     assert response.status_code == 200, response.text
     assert "The background worker is not running" in response.text
@@ -447,6 +471,83 @@ def test_worker_status_unavailable(client, monkeypatch):
     token = csrf_token(client, "/maintenance")
     response = client.post("/maintenance/run", headers={"X-CSRF-Token": token})
     assert response.status_code == 200 and "Maintenance completed" in response.text
+
+
+def test_worker_status_missing_function_is_an_error(client, monkeypatch, caplog):
+    """Only 55000 means "worker not running": a missing function is a 500."""
+    from app import db
+
+    monkeypatch.setattr(db, "WORKER_STATUS_SQL", "SELECT * FROM pass_policy.no_such_function()")
+    response = client.get("/")
+    assert response.status_code == 500
+    assert "no_such_function" not in response.text
+    assert "no_such_function" in caplog.text
+
+
+def test_extension_not_preloaded_page(client, monkeypatch, raising_55000, caplog):
+    """The first query on the views raising the server's 55000 gives the
+    dedicated page, with the HINT read from the server's error."""
+    from app import db
+
+    def status_counts(conn):
+        return conn.execute("SELECT * FROM public.web_t_no_shmem() AS t(n int)").fetchall()
+
+    monkeypatch.setattr(db, "status_counts", status_counts)
+    response = client.get("/")
+    assert response.status_code == 503, response.text
+    assert "pg_pass_policy is not preloaded</h1>" in response.text
+    assert "shared memory is not initialized" in response.text
+    assert NOT_PRELOADED_HINT in response.text
+    assert "pg_pass_policy is not preloaded (GET /)" in caplog.text
+    # the connection went back to the pool usable
+    assert client.get("/healthz").status_code == 200
+    monkeypatch.undo()
+    assert client.get("/").status_code == 200
+
+
+def test_unexpected_action_error_is_a_logged_500(client, monkeypatch, caplog):
+    from app import db
+
+    def broken_lock(conn, role, duration, reason):
+        conn.execute("SELECT * FROM pass_policy.no_such_table")
+
+    token = csrf_token(client, "/roles")
+    headers = {"X-CSRF-Token": token, "HX-Request": "true"}
+    # a value error of the server (class 22) stays inline
+    response = client.post(
+        "/roles/web_t_alpha/lock", data={"duration": "not an interval"}, headers=headers
+    )
+    assert response.status_code == 422, response.text
+    assert "invalid input syntax for type interval" in response.text
+    monkeypatch.setattr(db, "lock_role", broken_lock)
+    response = client.post("/roles/web_t_alpha/lock", data={"duration": "1 hour"}, headers=headers)
+    assert response.status_code == 500
+    assert response.headers["HX-Retarget"] == "#alerts"
+    assert "no_such_table" not in response.text
+    assert "database error on POST /roles/web_t_alpha/lock" in caplog.text
+    assert "no_such_table" in caplog.text
+
+
+def test_reserved_name_profile_created_in_sql(client, super_conn):
+    """A profile named "assign" (accepted by the extension, created in SQL)
+    is not offered for edition: GET /profiles/assign is refused, the
+    assignment route of the same path keeps working."""
+    super_conn.execute("SELECT pass_policy.create_profile('assign', '{}'::jsonb)")
+    try:
+        response = client.get("/profiles/assign")
+        assert response.status_code == 404, response.text
+        assert "is reserved by the web interface" in response.text
+        assert 'id="profile-form"' not in response.text
+        token = csrf_token(client, "/profiles")
+        headers = {"X-CSRF-Token": token, "HX-Request": "true"}
+        response = client.post(
+            "/profiles/assign", data={"role": "web_t_beta", "profile": T_PROFILE}, headers=headers
+        )
+        assert response.status_code == 200, response.text
+        assert f"Profile {T_PROFILE} assigned to web_t_beta" in response.text
+        assert client.get("/profiles/web_t_no_such_profile").status_code == 404
+    finally:
+        super_conn.execute("DELETE FROM pass_policy.profile WHERE name = 'assign'")
 
 
 def test_validation_errors_are_html(client):

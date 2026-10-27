@@ -8,6 +8,7 @@ and no password is ever logged or kept beyond the HTTP response.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable, Iterator
 from datetime import datetime
 from typing import Any, TypeVar
@@ -148,12 +149,78 @@ CONN: Any = Depends(get_conn, scope="function")
 T = TypeVar("T")
 
 
+class ExtensionNotPreloaded(Exception):
+    """pg_pass_policy is not in shared_preload_libraries: every view and
+    every function backed by the shared memory fails with SQLSTATE 55000.
+    Raised by the first query of a request that hits it, shown as a
+    dedicated page (main.py) with the server's HINT."""
+
+    def __init__(self, message: str, hint: str | None) -> None:
+        super().__init__(message)
+        self.message = message
+        self.hint = hint
+
+
+def not_preloaded(exc: BaseException) -> ExtensionNotPreloaded | None:
+    """The ExtensionNotPreloaded matching a 55000 error raised because the
+    library is not preloaded (message or HINT naming shared_preload_libraries,
+    or the shared memory reported as not initialized), None for anything else
+    (another 55000, such as PPP-004 "schema is not trusted", included)."""
+    if not isinstance(exc, psycopg.errors.ObjectNotInPrerequisiteState):
+        return None
+    message = error_message(exc)
+    hint = exc.diag.message_hint
+    text = f"{message} {hint or ''}"
+    if "shared_preload_libraries" in text or "shared memory is not initialized" in text:
+        return ExtensionNotPreloaded(message, hint)
+    return None
+
+
+# SQLSTATEs shown in the action fragments (422): the ones the extension
+# raises on a refused action (RAISE ... USING ERRCODE, ereport() in the C
+# code) and the errors caused by the submitted values themselves (class 22:
+# an interval that does not parse, an out-of-range integer; class 23: a CHECK
+# constraint of pass_policy.profile).  Anything else (undefined table or
+# function, lost connection, internal error...) is logged and gives the
+# generic 500 page.
+EXTENSION_SQLSTATES = frozenset(
+    {
+        "42501",  # insufficient_privilege (_require_admin, privileged target)
+        "42704",  # undefined_object (role, profile, pair does not exist)
+        "42710",  # duplicate_object (profile, pair already exists)
+        "55006",  # object_in_use (profile assigned, default profile)
+        "53400",  # configuration_limit_exceeded (shared memory full on lock)
+        "28P01",  # invalid_password (PPP-0xx policy refusal)
+        "P0001",  # raise_exception (plain RAISE EXCEPTION)
+    }
+)
+USER_INPUT_SQLSTATE_CLASSES = ("22", "23")
+_PPP_CODE = re.compile(r"PPP-\d{3}\b")
+
+
+def is_extension_error(exc: psycopg.Error) -> bool:
+    """Whether a PostgreSQL error is a refusal to show the user as is (see
+    EXTENSION_SQLSTATES): a message of the extension ("pg_pass_policy: ...",
+    "PPP-0xx: ..."), or one of its SQLSTATEs, or a data error caused by the
+    submitted values."""
+    if not_preloaded(exc) is not None:
+        return False
+    message = error_message(exc)
+    if message.startswith("pg_pass_policy:") or _PPP_CODE.match(message):
+        return True
+    sqlstate = exc.sqlstate or ""
+    return sqlstate in EXTENSION_SQLSTATES or sqlstate.startswith(USER_INPUT_SQLSTATE_CLASSES)
+
+
 def run_action(
     conn: Connection, action: Callable[..., T], *args: Any
 ) -> tuple[T | None, str | None]:
     """Run one pass_policy action in a savepoint, then commit it: (result,
-    None) on success, (None, error message) on a PostgreSQL error (the
-    savepoint is rolled back, the connection stays usable for the response).
+    None) on success, (None, error message) when the extension refuses it
+    (is_extension_error(): the savepoint is rolled back, the connection
+    stays usable for the response).  Any other PostgreSQL error propagates
+    once the savepoint is rolled back: main.py logs it and shows the generic
+    500 page (ExtensionNotPreloaded: the dedicated page).
 
     The commit comes before anything is re-read or shown: the extension
     applies its shared-memory changes (lock, unlock, failure counter) at
@@ -164,24 +231,30 @@ def run_action(
         with conn.transaction():
             result = action(conn, *args)
     except psycopg.Error as exc:
+        if not is_extension_error(exc):
+            raise
         return None, error_message(exc)
     conn.commit()
     return result, None
 
 
 def reread_after_commit(
-    conn: Connection, read: Callable[[Connection], T], logger: logging.Logger, what: str
-) -> tuple[T | None, bool]:
+    conn: Connection,
+    read: Callable[[Connection], T],
+    logger: logging.Logger,
+    what: str,
+    warning: str,
+) -> tuple[T | None, str | None]:
     """Re-read after a committed action whose result (a one-time password)
-    must be shown whatever happens: a failing read is logged and reported
-    as (None, True) instead of raising.  The read runs in a savepoint so
-    that the connection stays usable."""
+    must be shown whatever happens: (result, None), or, when the read
+    fails, (None, warning) after logging the error instead of raising.  The
+    read runs in a savepoint so that the connection stays usable."""
     try:
         with conn.transaction():
-            return read(conn), False
+            return read(conn), None
     except psycopg.Error as exc:
         logger.error("%s, the re-read failed: %s", what, exc)
-        return None, True
+        return None, warning
 
 
 def error_message(exc: Exception) -> str:
@@ -215,27 +288,22 @@ WORKER_STATUS_SQL = (
 )
 
 
-WORKER_UNAVAILABLE_ERRORS: tuple[type[psycopg.Error], ...] = (
-    psycopg.errors.ObjectNotInPrerequisiteState,
-    psycopg.ProgrammingError,
-)
-
-
 def worker_status(conn: Connection) -> dict[str, Any] | None:
-    """The worker state, or None when it cannot be read.
+    """The worker state, or None when the worker is not running.
 
     worker_status() raises ObjectNotInPrerequisiteState (55000) when the
-    library is not in shared_preload_libraries (no shared memory); a
-    ProgrammingError (42xxx: function missing, insufficient privilege) means
-    the same for the page.  Both show "worker not running" instead of
-    failing; the savepoint keeps the request transaction usable for the
-    queries that follow.  Any other error (lost connection, server shutting
-    down...) is not about the worker and propagates.
+    shared memory is missing: the dashboard shows "worker not running"
+    instead of failing, the savepoint keeps the request transaction usable
+    for the queries that follow.  When the library is not preloaded at all,
+    the dashboard never gets here: v_role_status (failed_attempts()) raises
+    first and the request gets the "extension not preloaded" page (see
+    ExtensionNotPreloaded).  Any other error (missing function, privilege,
+    lost connection...) propagates: the generic 500 page.
     """
     try:
         with conn.transaction():
             return conn.execute(WORKER_STATUS_SQL).fetchone()
-    except WORKER_UNAVAILABLE_ERRORS as exc:
+    except psycopg.errors.ObjectNotInPrerequisiteState as exc:
         log.warning("worker status unavailable: %s", error_message(exc))
         return None
 
