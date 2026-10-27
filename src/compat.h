@@ -65,6 +65,71 @@
 #endif
 
 /*
+ * PPP_MAY_SET_PASSWORD_OF(userid, roleid): may a non-superuser "userid"
+ * change the password of an existing role "roleid" (other than itself)?
+ * Used by the password hook as defence in depth, so that the history and
+ * minimum age checks never answer for a role whose password the caller may
+ * not change (AlterRole() and CreateRole() check this before calling the
+ * hook in 13.2, 16.4 and 17beta1).  It must never be stricter than
+ * PostgreSQL, otherwise legitimate changes would skip the history check:
+ *   PG 16-18 : CREATEROLE and ADMIN OPTION on the role (AlterRole() in
+ *              16.4 and 17beta1); is_admin_of_role() alone is a superset;
+ *   PG 14-15 : CREATEROLE, the role not being a superuser (replication
+ *              roles also require a superuser: superset again).
+ * has_createrole_privilege() and is_admin_of_role() are in utils/acl.h,
+ * superuser_arg() in miscadmin.h, unchanged 14 -> 18.
+ */
+#if PG_VERSION_NUM >= 160000
+#define PPP_MAY_SET_PASSWORD_OF(userid, roleid) \
+	is_admin_of_role((userid), (roleid))
+#else
+#define PPP_MAY_SET_PASSWORD_OF(userid, roleid) \
+	(has_createrole_privilege(userid) && !superuser_arg(roleid))
+#endif
+
+/*
+ * get_extension_schema() (commands/extension.h) is exported since PG 16;
+ * in PG 14 and 15 it is a static function of extension.c, and pg_extension
+ * has no syscache, so the shim scans pg_extension_oid_index like the
+ * original does.  Callers use ppp_get_extension_schema().
+ */
+#if PG_VERSION_NUM >= 160000
+#include "commands/extension.h"
+#define ppp_get_extension_schema(ext_oid) get_extension_schema(ext_oid)
+#else
+#include "access/genam.h"
+#include "access/htup_details.h"
+#include "access/table.h"
+#include "catalog/pg_extension.h"
+#include "utils/fmgroids.h"
+#include "utils/rel.h"
+
+static inline Oid
+ppp_get_extension_schema(Oid ext_oid)
+{
+	Oid			result = InvalidOid;
+	Relation	rel;
+	SysScanDesc scandesc;
+	HeapTuple	tuple;
+	ScanKeyData entry[1];
+
+	rel = table_open(ExtensionRelationId, AccessShareLock);
+	ScanKeyInit(&entry[0],
+				Anum_pg_extension_oid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(ext_oid));
+	scandesc = systable_beginscan(rel, ExtensionOidIndexId, true,
+								  NULL, 1, entry);
+	tuple = systable_getnext(scandesc);
+	if (HeapTupleIsValid(tuple))
+		result = ((Form_pg_extension) GETSTRUCT(tuple))->extnamespace;
+	systable_endscan(scandesc);
+	table_close(rel, AccessShareLock);
+	return result;
+}
+#endif
+
+/*
  * The following APIs are used unchanged on PG 14 -> 18 and need no shim
  * (listed here so a reviewer knows they were checked):
  *   - check_password_hook_type (commands/user.h): (const char *username,

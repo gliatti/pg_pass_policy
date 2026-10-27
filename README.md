@@ -158,6 +158,15 @@ SELECT pass_policy.lock_role('app_user', interval '1 hour', 'incident');  -- ren
 SELECT pass_policy.unlock_role('app_user');                            -- remet aussi le compteur à zéro
 ```
 
+`lock_duration` et `failure_window` (sauf 0, « pas de fenêtre ») valent au
+moins une seconde : la mémoire partagée les reçoit en secondes entières.
+Un verrou automatique levé par `unlock_role()` avant le passage du worker est
+tout de même journalisé (`role_locked`, `details.lifted_before_audit = true`),
+sans être recopié dans `role_state`. Si la bibliothèque a été retirée de
+`shared_preload_libraries` après l'installation, `lock_role()` et
+`unlock_role()` échouent (ERROR) au lieu de valider `role_state` sans effet sur
+l'authentification.
+
 ### Rotation sans coupure (paires de rôles)
 
 Deux rôles physiques, membres (`INHERIT`) d'un rôle de groupe qui porte les
@@ -255,9 +264,11 @@ compte comme « spécial ».
   quel rôle, et les profils (`default` compris) s'appliquent à lui : un membre
   de `pass_policy_admin` non superutilisateur ne peut pas le viser avec
   `rotate_password`, `expire_password`, `lock_role`… (ni un rôle membre d'un
-  superutilisateur ou d'un rôle `pg_*`), mais il peut lui assigner un profil
-  ou modifier `default`, que `run_maintenance()` applique ensuite (expiration,
-  `VALID UNTIL`, verrouillage). Pour ne pas se retrouver dehors après quelques
+  superutilisateur, d'un rôle `pg_*` ou, sur PostgreSQL ≤ 15, d'un rôle
+  `CREATEROLE`), ni lui assigner ou retirer un profil. En revanche il peut
+  modifier le profil `default`, que `run_maintenance()` applique ensuite à tous
+  les rôles sans profil, superutilisateurs compris (expiration, `VALID UNTIL`,
+  verrouillage). Pour ne pas se retrouver dehors après quelques
   fautes de frappe ou un profil trop strict, mettre
   `pg_pass_policy.exempt_roles = 'postgres'` (ou le nom de votre compte
   d'administration).

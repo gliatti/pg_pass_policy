@@ -40,6 +40,19 @@ SELECT ppp_test.try($$SELECT pass_policy.alter_profile('no_such_profile', '{"min
 SELECT ppp_test.try($$SELECT pass_policy.alter_profile('p_plain', '{"min_length = 1; DROP TABLE pass_policy.profile; --": 1}')$$) <> 'ok' AS injection_refused;
 SELECT count(*) AS profile_table_ok FROM pass_policy.profile WHERE name = 'p_plain';
 
+-- Durées sous la seconde refusées : la mémoire partagée les reçoit en secondes
+-- entières (worker.c), un lock_duration de 0,4 s y deviendrait 0 (verrou déjà
+-- expiré, donc jamais effectif) et un failure_window de 0,4 s « pas de fenêtre »
+SELECT ppp_test.try($$SELECT pass_policy.alter_profile('p_plain', '{"lock_duration": "0.4 seconds"}')$$) AS lock_subsecond;
+SELECT ppp_test.try($$SELECT pass_policy.alter_profile('p_plain', '{"lock_duration": "0 seconds"}')$$) AS lock_zero;
+SELECT ppp_test.try($$SELECT pass_policy.alter_profile('p_plain', '{"failure_window": "0.4 seconds"}')$$) AS window_subsecond;
+SELECT ppp_test.try($$SELECT pass_policy.create_profile('p_bad', '{"lock_duration": "500 milliseconds"}')$$) AS create_lock_subsecond;
+-- 1 seconde, et failure_window = 0 (pas de fenêtre) restent acceptés
+SELECT ppp_test.try($$SELECT pass_policy.alter_profile('p_plain', '{"lock_duration": "1 second", "failure_window": "1 second"}')$$) AS one_second;
+SELECT ppp_test.try($$SELECT pass_policy.alter_profile('p_plain', '{"failure_window": "0"}')$$) AS window_zero;
+SELECT lock_duration, failure_window FROM pass_policy.profile WHERE name = 'p_plain';
+SELECT pass_policy.alter_profile('p_plain', '{"lock_duration": "30 minutes", "failure_window": "15 minutes"}');
+
 -- effective_profile : sans affectation → default
 SELECT name FROM pass_policy.effective_profile('regress_prof');
 -- rôle inexistant → default également

@@ -25,6 +25,13 @@ CREATE ROLE regress_etl LOGIN;              -- membre d'un rôle prédéfini dan
 GRANT pg_execute_server_program TO regress_etl;
 CREATE ROLE regress_grp_super NOLOGIN;      -- groupe membre d'un superutilisateur
 GRANT regress_super TO regress_grp_super;
+-- CREATEROLE : privilégié sur PostgreSQL <= 15 (s'accorder pg_*, changer le
+-- mot de passe de tout non-superutilisateur), et donc aussi ses membres
+CREATE ROLE regress_cr_grp NOLOGIN CREATEROLE;
+CREATE ROLE regress_cr_member LOGIN;        -- membre d'un rôle CREATEROLE
+GRANT regress_cr_grp TO regress_cr_member;
+CREATE ROLE regress_cr_sub NOLOGIN;         -- groupe membre d'un rôle CREATEROLE
+GRANT regress_cr_grp TO regress_cr_sub;
 CREATE ROLE regress_pair_grp NOLOGIN;       -- groupe applicatif ordinaire, propriétaire de la base
 CREATE TEMP TABLE dbowner AS
   SELECT pg_get_userbyid(datdba) AS o FROM pg_database WHERE datname = current_database();
@@ -480,6 +487,33 @@ SELECT ppp_test.try($$SELECT pass_policy.create_rotation_pair('pair_grp', 'regre
  42501
 (1 row)
 
+-- CREATEROLE (PG <= 15 seulement) : le même prédicat _is_privileged() vaut
+-- pour la cible et pour chacun des rôles dont elle est membre ; sur PG >= 16
+-- CREATEROLE n'est plus privilégié et les trois appels réussissent. Sortie
+-- indépendante de la version.
+SELECT (ppp_test.try($$SELECT pass_policy.lock_role('regress_cr_grp')$$) = '42501')
+       = (current_setting('server_version_num')::int < 160000) AS createrole_rule;
+ createrole_rule 
+-----------------
+ t
+(1 row)
+
+SELECT (ppp_test.try($$SELECT pass_policy.lock_role('regress_cr_member')$$) = '42501')
+       = (current_setting('server_version_num')::int < 160000) AS createrole_member_rule;
+ createrole_member_rule 
+------------------------
+ t
+(1 row)
+
+BEGIN;
+SELECT (ppp_test.try($$SELECT pass_policy.create_rotation_pair('pair_cr', 'regress_pair_c1', 'regress_pair_c2', 'regress_cr_sub')$$) = '42501')
+       = (current_setting('server_version_num')::int < 160000) AS createrole_group_rule;
+ createrole_group_rule 
+-----------------------
+ t
+(1 row)
+
+ROLLBACK;
 -- … et l'exception annule le CREATE ROLE
 SELECT count(*) AS pair_roles_created FROM pg_roles WHERE rolname IN ('regress_pair_x', 'regress_pair_y');
  pair_roles_created 
@@ -525,6 +559,18 @@ SELECT actor FROM pass_policy.audit_log
 SELECT ppp_test.try($$SELECT pass_policy.unlock_role('regress_super')$$) AS cleanup_unlock_super;
  cleanup_unlock_super 
 ----------------------
+ ok
+(1 row)
+
+SELECT ppp_test.try($$SELECT pass_policy.unlock_role('regress_cr_grp')$$) AS cleanup_unlock_cr_grp;
+ cleanup_unlock_cr_grp 
+-----------------------
+ ok
+(1 row)
+
+SELECT ppp_test.try($$SELECT pass_policy.unlock_role('regress_cr_member')$$) AS cleanup_unlock_cr_member;
+ cleanup_unlock_cr_member 
+--------------------------
  ok
 (1 row)
 
@@ -584,6 +630,42 @@ SELECT ppp_test.try($$ALTER ROLE regress_target PASSWORD 'Untrusted-Schema#2026'
  ok
 (1 row)
 
+-- ---------------------------------------------------------------------
+-- Pas d'oracle par CREATE ROLE / ALTER ROLE : un rôle CREATEROLE sans ADMIN
+-- sur regress_target (mot de passe courant 'Untrusted-Schema#2026') ne doit
+-- jamais obtenir PPP-031 (« déjà utilisé ») ni PPP-030 pour lui. PostgreSQL
+-- teste l'existence du rôle (CREATE ROLE : 42710) et le droit de le modifier
+-- (ALTER ROLE) avant d'appeler le hook ; le hook ne fait de toute façon les
+-- contrôles d'historique et de min_age que si l'appelant peut changer ce mot
+-- de passe. Un mot de passe faible donne aussi 42710 (la complexité ne
+-- révélerait que la faiblesse du candidat, pas le mot de passe d'un autre).
+-- ALTER ROLE : refusé (42501) sur PG >= 16 sans ADMIN ; sur PG <= 15,
+-- CREATEROLE suffit à changer le mot de passe d'un non-superutilisateur, la
+-- réponse PPP-031 n'apprend donc rien qu'il ne puisse déjà faire.
+-- ---------------------------------------------------------------------
+CREATE ROLE regress_creator LOGIN CREATEROLE;
+SET SESSION AUTHORIZATION regress_creator;
+SELECT ppp_test.try($$CREATE ROLE regress_target PASSWORD 'Untrusted-Schema#2026'$$) AS create_existing_current;
+ create_existing_current 
+-------------------------
+ 42710
+(1 row)
+
+SELECT ppp_test.try($$CREATE ROLE regress_target PASSWORD 'weak'$$) AS create_existing_weak;
+ create_existing_weak 
+----------------------
+ 42710
+(1 row)
+
+SELECT ppp_test.try($$ALTER ROLE regress_target PASSWORD 'Untrusted-Schema#2026'$$)
+       = CASE WHEN current_setting('server_version_num')::int >= 160000
+              THEN '42501' ELSE '28P01 PPP-031' END AS alter_other_current;
+ alter_other_current 
+---------------------
+ t
+(1 row)
+
+RESET SESSION AUTHORIZATION;
 -- ---------------------------------------------------------------------
 -- pg_pass_policy.exempt_roles : _is_exempt() appelle la fonction C des hooks
 -- (ppp_role_is_exempt(), règles de SplitIdentifierString()) : noms non quotés

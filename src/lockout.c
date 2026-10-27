@@ -59,11 +59,6 @@ PG_FUNCTION_INFO_V1(ppp_shmem_lock_role);
 PG_FUNCTION_INFO_V1(ppp_shmem_unlock_role);
 PG_FUNCTION_INFO_V1(ppp_shmem_reset_failures);
 
-/* Safe defaults until the worker has read the "default" profile */
-#define PPP_DEFAULT_MAX_FAILURES		5
-#define PPP_DEFAULT_FAILURE_WINDOW		900
-#define PPP_DEFAULT_LOCK_DURATION		1800
-
 static ClientAuthentication_hook_type prev_client_auth_hook = NULL;
 
 static void ppp_client_auth_hook(Port *port, int status);
@@ -73,7 +68,7 @@ static void ppp_client_auth_hook(Port *port, int status);
  * Copy a role name into a hash key, truncated like the server does for
  * port->user_name (plain byte truncation to NAMEDATALEN - 1).
  */
-static void
+void
 ppp_make_key(pppRoleKey *key, const char *rolename)
 {
 	memset(key, 0, sizeof(pppRoleKey));
@@ -97,6 +92,7 @@ ppp_init_entry(pppRoleEntry *entry)
 	entry->locked_until = 0;
 	entry->lock_pending_audit = false;
 	entry->pending_failures = 0;
+	entry->audit_locked_until = 0;
 	entry->lock_from_state = false;
 	entry->lock_inflight = 0;
 	entry->lock_seq = 0;
@@ -166,7 +162,9 @@ ppp_entry_class(const pppRoleEntry *entry, TimestampTz now)
  *	   a failure counter or a few audit rows.
  * PPP_CLASS_KEEP entries are never evicted.  The evicted entry is described
  * in *ev (which may be NULL) so that the caller can log it once the lock is
- * released (ppp_log_eviction).
+ * released (ppp_log_eviction); ev->victim keeps its whole content, so that
+ * a caller that gives the room back (ppp_apply_lock_ops on error) can put
+ * the entry back.
  *
  * The scan is linear in max_tracked_roles and only happens once the hash is
  * full.  In PPP_ENTER_COUNT mode, a scan that found nothing is not repeated
@@ -244,6 +242,7 @@ ppp_enter_role(const char *rolename, pppEnterMode mode, TimestampTz now,
 				ev->lost_failed_count = victim->failed_count;
 				ev->lost_pending_failures = victim->pending_failures;
 			}
+			memcpy(&ev->victim, victim, sizeof(pppRoleEntry));
 		}
 		hash_search(ppp_role_hash, &victim->key, HASH_REMOVE, NULL);
 	}
@@ -292,6 +291,9 @@ ppp_log_eviction(const pppEviction *ev)
  *
  * The hash size must be accounted for in ppp_shmem_size():
  *	 hash_estimate_size(ppp_max_tracked_roles, sizeof(pppRoleEntry)).
+ *
+ * The fixed shared state (default parameters, first reload request) is
+ * initialised by ppp_shmem_startup() only.
  */
 void
 ppp_lockout_shmem_init(void)
@@ -307,20 +309,6 @@ ppp_lockout_shmem_init(void)
 								  ppp_max_tracked_roles,
 								  &info,
 								  HASH_ELEM | HASH_STRINGS);
-
-	/*
-	 * Without EXEC_BACKEND, this runs once in the postmaster.  With
-	 * EXEC_BACKEND, it runs again in every child: the shared state must not
-	 * be reset there.
-	 */
-	if (!IsUnderPostmaster && ppp_shared != NULL)
-	{
-		ppp_shared->default_max_failures = PPP_DEFAULT_MAX_FAILURES;
-		ppp_shared->default_failure_window_secs = PPP_DEFAULT_FAILURE_WINDOW;
-		ppp_shared->default_lock_duration_secs = PPP_DEFAULT_LOCK_DURATION;
-		/* force a first load of profiles and persisted locks */
-		pg_atomic_init_u32(&ppp_shared->reload_requested, 1);
-	}
 }
 
 /*
@@ -478,6 +466,7 @@ ppp_client_auth_hook(Port *port, int status)
 						entry->locked_until = TimestampTzPlusMilliseconds(now,
 																		  (int64) entry->lock_duration_secs * 1000);
 					entry->lock_pending_audit = true;
+					entry->audit_locked_until = entry->locked_until;
 					entry->lock_from_state = false;
 					just_locked = true;
 					locked_until = entry->locked_until;
@@ -503,6 +492,14 @@ ppp_client_auth_hook(Port *port, int status)
 				(errmsg(PPP_LOG_PREFIX "role \"%s\" locked after %d failed attempts",
 						rolename, failed_count)));
 
+	/*
+	 * Chain to the previous hook before refusing a locked role: a module
+	 * loaded before us (auth_delay, a login audit...) still sees the
+	 * attempt with its real status.  It may raise its own FATAL first.
+	 */
+	if (prev_client_auth_hook)
+		prev_client_auth_hook(port, status);
+
 	if (refuse)
 	{
 		if (locked_until == DT_NOEND)
@@ -517,9 +514,6 @@ ppp_client_auth_hook(Port *port, int status)
 					 errdetail("The role is locked until %s.",
 							   timestamptz_to_str(locked_until))));
 	}
-
-	if (prev_client_auth_hook)
-		prev_client_auth_hook(port, status);
 }
 
 /* ------------------------------------------------------------------------
@@ -622,6 +616,10 @@ ppp_op_overridden(const pppPendingOp *op)
  * applied by this call are undone and an ERROR is raised: the transaction
  * aborts (role_state update and audit row included), lock_role() fails
  * visibly and nothing claims a lock that is not enforced (fail-closed).
+ * The undo restores the shared memory exactly: entries that existed get
+ * their previous content back, entries created are removed and the entries
+ * they evicted (a failure counter, failures not yet audited) are put back,
+ * in reverse order, so that a failed lock_role() costs nobody a counter.
  *
  * Applying the locks here rather than at COMMIT means that no other
  * insertion (the authentication hook, another lock_role(), a worker reload)
@@ -688,9 +686,13 @@ ppp_apply_lock_ops(void)
 			break;
 		}
 
+		/*
+		 * The SQL caller writes its own audit row.  lock_pending_audit is
+		 * left alone: an automatic lock not yet audited keeps its pending
+		 * role_locked row (audit_locked_until), which the worker writes
+		 * without copying it to role_state (locked_until differs now).
+		 */
 		entry->locked_until = op->until;
-		/* the SQL caller writes its own audit row */
-		entry->lock_pending_audit = false;
 
 		/*
 		 * Mirrored in role_state by lock_role(): a later reload lifts it if
@@ -706,24 +708,45 @@ ppp_apply_lock_ops(void)
 
 	if (missing != NULL)
 	{
-		/* undo, in reverse order: we still hold the lock, nothing changed */
+		/*
+		 * Undo, in reverse order: we still hold the lock, nobody else saw
+		 * the intermediate states.  Removing the entry created by an
+		 * operation frees the room its eviction made, so the victim can
+		 * always be entered again (HASH_ENTER_NULL does not fail there);
+		 * the reverse order also handles a later operation that evicted or
+		 * recreated the entry of an earlier one.
+		 */
 		while (--i >= 0)
 		{
 			pppRoleKey	key;
+			pppRoleEntry *entry;
 
 			op = ops[i];
 			ppp_make_key(&key, op->rolename);
 			if (op->prev_existed)
 			{
-				pppRoleEntry *entry;
-
 				entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key,
 													 HASH_FIND, NULL);
 				if (entry != NULL)
 					memcpy(entry, &op->prev, sizeof(pppRoleEntry));
 			}
 			else
+			{
 				hash_search(ppp_role_hash, &key, HASH_REMOVE, NULL);
+				if (op->ev.evicted)
+				{
+					bool		found;
+
+					entry = (pppRoleEntry *) hash_search(ppp_role_hash,
+														 &op->ev.victim.key,
+														 HASH_ENTER_NULL,
+														 &found);
+					if (entry != NULL && !found)
+						memcpy(entry, &op->ev.victim, sizeof(pppRoleEntry));
+					/* restored: nothing was lost, nothing to log */
+					op->ev.evicted = (entry == NULL || found);
+				}
+			}
 			op->applied = false;
 		}
 	}
@@ -801,8 +824,13 @@ ppp_finish_pending_ops(bool commit)
 				ppp_stamp_entry(entry);
 				break;
 			case PPP_OP_UNLOCK:
+				/*
+				 * lock_pending_audit is kept: an automatic lock lifted
+				 * before the worker has written its role_locked row is
+				 * still audited (audit_locked_until), and not copied to
+				 * role_state since locked_until no longer matches.
+				 */
 				entry->locked_until = 0;
-				entry->lock_pending_audit = false;
 				entry->lock_from_state = false;
 				ppp_stamp_entry(entry);
 				break;

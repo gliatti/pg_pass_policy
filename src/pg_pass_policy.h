@@ -29,6 +29,15 @@ extern bool  ppp_superuser_bypass;
 extern bool  ppp_require_scram;
 extern bool  ppp_enforce_database;
 
+/*
+ * Lockout parameters used until the worker has read the "default" profile
+ * (same values as the defaults of SPEC 3.1).  Single definition, applied by
+ * ppp_shmem_startup() (pg_pass_policy.c).
+ */
+#define PPP_DEFAULT_MAX_FAILURES		5
+#define PPP_DEFAULT_FAILURE_WINDOW_SECS	(15 * 60)
+#define PPP_DEFAULT_LOCK_DURATION_SECS	(30 * 60)
+
 /* ---- Mémoire partagée (remplie par le worker, lue par le hook auth) ------- */
 typedef struct pppRoleKey
 {
@@ -52,6 +61,15 @@ typedef struct pppRoleEntry
 	TimestampTz locked_until;			/* 0 = non verrouillé, DT_NOEND = manuel */
 	bool		lock_pending_audit;		/* posé par le hook, effacé par le worker */
 	int32		pending_failures;		/* échecs non encore journalisés */
+
+	/*
+	 * locked_until of the automatic lock whose role_locked audit row is
+	 * pending (lock_pending_audit).  Kept apart from locked_until so that
+	 * an unlock, or a manual lock, applied before the worker has written
+	 * the row does not lose it: the worker audits this value, and copies it
+	 * to role_state only while locked_until still equals it.
+	 */
+	TimestampTz audit_locked_until;
 
 	/*
 	 * Lock state.  lock_from_state: the lock is expected to be mirrored in
@@ -109,6 +127,8 @@ typedef struct pppEviction
 	char		rolename[NAMEDATALEN];
 	int32		lost_failed_count;		/* counter still inside its window */
 	int32		lost_pending_failures;	/* failures lost before being audited */
+	pppRoleEntry victim;				/* content of the evicted entry, so that
+										 * an aborted lock can put it back */
 } pppEviction;
 
 typedef struct pppSharedState
@@ -182,6 +202,11 @@ extern void ppp_secure_zero(void *p, size_t len);
 extern void ppp_policy_init(void);		/* installe check_password_hook */
 
 /* ---- lockout.c --------------------------------------------------------- */
+/*
+ * Hash key of a role name, truncated like the server does for
+ * port->user_name (plain byte truncation to NAMEDATALEN - 1), zero-padded.
+ */
+extern void ppp_make_key(pppRoleKey *key, const char *rolename);
 extern void ppp_lockout_init(void);		/* installe ClientAuthentication_hook */
 extern void ppp_lockout_shmem_init(void); /* appelé depuis shmem_startup_hook */
 /* caller holds ppp_shared->lock exclusively; NULL when no room is left */

@@ -80,8 +80,8 @@ d'administration sont `SECURITY DEFINER` et vérifient l'appartenance).
 | grace_period | interval | '7 days' | VALID UNTIL = changed_at + max_age + grace_period |
 | warn_before | interval | '14 days' | alerte (audit + NOTIFY) quand expires_at − now() < warn_before |
 | max_failures | int | 5 | 0 = verrouillage désactivé |
-| failure_window | interval | '15 minutes' | fenêtre de comptage des échecs |
-| lock_duration | interval NULL | '30 minutes' | NULL = déverrouillage manuel uniquement |
+| failure_window | interval | '15 minutes' | fenêtre de comptage des échecs ; 0 = pas de fenêtre, sinon ≥ 1 s (CHECK) |
+| lock_duration | interval NULL | '30 minutes' | NULL = déverrouillage manuel uniquement ; ≥ 1 s (CHECK) |
 | created_at / updated_at | timestamptz | now() | |
 
 ### 3.2 `role_profile`
@@ -194,13 +194,16 @@ Règles communes à l'API :
   `lock_role`, `unlock_role`, `create_rotation_pair` (rôles de la paire déjà
   existants **et** `group_role` : le `GRANT group_role TO role_a/role_b`
   est exécuté en `SECURITY DEFINER`) ni `switch_rotation_pair`
-  (`_require_target_allowed()`, SQLSTATE `42501`). Est privilégié un rôle qui
-  a `SUPERUSER`, `REPLICATION` ou `BYPASSRLS`, un rôle prédéfini `pg_*`
+  (`_require_target_allowed()`, SQLSTATE `42501`). Est privilégié en lui-même
+  (`_is_privileged(oid)`, prédicat unique) un rôle qui a `SUPERUSER`,
+  `REPLICATION` ou `BYPASSRLS`, un rôle prédéfini `pg_*`
   (`pg_execute_server_program`, `pg_write_server_files`… ; `pg_database_owner`
   est exclu : tout propriétaire de base en est membre implicite et il
-  n'apporte rien au-delà de la propriété), un rôle membre, même indirect,
-  d'un tel rôle (`SET ROLE` / `INHERIT` en donnent les privilèges), ou, sur
-  PostgreSQL ≤ 15, un rôle `CREATEROLE` ;
+  n'apporte rien au-delà de la propriété) ou, sur PostgreSQL ≤ 15, un rôle
+  `CREATEROLE`. Une cible est refusée si elle est privilégiée ou membre, même
+  indirect, d'un rôle privilégié (`SET ROLE` / `INHERIT` en donnent les
+  privilèges) : le même prédicat s'applique à la cible et à chacun de ses
+  ancêtres ;
 - `assign_profile`, `unassign_profile` et `alter_profile` ne sont **pas**
   soumises à `_require_target_allowed()` : un membre de `pass_policy_admin`
   agit sur tous les rôles LOGIN, superutilisateurs compris, par les profils
@@ -276,7 +279,7 @@ Algorithme :
 2. état de l'extension (`ppp_require_extension()` → `ppp_extension_state()`, avant toute élévation) : absente → règle ci-dessous, sans session SPI ; présente mais non fiable (schéma `pass_policy` absent, ou dont le propriétaire n'est pas superutilisateur) → ERROR `PPP-004` (« pg_pass_policy schema is not trusted », SQLSTATE `55000`, DETAIL sur le propriétaire), jamais d'acceptation sans politique, sans session SPI ; installée et fiable → ouvrir la session SPI élevée et charger le profil effectif : `SELECT * FROM pass_policy.effective_profile($1)` (si le schéma n'existe pas dans cette base → **ne rien bloquer**, juste `ereport(WARNING)` une fois par session : l'extension n'est installée que dans `pg_pass_policy.database` ; **ATTENTION** : le hook s'exécute dans la base courante de la session, pas dans `pg_pass_policy.database`. Décision : la politique n'est appliquée que lorsque `current_database() = ppp_database` **ou** si la table est accessible localement ; en dehors, refuser `ALTER ROLE … PASSWORD` (et `CREATE ROLE … PASSWORD`) avec l'ERROR `PPP-003` (« password changes must be made while connected to database X ») si `ppp_enabled`. Ce comportement est contrôlé par le GUC `pg_pass_policy.enforce_database` (bool, défaut on ; off = simple WARNING, une fois par session) ;
 3. si `password_type != PASSWORD_TYPE_PLAINTEXT` : `reject_prehashed` → ERROR `PPP-001` ; vérificateur MD5 et `pg_pass_policy.require_scram` → ERROR `PPP-002` ; sinon enregistrer sans vérification de complexité (seul `min_age` est contrôlé). Pour un mot de passe en clair, `PPP-002` est aussi levé si `require_scram` et `password_encryption = md5` ;
 4. vérifications de complexité (ordre et codes) : `PPP-010` longueur min, `PPP-011` longueur max, `PPP-012` classes (min_classes), `PPP-013` min_lower, `PPP-014` min_upper, `PPP-015` min_digit, `PPP-016` min_special, `PPP-017` contient le nom du rôle, `PPP-018` dictionnaire, `PPP-019` répétitions, `PPP-020` caractères non imprimables / espace en début-fin. Codes hors complexité : `PPP-001` pré-haché refusé, `PPP-002` MD5 refusé par `require_scram`, `PPP-003` changement hors de `pg_pass_policy.database` ;
-5. `min_age` : `PPP-030` si `now() - password_changed_at < min_age` (sauf superutilisateur appelant, ignoré si `must_change`) ; `role_state` cherché par OID uniquement (rôle existant) ; la date retenue est la plus récente entre `role_state.password_changed_at` et la dernière ligne `password_history` sans OID (`role_oid IS NULL`) du même nom, écrite par `CREATE ROLE … PASSWORD` avant que `run_maintenance()` crée `role_state` ;
+5. `min_age` : `PPP-030` si `now() - password_changed_at < min_age` (sauf superutilisateur appelant, ignoré si `must_change`) ; pour un rôle existant, les étapes 5 et 6 ne sont faites que si l'appelant peut changer son mot de passe (superutilisateur, le rôle lui-même, ou `PPP_MAY_SET_PASSWORD_OF()` de `compat.h` : `is_admin_of_role()` sur PG ≥ 16, `CREATEROLE` et cible non superutilisateur sur PG ≤ 15), droits lus avant l'élévation ; sinon elles sont sautées en silence (pas d'oracle `PPP-030`/`PPP-031`), la complexité reste contrôlée. Défense en profondeur : `CreateRole()` et `AlterRole()` vérifient l'existence et les droits avant d'appeler le hook (sources 13.2, 16.4, 17beta1) ; `role_state` cherché par OID uniquement (rôle existant) ; la date retenue est la plus récente entre `role_state.password_changed_at` et la dernière ligne `password_history` sans OID (`role_oid IS NULL`) du même nom, écrite par `CREATE ROLE … PASSWORD` avant que `run_maintenance()` crée `role_state` ;
 6. historique : mot de passe actuel (`pg_authid`) puis chaque vérificateur des `history_count` derniers (l'actuel compris, et plus récents que `history_days`), `scram_verify_plain_password(username, password, verifier)` → `PPP-031` si égal ; vérificateurs MD5 : comparés via `pg_md5_encrypt`. Pour un rôle existant : lignes de son OID **et** lignes `role_oid IS NULL` de son nom (`CREATE ROLE … PASSWORD` pas encore rattaché par `run_maintenance()`), jamais celles d'un autre OID ; pour un rôle pas encore créé (`CREATE ROLE`), par nom parmi les seules lignes `role_oid IS NULL` ;
 7. calcul du nouveau vérificateur : `encrypt_password(PASSWORD_TYPE_SCRAM_SHA_256, username, shadow_pass)` (PG 14-18 : `libpq/crypt.h`) ; si `password_type == PLAINTEXT` ; sinon `shadow_pass` tel quel ;
 8. SPI `SELECT pass_policy.record_password_change($1, $2)` ;
@@ -302,13 +305,13 @@ remplie par le worker.
 static void ppp_client_auth_hook(Port *port, int status);
 ```
 
-1. chaîner d'abord au hook précédent (sauf si on va refuser) ;
-2. si `!ppp_enabled` ou rôle exempt → sortir ;
+1. si `!ppp_enabled` ou rôle exempt → chaîner au hook précédent et sortir ;
+2. sinon le hook précédent est appelé après l'étape 8, **avant** le FATAL de l'étape 5 (un module chargé avant nous, `auth_delay` par exemple, voit toujours la tentative et son statut réel) ;
 3. si `status == STATUS_ERROR` : le rôle existe-t-il (`get_role_oid`) ?
 4. `LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE)` ; chercher `port->user_name` dans `ppp_role_hash` ; si absent **et** `status == STATUS_ERROR` → créer avec les paramètres par défaut (`ppp_shared->default_*`) en mode « comptage » (`ppp_enter_role(…, PPP_ENTER_COUNT, …)`, voir « Hash plein » ci-dessous) ; faute de place → `ereport(LOG)` et continuer sans compter (un verrou existant reste appliqué : il a toujours une entrée) ; `role_missing` reçoit le résultat de l'étape 3 à la création **et à chaque échec** (un rôle créé après coup perd le drapeau), et est effacé par un succès ;
 5. si `locked_until > now` (ou `DT_NOEND`) → `ereport(FATAL, (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION), errmsg("role \"%s\" is locked by pg_pass_policy"), errdetail("locked until %s")))` — **même si status == STATUS_OK** ;
 6. si `status == STATUS_OK` → `failed_count = 0` ;
-7. sinon (`STATUS_ERROR` uniquement, voir §11) : si la fenêtre est écoulée (`ppp_window_elapsed()`) → repartir à 0 ; incrémenter ; si `failed_count >= max_failures` et `max_failures > 0` → `locked_until = now + lock_duration` (ou `DT_NOEND`), `lock_pending_audit = true`, `ereport(LOG, "pg_pass_policy: role \"%s\" locked after %d failed attempts")` ;
+7. sinon (`STATUS_ERROR` uniquement, voir §11) : si la fenêtre est écoulée (`ppp_window_elapsed()`) → repartir à 0 ; incrémenter ; si `failed_count >= max_failures` et `max_failures > 0` → `locked_until = now + lock_duration` (ou `DT_NOEND`), `lock_pending_audit = true`, `audit_locked_until = locked_until`, `ereport(LOG, "pg_pass_policy: role \"%s\" locked after %d failed attempts")` ;
 8. `LWLockRelease`.
 
 **Noms inexistants.** Ils sont comptés et « verrouillés » exactement comme les
@@ -372,7 +375,9 @@ en file pendant la transaction (annulées par `ROLLBACK [TO SAVEPOINT]`) :
   maintien du LWLock exclusif, en mode PRIORITY : entre la recherche de
   place et l'écriture, aucune autre insertion (hook, autre `lock_role`,
   rechargement du worker) ne peut prendre la place. Faute de place, les
-  verrous déjà appliqués par cet appel sont défaits et `ERROR 53400`
+  verrous déjà appliqués par cet appel sont défaits (dans l'ordre inverse :
+  contenu antérieur restauré, entrées créées retirées et les entrées
+  qu'elles avaient évincées réinsérées, `pppEviction.victim`) et `ERROR 53400`
   « cannot lock role "x": pg_pass_policy shared memory is full » est levée :
   la transaction est annulée (`role_state`, audit), `lock_role()` échoue
   visiblement. Une transaction sans `PPP_OP_LOCK` ne prend pas le LWLock à
@@ -402,7 +407,13 @@ Le worker, à chaque tour, parcourt le hash : écrit les lignes d'audit
 `auth_failed` / `role_locked` en attente (`lock_pending_audit`) et copie
 `locked_until` vers `role_state` dans une transaction dédiée, puis
 **acquitte la shmem seulement après le COMMIT** (`pending_failures`
-décrémenté, `lock_pending_audit` effacé si `locked_until` n'a pas changé) ;
+décrémenté, `lock_pending_audit` effacé si `audit_locked_until` n'a pas
+changé). Le `role_locked` d'un verrou automatique est écrit avec
+`audit_locked_until` même si le verrou a été levé (`unlock_role()`) ou
+remplacé (`lock_role()`) avant le passage du worker : ni `PPP_OP_UNLOCK`, ni
+`PPP_OP_LOCK`, ni le rechargement n'effacent `lock_pending_audit` ; la copie
+vers `role_state` n'est faite que si `locked_until = audit_locked_until`
+(sinon `details.lifted_before_audit = true`) ;
 dans une seconde transaction il efface les verrous expirés déjà journalisés
 (en gardant les échecs comptés après l'expiration), purge les entrées
 `INACTIVE`, les compteurs sans fenêtre (`failure_window` ≤ 0) dont le dernier
@@ -496,7 +507,7 @@ basic ou en-tête reverse-proxy (`REMOTE_USER`), rôle PG dédié membre de
 - `role_state` porte une contrainte UNIQUE/PK sur `role_oid` (le worker fait `ON CONFLICT (role_oid)`), et les colonnes `role_name`, `locked_until`, `locked_by`, `lock_reason`.
 - `lock_role` / `unlock_role` mettent à jour **d'abord** `role_state` puis la shmem : `run_maintenance()` appelle `shmem_reload()` et le worker réinjecte `role_state.locked_until` à chaque rechargement, donc un `shmem_unlock_role` sans mise à jour de `role_state` serait annulé au tour suivant.
 - Purge des rôles disparus : `role_profile`, `role_state`, `password_history`, `rotation_pair`.
-- `audit()` : `actor = 'worker'` quand `pg_backend_pid()` est le pid du worker (via `worker_status()`), sinon `session_user`.
+- `audit()` : `actor = 'worker'` quand `pg_backend_pid()` est le pid du worker (via `_worker_pid()` depuis la (revue finale) E9, `worker_status()` auparavant), sinon `session_user`.
 - Le hook d'authentification ne compte pas `STATUS_EOF` (client parti avant d'envoyer le mot de passe) : seuls les échecs réels (`STATUS_ERROR`) comptent.
 - `failure_window` ≤ 0 = pas de fenêtre (les échecs s'additionnent jusqu'au prochain succès).
 - Un superutilisateur peut être verrouillé : documenter `pg_pass_policy.exempt_roles = 'postgres'` dans le README.
@@ -567,3 +578,14 @@ basic ou en-tête reverse-proxy (`REMOTE_USER`), rôle PG dédié membre de
 - (code-review 2) X2 — `lock_role(role name, duration interval DEFAULT NULL, reason text DEFAULT NULL)` renvoie `timestamptz` : le `locked_until` posé (`infinity` pour un verrou manuel). `cli/src` et `web/app` appellent la fonction sans lire son résultat (`execute`) : compatibles. Tests : `60_lock_unlock` (`= 'infinity'`, `= now() + interval '1 second'`), `70_maintenance`.
 - (code-review 2) X3 — `lock_role()`, `unlock_role()`, `expire_password()` et `_ensure_state()` rafraîchissent `role_state.role_name` (nom courant lu dans `pg_authid`). L'étape f de `run_maintenance()` (déverrouillage automatique) prend le nom dans `pg_authid` (jointure par OID) pour `_shmem('unlock')`, l'audit `role_unlocked` et la ligne `role_state` ; l'étape a0 renommait déjà `role_state.role_name` plus tôt dans la même passe, la jointure rend l'étape f indépendante de cet ordre. Test : `70_maintenance` (`regress_ren1` → `regress_ren4`, puis `regress_carol` verrouillé 3 s, renommé `regress_dave`, verrou réinjecté par le worker sous le nouveau nom, levé par `run_maintenance()` : shmem, audit et `role_state` au nom `regress_dave`).
 - (code-review 3) `assign_profile()` et `unassign_profile()` appliquent `_require_target_allowed()` comme les autres actions : un admin non superutilisateur ne peut pas changer le profil d'un rôle privilégié.
+- (revue finale) Sécurité, PG ≤ 15 — `_require_target_allowed()` : la branche transitive (rôles dont la cible est membre) ne testait pas `CREATEROLE`, alors que la branche directe le faisait ; un admin non superutilisateur pouvait créer une paire sur un groupe membre d'un rôle `CREATEROLE`, puis `SET ROLE` vers lui et s'accorder `pg_execute_server_program`. Prédicat unique `_is_privileged(oid) RETURNS bool` (`STABLE`), appliqué à la cible et à chacun de ses ancêtres (§4). Le filtre d'affichage `_PRIVILEGED_ROLE` de `web/app/db.py`, copie de l'ancien prédicat, a le même oubli (simple affichage : l'extension refuse et l'erreur est montrée). Test : `90_privileges` (`createrole_rule`, `createrole_member_rule`, `createrole_group_rule`, écrits indépendamment de la version).
+- (revue finale) E1 — l'oracle `CREATE ROLE <existant> PASSWORD …` (« already exists » contre `PPP-031`) n'existe pas : `CreateRole()` teste l'existence (42710) et `AlterRole()` les droits **avant** d'appeler `check_password_hook` (vérifié dans les sources 13.2, 16.4 et 17beta1). Défense en profondeur ajoutée tout de même : pour un rôle existant, historique et `min_age` ne sont contrôlés que si l'appelant peut changer ce mot de passe (`PPP_MAY_SET_PASSWORD_OF()`, `compat.h`, §6.2 étape 5), sinon sautés en silence ; la complexité est toujours contrôlée (elle ne renseigne que sur le candidat). Test : `90_privileges` (`create_existing_current`, `create_existing_weak` : 42710 ; `alter_other_current` : 42501 sur PG ≥ 16, `PPP-031` sur PG ≤ 15 où `CREATEROLE` peut de toute façon changer ce mot de passe).
+- (revue finale) E2 — `lock_duration` < 1 s devenait 0 après `::int4` (`locked_until = now`, verrou jamais effectif) et un `failure_window` < 1 s « pas de fenêtre ». Contraintes `CHECK (lock_duration >= '1 second')` et `CHECK (failure_window = '0' OR failure_window >= '1 second')` ; le worker borne en plus à `[1, 2^31 − 1]` (`PPP_SQL_WINDOW_SECS`, `PPP_SQL_LOCK_SECS`, `CASE` explicite : `GREATEST()` ignore les NULL et transformerait le −1 du verrou manuel). Test : `10_profile`.
+- (revue finale) E3 — `PPP_OP_UNLOCK` effaçait `lock_pending_audit` : un verrou automatique levé par `unlock_role()` avant le passage du worker n'était jamais audité. Nouveau champ `pppRoleEntry.audit_locked_until` (verrou à journaliser) ; `lock_pending_audit` n'est plus effacé par le déverrouillage, par `lock_role()` ni par le rechargement ; le worker écrit `role_locked` avec cette valeur et ne la recopie dans `role_state` que si le verrou est toujours en place (§6.3). Limite inchangée : un second verrou automatique posé avant le passage du worker remplace le premier, qui n'est pas audité. Test : `hashfull.sh` (`regress_e3` : verrou auto, `unlock_role()`, tour du worker → `role_locked` et `role_unlocked`, `role_state` non verrouillé).
+- (revue finale) E4 — le hook d'authentification appelle le hook précédent avant de lever le FATAL « locked » (après `LWLockRelease`), et non plus après (code jamais atteint pour un rôle verrouillé).
+- (revue finale) E5 — annulation de `ppp_apply_lock_ops()` faute de place : l'entrée évincée pour créer un verrou annulé était perdue (compteur d'échecs, échecs non audités). `ppp_enter_role()` copie la victime dans `pppEviction.victim` et l'annulation la réinsère (ordre inverse, la place libérée par le retrait de l'entrée créée garantit l'insertion). Choisi plutôt qu'un décompte préalable des places : restitution exacte, sans second parcours du hash. Test : `hashfull.sh` (verrou de A puis B avec une seule place évincable : ERROR 53400, compteur de `regress_l2` intact, verrou au 5e échec).
+- (revue finale) E6 — `_shmem()` ne dégrade plus en WARNING les erreurs de `'lock'` et `'unlock'` : `lock_role()` validait `role_state` et l'audit alors que la shmem n'avait rien reçu (bibliothèque retirée de `shared_preload_libraries`, par exemple : fail-open). `unlock_role()` échoue aussi (cohérence `role_state`/shmem ; l'étape f de `run_maintenance()` également). `'reload'` et `'reset'` gardent le WARNING. Test : `lockout.sh` (redémarrage avec `shared_preload_libraries = ''`) ; impossible en pg_regress, dont l'instance précharge toujours la bibliothèque.
+- (revue finale) E7 — valeurs par défaut du verrouillage (5 / 900 / 1800) définies une seule fois (`PPP_DEFAULT_*`, `pg_pass_policy.h`) et initialisées à un seul endroit (`ppp_shmem_startup()`, avec la première demande de rechargement) ; `ppp_lockout_shmem_init()` ne crée plus que le hash.
+- (revue finale) E8 — `ppp_make_key()` exportée (`pg_pass_policy.h`) et utilisée par `ppp_ack_pending()` ; `ppp_text_datum()` supprimée.
+- (revue finale) E9 — `_audit()` n'appelle plus `worker_status()` (LWLock, tuplestore, sous-transaction du bloc `EXCEPTION`) pour chaque ligne : nouvelle fonction **C** `_worker_pid() RETURNS int` (`ppp_worker_pid`, lecture de `ppp_shared->worker_pid` sous LWLock partagé, NULL si le worker ne tourne pas) comparée à `pg_backend_pid()`. Sans bibliothèque préchargée, `_audit()` lève désormais l'erreur de chargement au lieu de l'ignorer (comme toute fonction C de l'extension).
+- (revue finale) E10 — couvert par le constat de sécurité (`_is_privileged()`).

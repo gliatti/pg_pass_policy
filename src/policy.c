@@ -1212,21 +1212,26 @@ ppp_extension_absent(const char *username)
 /*
  * Steps 3 to 8 of SPEC 6.2, run inside the single SPI session opened by the
  * hook once the extension is known to be installed and trusted (step 2).
- * caller_is_super is superuser() of the caller, read before that session
- * switched to the bootstrap superuser.
+ * caller_is_super is superuser() of the caller, roleid the OID of the
+ * target role (InvalidOid for CREATE ROLE) and may_check_history whether
+ * the caller may change its password; all three are read before that
+ * session switched to the bootstrap superuser.  When may_check_history is
+ * false, the minimum age and history checks are skipped silently: their
+ * answer (PPP-030, PPP-031) would tell the caller something about the
+ * passwords of a role he cannot manage, and PostgreSQL refuses the command
+ * anyway.  The complexity checks only depend on the candidate password and
+ * always run.
  */
 static void
 ppp_apply_policy(const char *username, const char *shadow_pass,
 				 PasswordType password_type, bool caller_is_super,
-				 MemoryContext cxt)
+				 Oid roleid, bool may_check_history, MemoryContext cxt)
 {
 	pppProfile	prof;
-	Oid			roleid;
 	char	   *verifier;
 	const char *code;
 
 	ppp_load_effective_profile(username, &prof, cxt);
-	roleid = get_role_oid(username, true);
 
 	if (password_type != PASSWORD_TYPE_PLAINTEXT)
 	{
@@ -1235,7 +1240,8 @@ ppp_apply_policy(const char *username, const char *shadow_pass,
 			ppp_reject(username, "PPP-001", &prof, true);
 		if (password_type == PASSWORD_TYPE_MD5 && ppp_require_scram)
 			ppp_reject(username, "PPP-002", &prof, true);
-		if (!caller_is_super && ppp_min_age_violated(username, roleid, &prof))
+		if (may_check_history && !caller_is_super &&
+			ppp_min_age_violated(username, roleid, &prof))
 			ppp_reject(username, "PPP-030", &prof, true);
 		verifier = pstrdup(shadow_pass);
 	}
@@ -1247,7 +1253,7 @@ ppp_apply_policy(const char *username, const char *shadow_pass,
 		/* steps 4 to 6 */
 		code = ppp_evaluate_plain(username, roleid, shadow_pass, &prof,
 								  ppp_superuser_bypass && caller_is_super,
-								  true, caller_is_super);
+								  may_check_history, caller_is_super);
 		if (code != NULL)
 			ppp_reject(username, code, &prof, true);
 
@@ -1284,10 +1290,24 @@ ppp_check_password_hook(const char *username, const char *shadow_pass,
 			/* step 2, without SPI; PPP-004 if untrusted */
 			if (ppp_require_extension(false) == PPP_EXT_TRUSTED)
 			{
+				/*
+				 * Read with the caller's identity: may the caller change the
+				 * password of this existing role?  PostgreSQL checks it
+				 * before calling the hook; this only makes sure that the
+				 * history and min_age checks can never become an oracle
+				 * should a caller of check_password_hook ever skip that
+				 * check (SPEC 6.2, step 5).
+				 */
+				Oid			roleid = get_role_oid(username, true);
+				bool		may_check_history = caller_is_super ||
+					!OidIsValid(roleid) || roleid == save_userid ||
+					PPP_MAY_SET_PASSWORD_OF(save_userid, roleid);
+
 				/* steps 3 to 8, in one elevated SPI session */
 				ppp_spi_begin(&st);
 				ppp_apply_policy(username, shadow_pass, password_type,
-								 caller_is_super, cxt);
+								 caller_is_super, roleid, may_check_history,
+								 cxt);
 				ppp_spi_end(&st);
 			}
 			else

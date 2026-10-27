@@ -235,4 +235,23 @@ check_eq "le serveur répond après des échecs sur un rôle inexistant" "1" "$o
 n=$(grep -c 'pg_pass_policy: worker .* failed' "$PPP_TMP/server.log" || true)
 check_eq "aucun échec de cycle du worker dans le log" "0" "$n"
 
+# --- bibliothèque retirée de shared_preload_libraries : lock_role échoue -----
+# Sans préchargement, shmem_lock_role() ne peut pas écrire en mémoire partagée
+# (le chargement de la bibliothèque échoue) : lock_role() et unlock_role()
+# doivent échouer et annuler leur transaction, et non valider role_state et
+# l'audit avec un simple WARNING (fail-open). Impossible en pg_regress, dont
+# l'instance précharge toujours la bibliothèque.
+echo "shared_preload_libraries = ''" >>"$PPP_TMP/data/postgresql.conf"
+"$PPP_BINDIR/pg_ctl" -D "$PPP_TMP/data" -l "$PPP_TMP/server.log" -o "-p $PPP_PORT" -w -t 60 restart >/dev/null
+audit0=$(psql_admin "SELECT count(*) FROM pass_policy.audit_log WHERE role_name = 'regress_lock'")
+out=$(psql_admin "SELECT pass_policy.lock_role('regress_lock', NULL, 'no preload')" 2>&1) && rc=0 || rc=$?
+check_eq "sans préchargement : lock_role échoue" "1" "$( [ "$rc" -ne 0 ] && echo 1 || echo 0)"
+check_contains "sans préchargement : ERROR explicite" "ERROR: .*shared_preload_libraries" "$out"
+out=$(psql_admin "SELECT count(*) FROM pass_policy.role_state WHERE role_name = 'regress_lock' AND locked_until IS NOT NULL")
+check_eq "sans préchargement : role_state non verrouillé (transaction annulée)" "0" "$out"
+out=$(psql_admin "SELECT count(*) FROM pass_policy.audit_log WHERE role_name = 'regress_lock'")
+check_eq "sans préchargement : aucun audit role_locked" "$audit0" "$out"
+out=$(psql_admin "SELECT pass_policy.unlock_role('regress_lock')" 2>&1) && rc=0 || rc=$?
+check_eq "sans préchargement : unlock_role échoue aussi" "1" "$( [ "$rc" -ne 0 ] && echo 1 || echo 0)"
+
 ppp_finish

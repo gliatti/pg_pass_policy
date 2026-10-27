@@ -57,6 +57,28 @@ out=$(psql_admin "SELECT failed_count FROM pass_policy.failed_attempts() WHERE r
 check_eq "failed_attempts() : compteur du vrai rôle = 5" "5" "$out"
 psql_admin "SELECT pass_policy.unlock_role('regress_bf')" >/dev/null
 
+# --- verrou automatique levé avant le passage du worker : audit conservé -----
+# unlock_role() arrive avant que le worker ait écrit role_locked : le verrou
+# doit être audité quand même (role_locked ET role_unlocked), sans être recopié
+# dans role_state (le rôle reste déverrouillé).
+psql_admin "CREATE ROLE regress_e3 LOGIN PASSWORD '$GOOD'"
+for i in 1 2 3 4 5; do psql_as regress_e3 "$BAD" >/dev/null || true; done
+out=$(psql_as regress_e3 "$GOOD") || true
+check_contains "regress_e3 verrouillé automatiquement (5 échecs)" "is locked by pg_pass_policy" "$out"
+psql_admin "SELECT pass_policy.unlock_role('regress_e3')" >/dev/null
+kick || fail "pas de tour du worker après unlock_role(regress_e3)"
+out=$(psql_admin "SELECT string_agg(event_type || ':' || coalesce(details->>'locked_by', details->>'by', '?'), ',' ORDER BY event_type)
+                    FROM pass_policy.audit_log
+                   WHERE role_name = 'regress_e3' AND event_type IN ('role_locked', 'role_unlocked')")
+check_eq "audit : role_locked (auto) ET role_unlocked (manual)" "role_locked:auto,role_unlocked:manual" "$out"
+out=$(psql_admin "SELECT details->>'lifted_before_audit' FROM pass_policy.audit_log
+                   WHERE role_name = 'regress_e3' AND event_type = 'role_locked'")
+check_eq "role_locked marqué lifted_before_audit" "true" "$out"
+out=$(psql_admin "SELECT count(*) FROM pass_policy.role_state WHERE role_name = 'regress_e3' AND locked_until IS NOT NULL")
+check_eq "role_state : le verrou levé n'est pas recopié" "0" "$out"
+out=$(psql_as regress_e3 "$GOOD" "SELECT current_user") || true
+check_eq "regress_e3 se connecte après le tour du worker" "regress_e3" "$out"
+
 # --- un nom inexistant est « verrouillé » comme un vrai rôle -----------------
 flood ghost_b 24
 for i in 1 2 3 4 5; do psql_as phantom "$BAD" >/dev/null || true; done
@@ -152,6 +174,31 @@ out=$(psql_as "$last" "$GOOD") || true
 check_contains "$last désormais refusé" "is locked by pg_pass_policy" "$out"
 out=$(psql_as regress_l1 "$GOOD" "SELECT current_user") || true
 check_eq "regress_l1 déverrouillé (entrée évincée sans conséquence)" "regress_l1" "$out"
+
+# --- lock_role annulé faute de place : la victime évincée est restaurée ------
+# Une seule entrée évincable (compteur vivant de regress_l2, déverrouillé puis
+# en échec) : une transaction verrouille A puis B ; A prend la place de
+# regress_l2, B n'en trouve pas → ERROR 53400, et l'annulation doit remettre
+# le compteur de regress_l2 (avant correction, il était perdu).
+psql_admin "SELECT pass_policy.unlock_role('regress_l2')" >/dev/null
+for i in 1 2; do psql_as regress_l2 "$BAD" >/dev/null || true; done
+check_eq "regress_l2 : compteur vivant = 2 (seule entrée évincable)" "2" \
+	"$(psql_admin "SELECT failed_count FROM pass_policy.failed_attempts() WHERE role_name = 'regress_l2'")"
+psql_admin "CREATE ROLE regress_e5a LOGIN PASSWORD '$GOOD'"
+psql_admin "CREATE ROLE regress_e5b LOGIN PASSWORD '$GOOD'"
+out=$(printf '%s\n' "BEGIN;" "SELECT pass_policy.lock_role('regress_e5a', NULL, 'e5');" \
+	"SELECT pass_policy.lock_role('regress_e5b', NULL, 'e5');" "COMMIT;" | psql_admin_script) && rc=0 || rc=$?
+check_contains "verrou de A puis B sans place pour B : ERROR 53400" "cannot lock role \"regress_e5b\": pg_pass_policy shared memory is full" "$out"
+check_eq "compteur de regress_l2 intact après l'annulation" "2" \
+	"$(psql_admin "SELECT failed_count FROM pass_policy.failed_attempts() WHERE role_name = 'regress_l2'")"
+check_eq "aucun verrou en shmem pour A ni B" "0" \
+	"$(psql_admin "SELECT count(*) FROM pass_policy.failed_attempts() WHERE role_name IN ('regress_e5a', 'regress_e5b')")"
+out=$(psql_as regress_e5a "$GOOD" "SELECT current_user") || true
+check_eq "A n'est pas verrouillé" "regress_e5a" "$out"
+for i in 3 4 5; do psql_as regress_l2 "$BAD" >/dev/null || true; done
+out=$(psql_as regress_l2 "$GOOD") || true
+check_contains "le compteur restauré mène au verrou au 5e échec" "is locked by pg_pass_policy" "$out"
+psql_admin "SELECT pass_policy.unlock_role('regress_l2')" >/dev/null
 
 # --- profils sur 15 rôles sur 16 : un 16e rôle sans profil est compté -------
 psql_admin "SELECT pass_policy.unlock_role(r) FROM unnest(ARRAY['victime', '$last']

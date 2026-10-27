@@ -70,6 +70,20 @@
 /* inactive entries without lock are purged after this delay */
 #define PPP_PURGE_AFTER_SECS	(24 * 60 * 60)
 
+/*
+ * Profile durations converted to whole seconds for the shared memory (see
+ * ppp_sync_reload): clamped to [1, INT_MAX], 0 = no window, -1 = manual
+ * unlock only.  GREATEST() ignores NULLs, hence the explicit CASE.
+ */
+#define PPP_SQL_WINDOW_SECS \
+	"(CASE WHEN p.failure_window > interval '0' " \
+	"THEN GREATEST(LEAST(extract(epoch FROM p.failure_window), 2147483647), 1) " \
+	"ELSE 0 END)::int4"
+#define PPP_SQL_LOCK_SECS \
+	"(CASE WHEN p.lock_duration IS NULL THEN -1 " \
+	"ELSE GREATEST(LEAST(extract(epoch FROM p.lock_duration), 2147483647), 1) " \
+	"END)::int4"
+
 /* copy of an entry with something to write to the tables */
 typedef struct pppPendingRow
 {
@@ -79,6 +93,7 @@ typedef struct pppPendingRow
 	int32		failed_count;
 	TimestampTz last_failure_at;
 	TimestampTz locked_until;
+	TimestampTz audit_locked_until; /* lock to audit (lock_pending_audit) */
 } pppPendingRow;
 
 /* lockout parameters of a role, read from the profiles */
@@ -151,12 +166,6 @@ ppp_worker_on_exit(int code, Datum arg)
 {
 	if (ppp_shared != NULL && ppp_shared->worker_pid == MyProcPid)
 		ppp_shared->worker_pid = 0;
-}
-
-static inline Datum
-ppp_text_datum(const char *s)
-{
-	return CStringGetTextDatum(s);
 }
 
 /*
@@ -270,6 +279,7 @@ ppp_sync_pending(void)
 		rows[nrows].failed_count = entry->failed_count;
 		rows[nrows].last_failure_at = entry->last_failure_at;
 		rows[nrows].locked_until = entry->locked_until;
+		rows[nrows].audit_locked_until = entry->audit_locked_until;
 		nrows++;
 	}
 	LWLockRelease(ppp_shared->lock);
@@ -286,7 +296,7 @@ ppp_sync_pending(void)
 			Datum		values[3];
 			char		nulls[3] = {' ', ' ', ' '};
 
-			values[0] = ppp_text_datum(r->rolename);
+			values[0] = CStringGetTextDatum(r->rolename);
 			values[1] = Int32GetDatum(r->pending_failures);
 			values[2] = TimestampTzGetDatum(r->last_failure_at);
 			if (r->last_failure_at == 0)
@@ -301,24 +311,46 @@ ppp_sync_pending(void)
 				elog(ERROR, "audit('auth_failed') returned SPI code %d", ret);
 		}
 
-		if (r->lock_pending_audit && r->locked_until != 0)
+		if (r->lock_pending_audit && r->audit_locked_until != 0)
 		{
-			Oid			argtypes[3] = {TEXTOID, TIMESTAMPTZOID, INT4OID};
-			Datum		values[3];
-			char		nulls[3] = {' ', ' ', ' '};
+			Oid			argtypes[4] = {TEXTOID, TIMESTAMPTZOID, INT4OID, BOOLOID};
+			Datum		values[4];
+			char		nulls[4] = {' ', ' ', ' ', ' '};
 
-			values[0] = ppp_text_datum(r->rolename);
-			values[1] = TimestampTzGetDatum(r->locked_until);	/* DT_NOEND = infinity */
+			/*
+			 * The lock was lifted (unlock_role()) or replaced (lock_role())
+			 * before this cycle: it is audited all the same, but role_state
+			 * must not be locked again with it.
+			 */
+			bool		still_locked = (r->locked_until == r->audit_locked_until);
+
+			values[0] = CStringGetTextDatum(r->rolename);
+			values[1] = TimestampTzGetDatum(r->audit_locked_until); /* DT_NOEND = infinity */
 			values[2] = Int32GetDatum(r->failed_count);
+			values[3] = BoolGetDatum(!still_locked);
 
 			ret = SPI_execute_with_args(
 										"SELECT pass_policy.audit('role_locked', $1, "
 										"pg_catalog.jsonb_build_object('locked_until', $2, 'failed_count', $3, "
 										"'locked_by', 'auto', "
-										"'reason', 'too many failed authentication attempts'))",
-										3, argtypes, values, nulls, false, 0);
+										"'reason', 'too many failed authentication attempts') "
+										"OPERATOR(pg_catalog.||) CASE WHEN $4 THEN "
+										"pg_catalog.jsonb_build_object('lifted_before_audit', true) "
+										"ELSE '{}'::pg_catalog.jsonb END)",
+										4, argtypes, values, nulls, false, 0);
 			if (ret != SPI_OK_SELECT)
 				elog(ERROR, "audit('role_locked') returned SPI code %d", ret);
+		}
+
+		if (r->lock_pending_audit && r->audit_locked_until != 0 &&
+			r->locked_until == r->audit_locked_until)
+		{
+			Oid			argtypes[2] = {TEXTOID, TIMESTAMPTZOID};
+			Datum		values[2];
+			char		nulls[2] = {' ', ' '};
+
+			values[0] = CStringGetTextDatum(r->rolename);
+			values[1] = TimestampTzGetDatum(r->audit_locked_until); /* DT_NOEND = infinity */
 
 			/* only existing roles get a role_state row */
 			ret = SPI_execute_with_args(
@@ -363,15 +395,16 @@ ppp_ack_pending(void)
 		pppRoleKey	key;
 		pppRoleEntry *entry;
 
-		memset(&key, 0, sizeof(key));
-		strlcpy(key.rolename, r->rolename, NAMEDATALEN);
+		ppp_make_key(&key, r->rolename);
 		entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key, HASH_FIND, NULL);
 		if (entry == NULL)
 			continue;
 		entry->pending_failures -= r->pending_failures;
 		if (entry->pending_failures < 0)
 			entry->pending_failures = 0;
-		if (r->lock_pending_audit && entry->locked_until == r->locked_until)
+		/* a lock set again since (other audit_locked_until) stays pending */
+		if (r->lock_pending_audit &&
+			entry->audit_locked_until == r->audit_locked_until)
 			entry->lock_pending_audit = false;
 	}
 	LWLockRelease(ppp_shared->lock);
@@ -521,10 +554,16 @@ ppp_sync_reload(void)
 	uint64		seq_snap;
 
 	/*
-	 * Durations are clamped to INT_MAX seconds (about 68 years) before the
-	 * int4 cast: a longer (legal) interval, or 'infinity', would otherwise
-	 * raise "integer out of range" at every cycle.  COALESCE comes first so
-	 * that NULL (manual unlock only) stays -1.
+	 * Durations (PPP_SQL_WINDOW_SECS, PPP_SQL_LOCK_SECS) are clamped to
+	 * INT_MAX seconds (about 68 years) before the int4 cast: a longer
+	 * (legal) interval, or 'infinity', would otherwise raise "integer out of
+	 * range" at every cycle.  They are also raised to at least one second:
+	 * the cast rounds, and a lock_duration under half a second would give
+	 * locked_until = now (a lock that never holds), a failure_window under
+	 * half a second 0 (no window at all).  The profile CHECK constraints
+	 * already refuse such values; this is defence in depth.  NULL
+	 * lock_duration (manual unlock only) stays -1, a zero failure_window
+	 * (no window) stays 0.
 	 */
 	/*
 	 * Read ppp_shared->lock_seq, then take a fresh snapshot for the queries
@@ -541,8 +580,8 @@ ppp_sync_reload(void)
 
 	/* profile "default" */
 	ret = SPI_execute("SELECT p.max_failures, "
-					  "LEAST(extract(epoch FROM p.failure_window), 2147483647)::int4, "
-					  "LEAST(COALESCE(extract(epoch FROM p.lock_duration), -1), 2147483647)::int4 "
+					  PPP_SQL_WINDOW_SECS ", "
+					  PPP_SQL_LOCK_SECS " "
 					  "FROM pass_policy.profile p WHERE p.name = 'default'",
 					  true, 1);
 	if (ret != SPI_OK_SELECT)
@@ -560,8 +599,8 @@ ppp_sync_reload(void)
 
 	/* roles with an assigned profile; current name taken from pg_roles */
 	ret = SPI_execute("SELECT COALESCE(r.rolname::text, rp.role_name), p.max_failures, "
-					  "LEAST(extract(epoch FROM p.failure_window), 2147483647)::int4, "
-					  "LEAST(COALESCE(extract(epoch FROM p.lock_duration), -1), 2147483647)::int4, "
+					  PPP_SQL_WINDOW_SECS ", "
+					  PPP_SQL_LOCK_SECS ", "
 					  "r.oid IS NOT NULL "
 					  "FROM pass_policy.role_profile rp "
 					  "JOIN pass_policy.profile p USING (profile_id) "
@@ -673,11 +712,12 @@ ppp_sync_reload(void)
 		if (entry->lock_inflight > 0 || entry->lock_seq > seq_snap)
 			continue;
 
-		if (entry->locked_until != locks[i].locked_until)
-		{
-			entry->locked_until = locks[i].locked_until;
-			entry->lock_pending_audit = false;
-		}
+		/*
+		 * lock_pending_audit is left alone: an automatic lock not yet
+		 * audited is written from audit_locked_until, and only copied to
+		 * role_state while locked_until still equals it.
+		 */
+		entry->locked_until = locks[i].locked_until;
 		entry->lock_from_state = true;
 	}
 
@@ -733,7 +773,6 @@ ppp_sync_reload(void)
 			entry->lock_inflight == 0 && entry->lock_seq <= seq_snap)
 		{
 			entry->locked_until = 0;
-			entry->lock_pending_audit = false;
 			entry->lock_from_state = false;
 			n_lifted++;
 		}

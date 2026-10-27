@@ -52,11 +52,6 @@ bool		ppp_enforce_database = true;
 pppSharedState *ppp_shared = NULL;
 HTAB	   *ppp_role_hash = NULL;
 
-/* default lockout parameters, mirroring the "default" profile of SPEC 3.1 */
-#define PPP_DEFAULT_MAX_FAILURES		5
-#define PPP_DEFAULT_FAILURE_WINDOW_SECS	(15 * 60)
-#define PPP_DEFAULT_LOCK_DURATION_SECS	(30 * 60)
-
 #ifdef PPP_HAVE_SHMEM_REQUEST_HOOK
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
 #endif
@@ -65,6 +60,7 @@ static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 void		_PG_init(void);
 
 PG_FUNCTION_INFO_V1(ppp_worker_status);
+PG_FUNCTION_INFO_V1(ppp_worker_pid);
 PG_FUNCTION_INFO_V1(ppp_is_exempt);
 
 
@@ -116,14 +112,23 @@ ppp_shmem_startup(void)
 
 	ppp_shared = ShmemInitStruct("pg_pass_policy shared state",
 								 sizeof(pppSharedState), &found);
+	/*
+	 * Only the first process to get here initialises the state: without
+	 * EXEC_BACKEND that is the postmaster, with EXEC_BACKEND every child
+	 * runs this hook again and finds the structure.  This is the single
+	 * initialisation site of the shared state (the hash table is created by
+	 * ppp_lockout_shmem_init(), below).
+	 */
 	if (!found)
 	{
 		memset(ppp_shared, 0, sizeof(pppSharedState));
 		ppp_shared->lock = &(GetNamedLWLockTranche(PPP_LWLOCK_TRANCHE))->lock;
+		/* safe defaults until the worker has read the "default" profile */
 		ppp_shared->default_max_failures = PPP_DEFAULT_MAX_FAILURES;
 		ppp_shared->default_failure_window_secs = PPP_DEFAULT_FAILURE_WINDOW_SECS;
 		ppp_shared->default_lock_duration_secs = PPP_DEFAULT_LOCK_DURATION_SECS;
-		pg_atomic_init_u32(&ppp_shared->reload_requested, 0);
+		/* force a first load of profiles and persisted locks */
+		pg_atomic_init_u32(&ppp_shared->reload_requested, 1);
 		ppp_shared->worker_pid = 0;
 		ppp_shared->worker_last_run = 0;
 		ppp_shared->worker_last_reload = 0;
@@ -353,7 +358,7 @@ ppp_extension_state(Oid *nspowner)
 	if (nspowner)
 		*nspowner = owner;
 
-	if (get_extension_schema(extoid) != nspoid)
+	if (ppp_get_extension_schema(extoid) != nspoid)
 		return PPP_EXT_UNTRUSTED;
 
 	return superuser_arg(owner) ? PPP_EXT_TRUSTED : PPP_EXT_UNTRUSTED;
@@ -458,6 +463,30 @@ ppp_worker_status(PG_FUNCTION_ARGS)
 	tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 
 	return (Datum) 0;
+}
+
+/*
+ * pass_policy._worker_pid() RETURNS int
+ *
+ * PID of the background worker, NULL when it is not running (or when the
+ * shared memory is not initialised).  Called by _audit() for every audit
+ * row: a single read under a shared lock, no tuplestore.
+ */
+Datum
+ppp_worker_pid(PG_FUNCTION_ARGS)
+{
+	pid_t		pid;
+
+	if (ppp_shared == NULL)
+		PG_RETURN_NULL();
+
+	LWLockAcquire(ppp_shared->lock, LW_SHARED);
+	pid = ppp_shared->worker_pid;
+	LWLockRelease(ppp_shared->lock);
+
+	if (pid == 0)
+		PG_RETURN_NULL();
+	PG_RETURN_INT32((int32) pid);
 }
 
 void

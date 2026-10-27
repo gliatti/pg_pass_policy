@@ -69,8 +69,12 @@ CREATE TABLE profile (
     grace_period      interval NOT NULL DEFAULT '7 days'     CHECK (grace_period >= interval '0'),
     warn_before       interval NOT NULL DEFAULT '14 days'    CHECK (warn_before >= interval '0'),
     max_failures      int NOT NULL DEFAULT 5   CHECK (max_failures >= 0),
-    failure_window    interval NOT NULL DEFAULT '15 minutes' CHECK (failure_window >= interval '0'),  -- 0 = no window (SPEC §11)
-    lock_duration     interval     DEFAULT '30 minutes' CHECK (lock_duration > interval '0'),
+    -- 0 = no window (SPEC §11).  Durations are handed to the shared memory in
+    -- whole seconds (worker.c): a non-zero window or a lock shorter than one
+    -- second would be rounded to 0 (no window / lock already expired).
+    failure_window    interval NOT NULL DEFAULT '15 minutes'
+                      CHECK (failure_window = interval '0' OR failure_window >= interval '1 second'),
+    lock_duration     interval     DEFAULT '30 minutes' CHECK (lock_duration >= interval '1 second'),
     created_at        timestamptz NOT NULL DEFAULT now(),
     updated_at        timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT profile_length_range CHECK (max_length >= min_length),
@@ -371,6 +375,17 @@ AS 'MODULE_PATHNAME', 'ppp_in_password_hook'
 LANGUAGE C VOLATILE PARALLEL RESTRICTED;
 COMMENT ON FUNCTION _in_password_hook() IS 'Internal: true while the pg_pass_policy password hook is running in this backend';
 
+/*
+ * Addition to SPEC §4: PID of the background worker (NULL when it is not
+ * running), read from shared memory under a shared LWLock.  Used by _audit()
+ * for every row, instead of worker_status() (tuplestore, hash size).
+ */
+CREATE FUNCTION _worker_pid()
+RETURNS int
+AS 'MODULE_PATHNAME', 'ppp_worker_pid'
+LANGUAGE C VOLATILE PARALLEL SAFE;
+COMMENT ON FUNCTION _worker_pid() IS 'Internal: PID of the pg_pass_policy background worker, NULL if not running';
+
 -------------------------------------------------------------------------------
 -- 5. Internal helpers
 -------------------------------------------------------------------------------
@@ -413,15 +428,29 @@ COMMENT ON FUNCTION _require_admin() IS 'Internal: raises an error unless sessio
  * A member of pass_policy_admin who is not superuser must not be able to
  * take over a more privileged role by rotating/expiring/locking it, nor to
  * grant such a role to the login roles of a rotation pair.  A role is
- * privileged when it has SUPERUSER, REPLICATION or BYPASSRLS, when it is a
- * predefined pg_* role (pg_execute_server_program runs OS commands,
- * pg_write_server_files writes any server file...; pg_database_owner is
- * excluded: every database owner is an implicit member and it carries no
- * privilege beyond the ownership already held), when it is a member, even
- * indirectly, of such a role (SET ROLE / INHERIT give its privileges), or,
- * on PostgreSQL <= 15, when it has CREATEROLE (which could then grant pg_*
- * roles and change the password of any non-superuser).
+ * privileged in itself (_is_privileged) when it has SUPERUSER, REPLICATION
+ * or BYPASSRLS, when it is a predefined pg_* role (pg_execute_server_program
+ * runs OS commands, pg_write_server_files writes any server file...;
+ * pg_database_owner is excluded: every database owner is an implicit member
+ * and it carries no privilege beyond the ownership already held), or, on
+ * PostgreSQL <= 15, when it has CREATEROLE (which could then grant pg_*
+ * roles and change the password of any non-superuser).  A target is refused
+ * when it is privileged itself or a member, even indirectly, of a
+ * privileged role (SET ROLE / INHERIT give its privileges): the same
+ * predicate is applied to the target and to every role it belongs to.
  */
+CREATE FUNCTION _is_privileged(p_oid oid)
+RETURNS bool
+LANGUAGE sql STABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+    SELECT coalesce((SELECT a.rolsuper OR a.rolreplication OR a.rolbypassrls
+                            OR (starts_with(a.rolname, 'pg_') AND a.rolname <> 'pg_database_owner')
+                            OR (a.rolcreaterole AND current_setting('server_version_num')::int < 160000)
+                       FROM pg_catalog.pg_authid a WHERE a.oid = p_oid), false)
+$$;
+COMMENT ON FUNCTION _is_privileged(oid) IS 'Internal: true if a role is privileged in itself (SUPERUSER, REPLICATION, BYPASSRLS, pg_*, CREATEROLE on PG <= 15)';
+
 CREATE FUNCTION _require_target_allowed(p_role name)
 RETURNS oid
 LANGUAGE plpgsql STABLE
@@ -430,7 +459,7 @@ AS $$
 DECLARE
     r record;
 BEGIN
-    SELECT a.oid, a.rolname, a.rolsuper, a.rolreplication, a.rolbypassrls, a.rolcreaterole INTO r
+    SELECT a.oid, a.rolname INTO r
       FROM pg_catalog.pg_authid a WHERE a.rolname = p_role;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'pg_pass_policy: role "%" does not exist', p_role
@@ -439,17 +468,14 @@ BEGIN
     IF coalesce((SELECT x.rolsuper FROM pg_catalog.pg_roles x WHERE x.rolname = session_user), false) THEN
         RETURN r.oid;
     END IF;
-    IF r.rolsuper OR r.rolreplication OR r.rolbypassrls
-       OR (starts_with(r.rolname, 'pg_') AND r.rolname <> 'pg_database_owner')
-       OR (r.rolcreaterole AND current_setting('server_version_num')::int < 160000)
+    IF pass_policy._is_privileged(r.oid)
        OR EXISTS (SELECT FROM pg_catalog.pg_authid x
                    WHERE x.oid <> r.oid
-                     AND (x.rolsuper OR x.rolreplication OR x.rolbypassrls
-                          OR (starts_with(x.rolname, 'pg_') AND x.rolname <> 'pg_database_owner'))
+                     AND pass_policy._is_privileged(x.oid)
                      AND pg_catalog.pg_has_role(r.oid, x.oid, 'MEMBER')) THEN
         RAISE EXCEPTION 'pg_pass_policy: only a superuser can manage privileged role "%"', p_role
               USING ERRCODE = 'insufficient_privilege',
-                    DETAIL = 'The role has, or is a member of a role having, SUPERUSER, REPLICATION, BYPASSRLS or predefined (pg_*) privileges.';
+                    DETAIL = 'The role has, or is a member of a role having, SUPERUSER, REPLICATION, BYPASSRLS, predefined (pg_*) or, on PostgreSQL 15 and older, CREATEROLE privileges.';
     END IF;
     RETURN r.oid;
 END
@@ -481,8 +507,16 @@ AS 'MODULE_PATHNAME', 'ppp_is_exempt'
 LANGUAGE C STABLE STRICT;
 COMMENT ON FUNCTION _is_exempt(text) IS 'Internal: true if the role is listed in pg_pass_policy.exempt_roles (same function as the C hooks)';
 
--- Calls to the C shared-memory functions must never break maintenance or
--- administration when the library/worker is unavailable: errors become WARNINGs.
+/*
+ * Calls to the C shared-memory functions.  'lock' and 'unlock' let their
+ * errors through: role_state (and the audit row) must never claim a lock or
+ * an unlock that the shared memory did not receive, e.g. when the library is
+ * not preloaded (fail-closed: lock_role() and unlock_role() fail and their
+ * transaction is rolled back).  'reload' and 'reset' only optimise or tidy
+ * up (the worker reloads at its next cycle anyway, a stale counter expires
+ * with its window): their failures are downgraded to WARNINGs so that they
+ * never break maintenance or administration.
+ */
 CREATE FUNCTION _shmem(p_op text, p_role text DEFAULT NULL, p_until timestamptz DEFAULT NULL)
 RETURNS bool
 LANGUAGE plpgsql
@@ -490,18 +524,25 @@ SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN
     CASE p_op
-        WHEN 'reload' THEN PERFORM pass_policy.shmem_reload();
         WHEN 'lock'   THEN PERFORM pass_policy.shmem_lock_role(p_role, p_until);
+                           RETURN true;
         WHEN 'unlock' THEN PERFORM pass_policy.shmem_unlock_role(p_role);
-        WHEN 'reset'  THEN PERFORM pass_policy.shmem_reset_failures(p_role);
+                           RETURN true;
+        ELSE NULL;
     END CASE;
+    BEGIN
+        CASE p_op
+            WHEN 'reload' THEN PERFORM pass_policy.shmem_reload();
+            WHEN 'reset'  THEN PERFORM pass_policy.shmem_reset_failures(p_role);
+        END CASE;
+    EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'pg_pass_policy: shared memory call "%" failed: %', p_op, SQLERRM;
+        RETURN false;
+    END;
     RETURN true;
-EXCEPTION WHEN OTHERS THEN
-    RAISE WARNING 'pg_pass_policy: shared memory call "%" failed: %', p_op, SQLERRM;
-    RETURN false;
 END
 $$;
-COMMENT ON FUNCTION _shmem(text, text, timestamptz) IS 'Internal: calls a shmem_* C function, downgrading failures to warnings';
+COMMENT ON FUNCTION _shmem(text, text, timestamptz) IS 'Internal: calls a shmem_* C function; lock/unlock errors are raised, reload/reset errors become warnings';
 
 -- Internal audit writer (no permission check: only called by trusted code).
 CREATE FUNCTION _audit(p_event_type text, p_role_name text, p_details jsonb DEFAULT '{}')
@@ -516,13 +557,10 @@ DECLARE
     v_payload text;
 BEGIN
     -- SPEC §11: actor = 'worker' when called by the background worker
-    BEGIN
-        IF pg_catalog.pg_backend_pid() = (SELECT w.pid FROM pass_policy.worker_status() w LIMIT 1) THEN
-            v_actor := 'worker';
-        END IF;
-    EXCEPTION WHEN OTHERS THEN
-        NULL;   -- library/shmem unavailable: keep session_user
-    END;
+    -- (_worker_pid() is NULL when the worker is not running)
+    IF pass_policy._worker_pid() IS NOT DISTINCT FROM pg_catalog.pg_backend_pid() THEN
+        v_actor := 'worker';
+    END IF;
 
     INSERT INTO pass_policy.audit_log
            (event_type, role_name, actor, database, client_addr, application_name, details)
@@ -1770,6 +1808,9 @@ GRANT SELECT (id, role_oid, role_name, changed_at) ON password_history
 -- read-only API; needed by the views (failed_attempts, worker_status)
 GRANT EXECUTE ON FUNCTION effective_profile(name), failed_attempts(), worker_status()
    TO pass_policy_viewer, pass_policy_admin;
+-- _is_privileged(): exposed so that clients (web, CLI) can filter their role
+-- lists with the very predicate _require_target_allowed() enforces
+GRANT EXECUTE ON FUNCTION _is_privileged(oid) TO pass_policy_viewer, pass_policy_admin;
 -- record_password_change(): no grant (called by the C hook as superuser only)
 
 GRANT EXECUTE ON FUNCTION
