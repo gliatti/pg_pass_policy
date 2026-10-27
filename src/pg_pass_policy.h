@@ -159,6 +159,22 @@ extern bool ppp_role_is_exempt(const char *rolename);
  * never be trusted.  Requires a transaction and catalog access.
  */
 extern bool ppp_extension_installed(void);
+
+/*
+ * Three-state variant used by the password hook and the SQL functions of
+ * policy.c: an extension that is installed but not trusted must make them
+ * fail (PPP-004) instead of silently applying no policy.  *nspowner
+ * (optional) receives the owner of schema PPP_SCHEMA, InvalidOid if none.
+ */
+typedef enum pppExtensionState
+{
+	PPP_EXT_ABSENT,				/* extension not installed in this database */
+	PPP_EXT_TRUSTED,			/* installed in PPP_SCHEMA, superuser owner */
+	PPP_EXT_UNTRUSTED			/* installed, but schema missing, elsewhere or
+								 * not owned by a superuser */
+} pppExtensionState;
+
+extern pppExtensionState ppp_extension_state(Oid *nspowner);
 /* efface une zone mémoire contenant un secret avant de la libérer */
 extern void ppp_secure_zero(void *p, size_t len);
 

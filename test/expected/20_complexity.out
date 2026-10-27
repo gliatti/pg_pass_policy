@@ -22,6 +22,23 @@ SELECT word FROM pass_policy.dictionary WHERE word = 'correct-horse9';
  correct-horse9
 (1 row)
 
+-- Le hook ne compare que le SHA-256 du mot de passe en minuscules à la colonne
+-- générée word_sha256 (octets bruts du mot, encodage du serveur, y compris
+-- pour une barre oblique inverse)
+SELECT pass_policy.load_dictionary(ARRAY['Back\Slash-Word9']) AS loaded_backslash;
+ loaded_backslash 
+------------------
+                1
+(1 row)
+
+SELECT bool_and(word_sha256 = sha256(convert_to(word, current_setting('server_encoding')))) AS digests_ok,
+       count(DISTINCT word_sha256) = count(*) AS digests_unique
+  FROM pass_policy.dictionary;
+ digests_ok | digests_unique 
+------------+----------------
+ t          | t
+(1 row)
+
 -- Audit avant les appels à check_password() (doit rester inchangé)
 CREATE TEMP TABLE audit_before AS
   SELECT count(*) AS n FROM pass_policy.audit_log
@@ -57,7 +74,8 @@ INSERT INTO cases VALUES
   (22, NULL, 'Abcdefg9!xyz'),                   -- exactement 12 caractères
   (23, NULL, 'Abcd9!xxxyz12'),                  -- exactement 3 répétitions
   (24, NULL, rpad('Ab9!', 128, 'xyZ7')),        -- exactement 128 caractères
-  (25, NULL, 'Mid space 9!Ok');                 -- espace interne autorisé
+  (25, NULL, 'Mid space 9!Ok'),                 -- espace interne autorisé
+  (26, 'PPP-018', 'BACK\slash-WORD9');            -- dictionnaire, mot avec « \ »
 -- (les vérificateurs pré-hachés ne sont pas des secrets : exclus)
 INSERT INTO ppp_test.secrets SELECT 'cplx' || id, pwd FROM cases
  WHERE expected IS DISTINCT FROM 'PPP-001';
@@ -91,7 +109,8 @@ SELECT id, expected, ppp_test.code(pass_policy.check_password('regress_cplx', pw
  23 |          | 
  24 |          | 
  25 |          | 
-(25 rows)
+ 26 | PPP-018  | PPP-018
+(26 rows)
 
 -- Les motifs de refus ne contiennent jamais le mot de passe
 SELECT count(*) AS reasons_with_password
@@ -141,7 +160,8 @@ SELECT id, expected,
  18 | PPP-020  | 28P01 PPP-020
  19 | PPP-001  | 28P01 PPP-001
  20 | PPP-001  | 28P01 PPP-001
-(20 rows)
+ 26 | PPP-018  | 28P01 PPP-018
+(21 rows)
 
 -- Format du message (préfixe stable PPP-xxx, aucun mot de passe)
 ALTER ROLE regress_cplx PASSWORD 'Ab9!xyz';

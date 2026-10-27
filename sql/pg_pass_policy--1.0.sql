@@ -124,9 +124,21 @@ CREATE INDEX password_history_role_idx ON password_history (role_oid, changed_at
 COMMENT ON TABLE password_history IS 'Previous password verifiers (SCRAM/MD5 hashes, never clear text) for anti-reuse';
 
 -- 3.5 dictionary
+/*
+ * word_sha256 = SHA-256 of the raw bytes of word (server encoding).  The C
+ * hook looks a candidate password up by the digest of its lower-cased form
+ * only: the clear text never reaches SQL and no word is read back.  The
+ * bytes are taken with decode(..., 'escape') (IMMUTABLE, no encoding
+ * conversion; backslashes doubled first) rather than convert_to(), which is
+ * only STABLE and cannot be used in a generated column, or textsend(), which
+ * converts to the client encoding.
+ */
 CREATE TABLE dictionary (
-    word text PRIMARY KEY CHECK (word = lower(word) AND word <> '')
+    word        text PRIMARY KEY CHECK (word = lower(word) AND word <> ''),
+    word_sha256 bytea NOT NULL
+                GENERATED ALWAYS AS (sha256(decode(replace(word, '\', '\\'), 'escape'))) STORED
 );
+CREATE UNIQUE INDEX dictionary_sha256_idx ON dictionary (word_sha256);
 COMMENT ON TABLE dictionary IS 'Blocklist of common passwords, stored in lower case';
 
 -- 3.6 audit_log
@@ -347,11 +359,11 @@ COMMENT ON FUNCTION worker_status() IS 'State of the pg_pass_policy background w
 /*
  * Addition to SPEC §4: true only while this backend is executing the
  * pg_pass_policy check_password_hook (static flag set by the C hook around
- * its SPI calls).  record_password_change() and audit() are callable by
- * PUBLIC because the hook runs in the session of whoever issues
- * ALTER/CREATE ROLE ... PASSWORD; without this guard any user could call
- * record_password_change() on himself and push back his own expiry without
- * changing his password.
+ * its SPI calls).  Defence in depth for record_password_change() and
+ * audit(): neither is granted to PUBLIC any more (the hook calls them as
+ * superuser), but should EXECUTE be granted by mistake, a user could
+ * otherwise call record_password_change() on himself and push back his own
+ * expiry without changing his password.
  */
 CREATE FUNCTION _in_password_hook()
 RETURNS bool
@@ -456,15 +468,103 @@ AS $$
 $$;
 COMMENT ON FUNCTION _guc_on(text, bool) IS 'Internal: reads a boolean GUC, with a default when it is undefined';
 
+/*
+ * Same rules as SplitIdentifierString(), used by ppp_role_is_exempt() in C:
+ * names separated by commas, whitespace (space, tab, CR, LF, FF) around
+ * them ignored, unquoted names down-cased (ASCII letters, as
+ * downcase_truncate_identifier() does in a multi-byte encoding) and ending
+ * at whitespace or a comma, "quoted" names kept as is with "" standing for
+ * one double quote, names truncated to 63 bytes.  Returns NULL when the
+ * syntax is invalid (the GUC check hook rejects such values anyway).
+ */
+CREATE FUNCTION _split_identifiers(p_list text)
+RETURNS text[]
+LANGUAGE plpgsql IMMUTABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+    v_ws     constant text := E' \t\n\r\f';
+    v_len    int := length(coalesce(p_list, ''));
+    v_pos    int := 1;
+    v_start  int;
+    v_name   text;
+    v_result text[] := '{}';
+BEGIN
+    -- leading whitespace; an empty (or blank) list is valid
+    WHILE v_pos <= v_len AND strpos(v_ws, substr(p_list, v_pos, 1)) > 0 LOOP
+        v_pos := v_pos + 1;
+    END LOOP;
+    IF v_pos > v_len THEN
+        RETURN v_result;
+    END IF;
+    LOOP
+        IF substr(p_list, v_pos, 1) = '"' THEN
+            -- quoted name: "" collapses to ", no down-casing
+            v_name := '';
+            v_pos := v_pos + 1;
+            LOOP
+                IF v_pos > v_len THEN
+                    RETURN NULL;                        -- mismatched quotes
+                END IF;
+                IF substr(p_list, v_pos, 1) = '"' THEN
+                    IF substr(p_list, v_pos + 1, 1) = '"' THEN
+                        v_name := v_name || '"';
+                        v_pos := v_pos + 2;
+                    ELSE
+                        v_pos := v_pos + 1;
+                        EXIT;
+                    END IF;
+                ELSE
+                    v_name := v_name || substr(p_list, v_pos, 1);
+                    v_pos := v_pos + 1;
+                END IF;
+            END LOOP;
+        ELSE
+            -- unquoted name: up to a comma or whitespace, ASCII down-cased
+            v_start := v_pos;
+            WHILE v_pos <= v_len AND substr(p_list, v_pos, 1) <> ','
+                  AND strpos(v_ws, substr(p_list, v_pos, 1)) = 0 LOOP
+                v_pos := v_pos + 1;
+            END LOOP;
+            IF v_pos = v_start THEN
+                RETURN NULL;                            -- empty unquoted name
+            END IF;
+            v_name := translate(substr(p_list, v_start, v_pos - v_start),
+                                'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz');
+        END IF;
+        -- trailing whitespace, then a comma or the end
+        WHILE v_pos <= v_len AND strpos(v_ws, substr(p_list, v_pos, 1)) > 0 LOOP
+            v_pos := v_pos + 1;
+        END LOOP;
+        -- truncate_identifier(): at most NAMEDATALEN - 1 bytes, whole characters
+        WHILE octet_length(v_name) > 63 LOOP
+            v_name := left(v_name, -1);
+        END LOOP;
+        v_result := v_result || v_name;
+        IF v_pos > v_len THEN
+            RETURN v_result;
+        END IF;
+        IF substr(p_list, v_pos, 1) <> ',' THEN
+            RETURN NULL;                                -- invalid syntax
+        END IF;
+        v_pos := v_pos + 1;
+        WHILE v_pos <= v_len AND strpos(v_ws, substr(p_list, v_pos, 1)) > 0 LOOP
+            v_pos := v_pos + 1;
+        END LOOP;
+    END LOOP;
+END
+$$;
+COMMENT ON FUNCTION _split_identifiers(text) IS 'Internal: splits a comma-separated identifier list like SplitIdentifierString() (NULL if invalid)';
+
 CREATE FUNCTION _is_exempt(p_role text)
 RETURNS bool
 LANGUAGE sql STABLE
 SET search_path = pg_catalog, pg_temp
 AS $$
-    SELECT p_role = ANY (string_to_array(
-               replace(coalesce(current_setting('pg_pass_policy.exempt_roles', true), ''), ' ', ''), ','))
+    SELECT coalesce(p_role = ANY (pass_policy._split_identifiers(
+               current_setting('pg_pass_policy.exempt_roles', true))), false)
 $$;
-COMMENT ON FUNCTION _is_exempt(text) IS 'Internal: true if the role is listed in pass_policy.exempt_roles';
+COMMENT ON FUNCTION _is_exempt(text) IS 'Internal: true if the role is listed in pass_policy.exempt_roles (same parsing as the C hooks)';
 
 -- Calls to the C shared-memory functions must never break maintenance or
 -- administration when the library/worker is unavailable: errors become WARNINGs.
@@ -568,8 +668,10 @@ COMMENT ON FUNCTION _refresh_role_state(oid) IS 'Internal: recomputes expires_at
  *             NULL -> 'infinity' only if the current value was written by us;
  *             never overrides a shorter value set manually ;
  *   'force'   rotation: always writes coalesce(desired, 'infinity') ;
- *   'unblock' rotation with manage_valid_until = off: writes only if the
- *             current VALID UNTIL is already in the past.
+ *   'unblock' manage_valid_until = off, or exempt role: writes only if the
+ *             current VALID UNTIL is already in the past, and then
+ *             'infinity' (bounded by a rotation pair only): the extension
+ *             does not manage the expiry, it only lifts a block it caused.
  * Returns a jsonb description of the change, or NULL if nothing was done.
  */
 CREATE FUNCTION _apply_valid_until(p_oid oid, p_mode text DEFAULT 'sync')
@@ -601,7 +703,9 @@ BEGIN
         IF r.rolvaliduntil IS NULL OR r.rolvaliduntil > now() THEN
             RETURN NULL;
         END IF;
-        v_new := coalesce(v_desired, 'infinity');
+        -- not grace_until: with manage_valid_until = off nothing would ever
+        -- lift that new value once passed, and the role would end up blocked
+        v_new := coalesce(r.pair_bound, 'infinity');
     ELSE
         IF v_desired IS NULL THEN
             IF r.rolvaliduntil IS NULL OR r.rolvaliduntil = 'infinity' THEN
@@ -700,6 +804,24 @@ END
 $$;
 COMMENT ON FUNCTION _set_password(name, text) IS 'Internal: ALTER ROLE PASSWORD without leaking the password in logs or error context';
 
+-- Keeps the history_count most recent history rows of a role (at least
+-- one: the reference for the reconciliation of run_maintenance()).
+CREATE FUNCTION _trim_history(p_oid oid)
+RETURNS void
+LANGUAGE sql
+SET search_path = pg_catalog, pg_temp
+AS $$
+    DELETE FROM pass_policy.password_history h
+     WHERE h.role_oid = p_oid
+       AND h.id NOT IN (SELECT h2.id FROM pass_policy.password_history h2
+                         WHERE h2.role_oid = p_oid
+                         ORDER BY h2.changed_at DESC, h2.id DESC
+                         LIMIT (SELECT greatest(e.history_count, 1)
+                                  FROM pass_policy._role_effective_profile e
+                                 WHERE e.role_oid = p_oid))
+$$;
+COMMENT ON FUNCTION _trim_history(oid) IS 'Internal: truncates the password history of a role to history_count rows';
+
 -- Records a password change (no permission check: trusted callers only).
 CREATE FUNCTION _record_password_change(p_role text, p_verifier text)
 RETURNS void
@@ -729,13 +851,7 @@ BEGIN
     INSERT INTO pass_policy.password_history (role_oid, role_name, verifier, changed_at)
     VALUES (v_oid, p_role, p_verifier, now());
 
-    -- keep history_count entries (at least one: the reference for reconciliation)
-    DELETE FROM pass_policy.password_history h
-     WHERE h.role_oid = v_oid
-       AND h.id NOT IN (SELECT h2.id FROM pass_policy.password_history h2
-                         WHERE h2.role_oid = v_oid
-                         ORDER BY h2.changed_at DESC, h2.id DESC
-                         LIMIT greatest(p.history_count, 1));
+    PERFORM pass_policy._trim_history(v_oid);
 
     INSERT INTO pass_policy.role_state AS s
            (role_oid, role_name, password_changed_at, expires_at, grace_until,
@@ -833,8 +949,9 @@ COMMENT ON FUNCTION _apply_profile_settings(int, jsonb) IS 'Internal: validates 
 -- 6. Public API (SPEC §4)
 -------------------------------------------------------------------------------
 
--- audit(): callable by PUBLIC so that the C hook can log password_rejected
--- from the session of the user; outside the hook only admins may write.
+-- audit(): granted to pass_policy_admin; the C hook calls it as superuser
+-- (password_rejected).  The check below keeps any other caller out even if
+-- EXECUTE were granted more widely.
 CREATE FUNCTION audit(event_type text, role_name text, details jsonb DEFAULT '{}')
 RETURNS void
 LANGUAGE plpgsql SECURITY DEFINER
@@ -868,9 +985,9 @@ $$;
 COMMENT ON FUNCTION effective_profile(name) IS 'Profile applying to a role (assigned profile or "default")';
 
 /*
- * Called by the C hook (SPI) after a password has been accepted, in the
- * session of whoever runs CREATE/ALTER ROLE ... PASSWORD, hence
- * SECURITY DEFINER + EXECUTE to PUBLIC.  Allowed ONLY when the backend is
+ * Called by the C hook (SPI, as the bootstrap superuser) after a password
+ * has been accepted, in the session of whoever runs CREATE/ALTER ROLE ...
+ * PASSWORD; EXECUTE is granted to nobody.  Allowed ONLY when the backend is
  * inside the pg_pass_policy hook (_in_password_hook()): PostgreSQL has
  * already checked that the current user may set this role's password
  * (CREATEROLE/ADMIN, self, superuser) before calling the hook.
@@ -1027,7 +1144,11 @@ BEGIN
     IF NOT FOUND THEN
         RETURN;
     END IF;
-    PERFORM pass_policy._refresh_role_state(v_oid);
+    -- role gone (row left for the purge): no role_state to recompute;
+    -- _refresh_role_state(NULL) would recompute every role
+    IF v_oid IS NOT NULL THEN
+        PERFORM pass_policy._refresh_role_state(v_oid);
+    END IF;
     PERFORM pass_policy._audit('profile_assigned', v_role,
             jsonb_build_object('profile', 'default', 'unassigned', true));
     PERFORM pass_policy._shmem('reload');
@@ -1064,12 +1185,16 @@ BEGIN
         RAISE EXCEPTION 'pg_pass_policy: password generation failed';
     END IF;
     PERFORM pass_policy._set_password(v_role, v_pwd);
+    -- records the change (must_change cleared) if the hook did not
     PERFORM pass_policy._ensure_recorded(v_role);
 
-    UPDATE pass_policy.role_state s SET must_change = false WHERE s.role_oid = v_oid;
     PERFORM pass_policy._refresh_role_state(v_oid);
+    -- an exempt role is skipped by run_maintenance() step d: a VALID UNTIL
+    -- written here would never be synchronised again, so only a past one is
+    -- lifted ('unblock'), as with manage_valid_until = off
     v_vu := pass_policy._apply_valid_until(v_oid,
               CASE WHEN pass_policy._guc_on('pg_pass_policy.manage_valid_until', true)
+                        AND NOT pass_policy._is_exempt(v_role)
                    THEN 'force' ELSE 'unblock' END);
 
     PERFORM pass_policy._audit('password_rotated', v_role,
@@ -1282,9 +1407,14 @@ BEGIN
 
     PERFORM pass_policy._set_password(v_new, v_pwd);
     PERFORM pass_policy._ensure_recorded(v_new);
-    UPDATE pass_policy.role_state s SET must_change = false WHERE s.role_oid = v_new_oid;
     PERFORM pass_policy._refresh_role_state(v_new_oid);
-    PERFORM pass_policy._apply_valid_until(v_new_oid, 'force');
+    -- same rule as rotate_password(): 'force' only when the extension
+    -- manages VALID UNTIL for this role (the bound of a previous switch, in
+    -- the past, is lifted by 'unblock' otherwise)
+    PERFORM pass_policy._apply_valid_until(v_new_oid,
+              CASE WHEN pass_policy._guc_on('pg_pass_policy.manage_valid_until', true)
+                        AND NOT pass_policy._is_exempt(v_new)
+                   THEN 'force' ELSE 'unblock' END);
 
     IF v_old IS NOT NULL THEN
         SELECT now() + p.grace_period INTO v_bound FROM pass_policy.effective_profile(v_old) p;
@@ -1319,8 +1449,9 @@ COMMENT ON FUNCTION switch_rotation_pair(text, int) IS 'Rotates a pair: new pass
 /*
  * run_maintenance(): one pass of what the background worker does; may also
  * be scheduled with pg_cron (runs fine without the worker / shmem).
- *  a0. re-map role_oid by role name (restore on another cluster, CREATE ROLE)
- *      and follow role renames ;
+ *  a0. re-map by role name the rows whose role_oid no longer exists
+ *      (restore on another cluster, CREATE ROLE ... PASSWORD), then follow
+ *      role renames ;
  *  a.  purge rows of roles that no longer exist ;
  *  b.  reconcile pg_authid.rolpassword with the history ;
  *  c.  recompute expires_at / grace_until ;
@@ -1356,15 +1487,24 @@ BEGIN
     END IF;
 
     ---------------------------------------------------------------- a0
-    -- name wins: rows whose role_name exists with another OID get that OID
+    -- Orphaned rows (their OID no longer exists) whose role_name exists with
+    -- another OID get that OID: restore on another cluster (OIDs differ,
+    -- names are kept).  A row whose OID still exists is never re-mapped,
+    -- even if another role now carries its former name (rename, then
+    -- creation of a role with the old name): locks, profile and history
+    -- follow the OID, and the renames below update the name.
+    -- Limit: a role dropped and re-created with the same name between two
+    -- passes cannot be told from a restore and inherits the rows.
     FOR r IN
         SELECT 'role_state' AS tbl, s.role_oid AS old_oid, a.oid AS new_oid, s.role_name AS rname
           FROM pass_policy.role_state s JOIN pg_catalog.pg_authid a ON a.rolname = s.role_name
          WHERE a.oid <> s.role_oid
+           AND NOT EXISTS (SELECT FROM pg_catalog.pg_authid o WHERE o.oid = s.role_oid)
         UNION ALL
         SELECT 'role_profile', p.role_oid, a.oid, p.role_name
           FROM pass_policy.role_profile p JOIN pg_catalog.pg_authid a ON a.rolname = p.role_name
          WHERE a.oid <> p.role_oid
+           AND NOT EXISTS (SELECT FROM pg_catalog.pg_authid o WHERE o.oid = p.role_oid)
     LOOP
         IF r.tbl = 'role_state' THEN
             IF EXISTS (SELECT FROM pass_policy.role_state x WHERE x.role_oid = r.new_oid) THEN
@@ -1386,20 +1526,19 @@ BEGIN
     END LOOP;
     UPDATE pass_policy.password_history h SET role_oid = a.oid
       FROM pg_catalog.pg_authid a
-     WHERE a.rolname = h.role_name AND h.role_oid IS DISTINCT FROM a.oid;
-    -- renames: OID still exists, old name gone
+     WHERE a.rolname = h.role_name AND h.role_oid IS DISTINCT FROM a.oid
+       AND (h.role_oid IS NULL
+            OR NOT EXISTS (SELECT FROM pg_catalog.pg_authid o WHERE o.oid = h.role_oid));
+    -- renames: the OID still exists under another name
     UPDATE pass_policy.role_state s SET role_name = a.rolname
       FROM pg_catalog.pg_authid a
-     WHERE a.oid = s.role_oid AND a.rolname <> s.role_name
-       AND NOT EXISTS (SELECT FROM pg_catalog.pg_authid b WHERE b.rolname = s.role_name);
+     WHERE a.oid = s.role_oid AND a.rolname <> s.role_name;
     UPDATE pass_policy.role_profile p SET role_name = a.rolname
       FROM pg_catalog.pg_authid a
-     WHERE a.oid = p.role_oid AND a.rolname <> p.role_name
-       AND NOT EXISTS (SELECT FROM pg_catalog.pg_authid b WHERE b.rolname = p.role_name);
+     WHERE a.oid = p.role_oid AND a.rolname <> p.role_name;
     UPDATE pass_policy.password_history h SET role_name = a.rolname
       FROM pg_catalog.pg_authid a
-     WHERE a.oid = h.role_oid AND a.rolname <> h.role_name
-       AND NOT EXISTS (SELECT FROM pg_catalog.pg_authid b WHERE b.rolname = h.role_name);
+     WHERE a.oid = h.role_oid AND a.rolname <> h.role_name;
 
     ---------------------------------------------------------------- a
     FOR r IN
@@ -1491,14 +1630,7 @@ BEGIN
             -- the password was changed without going through the hook
             INSERT INTO pass_policy.password_history (role_oid, role_name, verifier, changed_at)
             VALUES (r.oid, r.rname, r.rolpassword, now());
-            DELETE FROM pass_policy.password_history h
-             WHERE h.role_oid = r.oid
-               AND h.id NOT IN (SELECT h2.id FROM pass_policy.password_history h2
-                                 WHERE h2.role_oid = r.oid
-                                 ORDER BY h2.changed_at DESC, h2.id DESC
-                                 LIMIT (SELECT greatest(e.history_count, 1)
-                                          FROM pass_policy._role_effective_profile e
-                                         WHERE e.role_oid = r.oid));
+            PERFORM pass_policy._trim_history(r.oid);
             UPDATE pass_policy.role_state s
                SET password_changed_at = now(), last_warned_at = NULL,
                    must_change = false, verifier_pending = false
@@ -1664,9 +1796,12 @@ COMMENT ON VIEW v_recent_audit IS 'Last 1000 audit events';
 -- 8. Privileges
 -------------------------------------------------------------------------------
 /*
- * - schema USAGE to PUBLIC: the C hook calls effective_profile() and
- *   record_password_change() in the session of any user changing a
- *   password; every table stays REVOKEd from PUBLIC ;
+ * - nothing to PUBLIC: the SPI queries of the C hook run as the bootstrap
+ *   superuser (ppp_spi_begin(), src/policy.c), whoever changes a password,
+ *   so neither USAGE on the schema nor EXECUTE on effective_profile(),
+ *   record_password_change() or audit() is needed by ordinary users ;
+ *   record_password_change() and audit() keep their _in_password_hook()
+ *   guard as defence in depth ;
  * - viewer: SELECT on tables and views, except password_history.verifier
  *   (column grant: the hashes are offline-cracking material) ;
  * - admin: member of viewer + EXECUTE on the administration API ;
@@ -1674,7 +1809,7 @@ COMMENT ON VIEW v_recent_audit IS 'Last 1000 audit events';
  *   code only).
  */
 REVOKE ALL ON SCHEMA pass_policy FROM PUBLIC;
-GRANT USAGE ON SCHEMA pass_policy TO PUBLIC, pass_policy_viewer, pass_policy_admin;
+GRANT USAGE ON SCHEMA pass_policy TO pass_policy_viewer, pass_policy_admin;
 
 REVOKE ALL ON ALL TABLES IN SCHEMA pass_policy FROM PUBLIC;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA pass_policy FROM PUBLIC;
@@ -1686,14 +1821,10 @@ GRANT SELECT ON profile, role_profile, role_state, dictionary, audit_log, rotati
 GRANT SELECT (id, role_oid, role_name, changed_at) ON password_history
    TO pass_policy_viewer, pass_policy_admin;
 
--- called from any session by the C password hook
-GRANT EXECUTE ON FUNCTION effective_profile(name), record_password_change(text, text),
-                          audit(text, text, jsonb)
-   TO PUBLIC;
-
--- needed by the views
-GRANT EXECUTE ON FUNCTION failed_attempts(), worker_status()
+-- read-only API; needed by the views (failed_attempts, worker_status)
+GRANT EXECUTE ON FUNCTION effective_profile(name), failed_attempts(), worker_status()
    TO pass_policy_viewer, pass_policy_admin;
+-- record_password_change(): no grant (called by the C hook as superuser only)
 
 GRANT EXECUTE ON FUNCTION
     check_password(text, text),
@@ -1711,5 +1842,6 @@ GRANT EXECUTE ON FUNCTION
     create_rotation_pair(text, name, name, name),
     switch_rotation_pair(text, int),
     purge_audit(interval),
-    load_dictionary(text[])
+    load_dictionary(text[]),
+    audit(text, text, jsonb)
    TO pass_policy_admin;

@@ -14,6 +14,13 @@ CREATE ROLE regress_cplx LOGIN;
 -- Mot du dictionnaire personnalisé (stocké en minuscules)
 SELECT pass_policy.load_dictionary(ARRAY['Correct-Horse9']) AS loaded;
 SELECT word FROM pass_policy.dictionary WHERE word = 'correct-horse9';
+-- Le hook ne compare que le SHA-256 du mot de passe en minuscules à la colonne
+-- générée word_sha256 (octets bruts du mot, encodage du serveur, y compris
+-- pour une barre oblique inverse)
+SELECT pass_policy.load_dictionary(ARRAY['Back\Slash-Word9']) AS loaded_backslash;
+SELECT bool_and(word_sha256 = sha256(convert_to(word, current_setting('server_encoding')))) AS digests_ok,
+       count(DISTINCT word_sha256) = count(*) AS digests_unique
+  FROM pass_policy.dictionary;
 
 -- Audit avant les appels à check_password() (doit rester inchangé)
 CREATE TEMP TABLE audit_before AS
@@ -51,7 +58,8 @@ INSERT INTO cases VALUES
   (22, NULL, 'Abcdefg9!xyz'),                   -- exactement 12 caractères
   (23, NULL, 'Abcd9!xxxyz12'),                  -- exactement 3 répétitions
   (24, NULL, rpad('Ab9!', 128, 'xyZ7')),        -- exactement 128 caractères
-  (25, NULL, 'Mid space 9!Ok');                 -- espace interne autorisé
+  (25, NULL, 'Mid space 9!Ok'),                 -- espace interne autorisé
+  (26, 'PPP-018', 'BACK\slash-WORD9');            -- dictionnaire, mot avec « \ »
 -- (les vérificateurs pré-hachés ne sont pas des secrets : exclus)
 INSERT INTO ppp_test.secrets SELECT 'cplx' || id, pwd FROM cases
  WHERE expected IS DISTINCT FROM 'PPP-001';

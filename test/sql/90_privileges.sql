@@ -72,6 +72,31 @@ RESET SESSION AUTHORIZATION;
 -- L'appel record_self n'a pas laissé de vérificateur visible dans l'audit
 SELECT ppp_test.leaks();
 
+-- Aucun droit pour PUBLIC : les requêtes SPI du hook tournent en
+-- superutilisateur (ppp_spi_begin), ni USAGE sur le schéma ni EXECUTE sur
+-- effective_profile(), record_password_change() ou audit() ne sont nécessaires
+SELECT has_schema_privilege('regress_user', 'pass_policy', 'USAGE') AS user_usage,
+       has_function_privilege('regress_user', 'pass_policy.effective_profile(name)', 'EXECUTE') AS user_effective_profile,
+       has_function_privilege('regress_user', 'pass_policy.record_password_change(text, text)', 'EXECUTE') AS user_record,
+       has_function_privilege('regress_user', 'pass_policy.audit(text, text, jsonb)', 'EXECUTE') AS user_audit;
+SELECT has_function_privilege('regress_viewer', 'pass_policy.effective_profile(name)', 'EXECUTE') AS viewer_effective_profile,
+       has_function_privilege('regress_viewer', 'pass_policy.audit(text, text, jsonb)', 'EXECUTE') AS viewer_audit,
+       has_function_privilege('regress_admin', 'pass_policy.audit(text, text, jsonb)', 'EXECUTE') AS admin_audit,
+       has_function_privilege('regress_admin', 'pass_policy.record_password_change(text, text)', 'EXECUTE') AS admin_record;
+-- … et l'utilisateur ordinaire change toujours SON mot de passe : politique
+-- appliquée, changement enregistré
+INSERT INTO ppp_test.secrets VALUES ('user_own', 'Own-Password#2026x');
+SET SESSION AUTHORIZATION regress_user;
+SELECT ppp_test.try($$ALTER ROLE regress_user PASSWORD 'weak'$$) AS user_own_weak;
+SELECT ppp_test.try($$ALTER ROLE regress_user PASSWORD 'Own-Password#2026x'$$) AS user_own_password;
+RESET SESSION AUTHORIZATION;
+SELECT count(*) AS user_history_rows FROM pass_policy.password_history
+ WHERE role_oid = 'regress_user'::regrole::oid;
+SELECT password_changed_at > now() - interval '1 minute' AS user_change_recorded
+  FROM pass_policy.role_state WHERE role_oid = 'regress_user'::regrole::oid;
+SELECT count(*) AS user_changed_events FROM pass_policy.audit_log
+ WHERE role_name = 'regress_user' AND event_type = 'password_changed';
+
 -- Viewer -----------------------------------------------------------------
 SET SESSION AUTHORIZATION regress_viewer;
 SELECT ppp_test.try($$SELECT * FROM pass_policy.v_role_status$$) AS sel_status;
@@ -90,6 +115,11 @@ SET SESSION AUTHORIZATION regress_admin;
 SELECT rolsuper FROM pg_roles WHERE rolname = session_user;
 INSERT INTO ppp_test.secrets
   SELECT 'admin_rot', pass_policy.rotate_password('regress_target');
+-- check_password() par un admin sur un autre rôle : ni historique ni min_age
+-- (regress_target vient de changer de mot de passe, min_age = 1 jour) ; sinon
+-- PPP-030 renseignerait sur la date du dernier changement d'un autre rôle
+INSERT INTO ppp_test.secrets VALUES ('admin_check', 'Unrelated-Valid#2026x');
+SELECT ppp_test.code(pass_policy.check_password('regress_target', 'Unrelated-Valid#2026x')) AS admin_check_other;
 SELECT ppp_test.try($$SELECT pass_policy.lock_role('regress_target', interval '1 hour', 'admin test')$$) AS lock;
 SELECT ppp_test.try($$SELECT pass_policy.unlock_role('regress_target')$$) AS unlock;
 SELECT ppp_test.try($$SELECT pass_policy.create_profile('p_admin', '{"min_length": 14}')$$) AS create_profile;
@@ -136,6 +166,56 @@ INSERT INTO ppp_test.secrets SELECT 'super_rot_etl', pass_policy.rotate_password
 SELECT length(pwd) AS super_rot_etl_len FROM ppp_test.secrets WHERE label = 'super_rot_etl';
 SELECT ppp_test.try($$SELECT pass_policy.create_rotation_pair('pair_super', 'regress_pair_s', 'regress_pair_t', 'regress_grp_super')$$) AS super_pair_on_member_of_super;
 DO $$BEGIN EXECUTE format('ALTER DATABASE %I OWNER TO %I', current_database(), (SELECT o FROM dbowner)); END$$;
+
+-- ---------------------------------------------------------------------
+-- Extension présente mais schéma non fiable (re-possédé par un non
+-- superutilisateur) : le hook refuse explicitement (PPP-004) au lieu de
+-- n'appliquer aucune politique ; check_password() aussi.
+-- ---------------------------------------------------------------------
+SELECT nspowner::regrole AS ppp_owner FROM pg_namespace WHERE nspname = 'pass_policy' \gset
+ALTER SCHEMA pass_policy OWNER TO regress_user;
+SELECT ppp_test.try($$ALTER ROLE regress_target PASSWORD 'Untrusted-Schema#2026'$$) AS untrusted_alter;
+SELECT ppp_test.try($$SELECT pass_policy.check_password('regress_target', 'Untrusted-Schema#2026')$$) AS untrusted_check;
+ALTER ROLE regress_target PASSWORD 'Untrusted-Schema#2026';
+ALTER SCHEMA pass_policy OWNER TO :"ppp_owner";
+INSERT INTO ppp_test.secrets VALUES ('untrusted', 'Untrusted-Schema#2026');
+SELECT ppp_test.try($$ALTER ROLE regress_target PASSWORD 'Untrusted-Schema#2026'$$) AS trusted_again;
+
+-- ---------------------------------------------------------------------
+-- pg_pass_policy.exempt_roles : _is_exempt() (SQL) découpe la liste comme
+-- SplitIdentifierString() (C) : noms non quotés en minuscules, "quotés" tels
+-- quels, espaces ignorés. Le hook (C) et _is_exempt() doivent concorder :
+-- un rôle exempté accepte un mot de passe faible.
+-- ---------------------------------------------------------------------
+SELECT pass_policy._split_identifiers(' a , b ') AS split_spaces,
+       pass_policy._split_identifiers('Postgres, "App User", "x""y"') AS split_mixed,
+       pass_policy._split_identifiers('a b') IS NULL AS split_invalid,
+       pass_policy._split_identifiers('') AS split_empty;
+CREATE ROLE "Regress_Exempt Q" LOGIN;
+CREATE ROLE regress_exempt_u LOGIN;
+CREATE ROLE "Regress_Exempt_U" LOGIN;
+ALTER SYSTEM SET pg_pass_policy.exempt_roles = 'Postgres, "Regress_Exempt Q" , REGRESS_EXEMPT_U';
+SELECT pg_reload_conf();
+SELECT pg_sleep(0.5);
+SHOW pg_pass_policy.exempt_roles;
+INSERT INTO ppp_test.secrets VALUES ('exempt_weak', 'exempt-weak');
+SELECT r AS role_name, pass_policy._is_exempt(r) AS sql_exempt,
+       ppp_test.try(format('ALTER ROLE %I PASSWORD %L', r, 'exempt-weak')) = 'ok' AS hook_exempt
+  FROM unnest(ARRAY['Regress_Exempt Q', 'regress_exempt_u', 'Regress_Exempt_U']) r
+ ORDER BY 1;
+SELECT pass_policy._is_exempt('Postgres') AS quoted_case_kept,
+       pass_policy._is_exempt('postgres') AS unquoted_lowered;
+-- Rôle exempté : rotate_password() ne pose pas de VALID UNTIL (run_maintenance()
+-- ne le resynchroniserait jamais), il relève seulement une borne passée
+INSERT INTO ppp_test.secrets SELECT 'exempt_rot', pass_policy.rotate_password('regress_exempt_u');
+SELECT rolvaliduntil IS NULL AS exempt_rotate_no_valid_until FROM pg_roles WHERE rolname = 'regress_exempt_u';
+SELECT pass_policy.expire_password('regress_exempt_u');
+INSERT INTO ppp_test.secrets SELECT 'exempt_rot2', pass_policy.rotate_password('regress_exempt_u');
+SELECT rolvaliduntil = 'infinity' AS exempt_rotate_unblocked FROM pg_roles WHERE rolname = 'regress_exempt_u';
+ALTER SYSTEM RESET pg_pass_policy.exempt_roles;
+SELECT pg_reload_conf();
+SELECT pg_sleep(0.5);
+SHOW pg_pass_policy.exempt_roles;
 
 -- ---------------------------------------------------------------------
 -- Faux schéma pass_policy dans une autre base : le hook ne doit jamais

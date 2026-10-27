@@ -114,4 +114,17 @@ check_eq "trois refus journalisés (LOG password_rejected, code seul)" "3" "$n"
 out=$(psql_admin "SELECT count(*) FROM pass_policy.audit_log WHERE details::text LIKE '%leakprobe%'")
 check_eq "aucun mot de passe refusé dans l'audit" "0" "$out"
 
+# ERROR levée par check_password() hors des refus PPP-xxx (ici : extension
+# absente de la base) : la ligne STATEMENT contiendrait le mot de passe passé
+# en argument. La fonction C est déclarée à la main dans une base sans
+# l'extension pour atteindre ce chemin.
+psql_admin "CREATE DATABASE ppp_noext" >/dev/null
+out=$("$PPP_BINDIR/psql" -X -q -At -h 127.0.0.1 -p "$PPP_PORT" -U "$PPP_SUPERUSER" -d ppp_noext \
+	-c "CREATE FUNCTION public.ppp_check(text, text) RETURNS text AS 'pg_pass_policy', 'ppp_check_password' LANGUAGE C STRICT" \
+	-c "SELECT public.ppp_check('bob', 'LeakProbeUnique-2026')" 2>&1) || true
+check_contains "check_password() sans extension : ERROR" 'not installed in this database' "$out"
+sleep 0.5
+n=$(grep -cF -- 'LeakProbeUnique-2026' "$PPP_TMP/server.log" || true)
+check_eq "check_password() en erreur : mot de passe absent du log serveur" "0" "$n"
+
 ppp_finish

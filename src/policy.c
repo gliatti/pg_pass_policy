@@ -67,10 +67,17 @@ static bool ppp_in_hook = false;
 #define PPP_GEN_MAX_TRIES	100
 
 /* Alphabet without ambiguous characters 0 O 1 l I | */
-static const char ppp_alpha_lower[] = "abcdefghijkmnopqrstuvwxyz";
-static const char ppp_alpha_upper[] = "ABCDEFGHJKLMNPQRSTUVWXYZ";
-static const char ppp_alpha_digit[] = "23456789";
-static const char ppp_alpha_special[] = "!#%()*+,-./:;=?@[]^_{}~";
+#define PPP_ALPHA_LOWER		"abcdefghijkmnopqrstuvwxyz"
+#define PPP_ALPHA_UPPER		"ABCDEFGHJKLMNPQRSTUVWXYZ"
+#define PPP_ALPHA_DIGIT		"23456789"
+#define PPP_ALPHA_SPECIAL	"!#%()*+,-./:;=?@[]^_{}~"
+
+static const char ppp_alpha_lower[] = PPP_ALPHA_LOWER;
+static const char ppp_alpha_upper[] = PPP_ALPHA_UPPER;
+static const char ppp_alpha_digit[] = PPP_ALPHA_DIGIT;
+static const char ppp_alpha_special[] = PPP_ALPHA_SPECIAL;
+static const char ppp_alpha_all[] = PPP_ALPHA_LOWER PPP_ALPHA_UPPER
+PPP_ALPHA_DIGIT PPP_ALPHA_SPECIAL;
 
 /*
  * Effective profile (subset of pass_policy.profile used by the checks).
@@ -96,12 +103,17 @@ typedef struct pppProfile
 	char	   *min_age_text;	/* for messages */
 } pppProfile;
 
-/* State saved while running SPI as the bootstrap superuser */
+/*
+ * State saved while running SPI as the bootstrap superuser.  outer_cxt is
+ * the memory context current before SPI_connect(): what must survive
+ * SPI_finish() (profile strings, results) is allocated there.
+ */
 typedef struct pppSpiState
 {
 	Oid			save_userid;
 	int			save_sec_context;
 	int			save_nestlevel;
+	MemoryContext outer_cxt;
 } pppSpiState;
 
 static void ppp_check_password_hook(const char *username,
@@ -122,10 +134,18 @@ static void ppp_check_password_hook(const char *username,
  * the hook runs with the privileges of whoever executes ALTER ROLE (possibly
  * an unprivileged role changing its own password).  All queries issued
  * through this are fixed, schema-qualified statements of this file.
+ *
+ * One such session covers a whole entry point (password hook,
+ * check_password(), generate_password()): superuser() and GetUserId() of
+ * the caller must therefore be read BEFORE calling this.  On error, the
+ * entry point restores the identity itself and re-throws through
+ * ppp_rethrow_hidden(); the GUC level and the SPI connection are then
+ * released by the (sub)transaction abort.
  */
 static void
 ppp_spi_begin(pppSpiState *st)
 {
+	st->outer_cxt = CurrentMemoryContext;
 	GetUserIdAndSecContext(&st->save_userid, &st->save_sec_context);
 	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID,
 						   st->save_sec_context | SECURITY_LOCAL_USERID_CHANGE |
@@ -174,13 +194,63 @@ ppp_spi_end(pppSpiState *st)
 }
 
 /*
- * Is the pg_pass_policy extension (not merely a schema of that name)
- * installed in the current database?  See ppp_extension_installed().
+ * Re-throw the error being handled with its STATEMENT and CONTEXT hidden.
+ *
+ * Called from the PG_CATCH() of the entry points that receive a clear-text
+ * password (the hook, check_password()) or run under the elevated SPI
+ * session.  The GUC guard of ppp_spi_begin() (log_min_error_statement =
+ * panic) only protects the messages emitted while it is active: an ERROR is
+ * written to the server log by the outermost handler, after this function
+ * has returned, when the statement text (ALTER ROLE ... PASSWORD 'x', or
+ * SELECT check_password('r', 'x')) would otherwise be printed.  Marking the
+ * error itself covers every ERROR raised below, including those of
+ * PostgreSQL functions (get_role_oid, encrypt_password, SPI...) that do not
+ * call errhidestmt().
  */
-static bool
-ppp_schema_exists(void)
+static void
+ppp_rethrow_hidden(MemoryContext cxt)
 {
-	return ppp_extension_installed();
+	ErrorData  *edata;
+
+	MemoryContextSwitchTo(cxt);
+	edata = CopyErrorData();
+	FlushErrorState();
+	edata->hide_stmt = true;
+	edata->hide_ctx = true;
+	ReThrowError(edata);
+}
+
+/*
+ * PPP-004: the extension is present in this database but cannot be trusted
+ * (schema re-owned by a non-superuser, owner demoted, objects outside
+ * PPP_SCHEMA).  Applying no policy at all would silently fail open, and
+ * running its SQL as superuser would hand that owner superuser rights:
+ * refuse explicitly.
+ */
+static void
+ppp_untrusted_error(Oid nspowner)
+{
+	char	   *detail;
+
+	if (!OidIsValid(nspowner))
+		detail = pstrdup("Schema \"" PPP_SCHEMA "\" does not exist or does not hold the objects of extension pg_pass_policy.");
+	else if (!superuser_arg(nspowner))
+	{
+		const char *owner = GetUserNameFromId(nspowner, true);
+
+		detail = psprintf("Schema \"" PPP_SCHEMA "\" is owned by role \"%s\", which is not a superuser.",
+						  owner ? owner : "?");
+	}
+	else
+		detail = pstrdup("The objects of extension pg_pass_policy are not in schema \"" PPP_SCHEMA "\".");
+
+	ereport(ERROR,
+			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			 errmsg("PPP-004: pg_pass_policy schema is not trusted"),
+			 errdetail_internal("%s", detail),
+			 errhint("A superuser must own schema \"" PPP_SCHEMA "\" (ALTER SCHEMA " PPP_SCHEMA " OWNER TO a superuser)."),
+			 errhidestmt(true),
+			 errhidecontext(true)));
 }
 
 static int
@@ -267,19 +337,18 @@ ppp_profile_from_spi(pppProfile *p, MemoryContext cxt)
  * Load the effective profile of a role through
  * pass_policy.effective_profile(name).  The role may not exist yet
  * (CREATE ROLE): effective_profile() then returns the default profile.
+ * Runs inside the SPI session of the caller; strings are allocated in cxt.
  */
 static void
-ppp_load_effective_profile(const char *rolename, pppProfile *p)
+ppp_load_effective_profile(const char *rolename, pppProfile *p,
+						   MemoryContext cxt)
 {
-	MemoryContext cxt = CurrentMemoryContext;
-	pppSpiState st;
 	Oid			argtypes[1] = {NAMEOID};
 	Datum		values[1];
 	int			ret;
 
 	values[0] = DirectFunctionCall1(namein, CStringGetDatum(rolename));
 
-	ppp_spi_begin(&st);
 	ret = SPI_execute_with_args("SELECT * FROM " PPP_SCHEMA ".effective_profile($1)",
 								1, argtypes, values, NULL, true, 1);
 	if (ret != SPI_OK_SELECT)
@@ -289,24 +358,22 @@ ppp_load_effective_profile(const char *rolename, pppProfile *p)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("pg_pass_policy: no effective profile for role \"%s\"",
-						rolename)));
+						rolename),
+				 errhidestmt(true),
+				 errhidecontext(true)));
 	ppp_profile_from_spi(p, cxt);
-	ppp_spi_end(&st);
 }
 
-/* Load a profile by name (generate_password) */
+/* Load a profile by name (generate_password), inside the caller's SPI session */
 static void
-ppp_load_named_profile(const char *profname, pppProfile *p)
+ppp_load_named_profile(const char *profname, pppProfile *p, MemoryContext cxt)
 {
-	MemoryContext cxt = CurrentMemoryContext;
-	pppSpiState st;
 	Oid			argtypes[1] = {TEXTOID};
 	Datum		values[1];
 	int			ret;
 
 	values[0] = CStringGetTextDatum(profname);
 
-	ppp_spi_begin(&st);
 	ret = SPI_execute_with_args("SELECT * FROM " PPP_SCHEMA ".profile WHERE name = $1",
 								1, argtypes, values, NULL, true, 1);
 	if (ret != SPI_OK_SELECT)
@@ -315,9 +382,10 @@ ppp_load_named_profile(const char *profname, pppProfile *p)
 	if (SPI_processed == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("pg_pass_policy: profile \"%s\" does not exist", profname)));
+				 errmsg("pg_pass_policy: profile \"%s\" does not exist", profname),
+				 errhidestmt(true),
+				 errhidecontext(true)));
 	ppp_profile_from_spi(p, cxt);
-	ppp_spi_end(&st);
 }
 
 
@@ -409,44 +477,60 @@ ppp_reverse(const char *s)
 
 /*
  * Is the (already lower-cased) password one of the words of
- * pass_policy.dictionary?  Only the length of the password is sent to
- * SQL; the comparison itself is done here.
+ * pass_policy.dictionary?
+ *
+ * Only the SHA-256 digest of the lower-cased password is sent to SQL, as a
+ * bound parameter compared with the generated column word_sha256 (unique
+ * index): the clear text never leaves this file, and nothing but the
+ * matching row is read.  The digest is unsalted, but it is never stored nor
+ * logged (bound parameters of SPI statements are not logged by
+ * log_statement / log_parameter_max_length, auto_explain is silenced by
+ * ppp_spi_begin()), and the digest of a word that IS in the dictionary
+ * reveals nothing (the word is public).
+ *
+ * sha256() is called through the fmgr interface (sha256_bytea, available
+ * with the same signature on every supported version) rather than through
+ * common/cryptohash.h.  Must run inside the SPI session of the caller.
  */
 static bool
 ppp_in_dictionary(const char *lower_pw)
 {
-	pppSpiState st;
-	Oid			argtypes[1] = {INT4OID};
+	size_t		len = strlen(lower_pw);
+	bytea	   *volatile input;
+	bytea	   *volatile digest = NULL;
+	Oid			argtypes[1] = {BYTEAOID};
 	Datum		values[1];
 	int			ret;
-	bool		found = false;
-	uint64		i;
+	volatile bool found = false;
 
-	values[0] = Int32GetDatum(pg_mbstrlen(lower_pw));
+	input = (bytea *) palloc(VARHDRSZ + len);
+	SET_VARSIZE(input, VARHDRSZ + len);
+	memcpy(VARDATA(input), lower_pw, len);
 
-	ppp_spi_begin(&st);
-	ret = SPI_execute_with_args("SELECT pg_catalog.lower(word) FROM " PPP_SCHEMA ".dictionary "
-								"WHERE pg_catalog.length(word) = $1",
-								1, argtypes, values, NULL, true, 0);
-	if (ret != SPI_OK_SELECT)
-		elog(ERROR, "pg_pass_policy: dictionary lookup failed: %s",
-			 SPI_result_code_string(ret));
-	for (i = 0; i < SPI_processed && !found; i++)
+	PG_TRY();
 	{
-		bool		isnull;
-		Datum		d;
-		text	   *t;
-
-		d = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1,
-						  &isnull);
-		if (isnull)
-			continue;
-		t = DatumGetTextPP(d);
-		if (VARSIZE_ANY_EXHDR(t) == strlen(lower_pw) &&
-			memcmp(VARDATA_ANY(t), lower_pw, VARSIZE_ANY_EXHDR(t)) == 0)
-			found = true;
+		digest = DatumGetByteaPP(DirectFunctionCall1(sha256_bytea,
+													 PointerGetDatum(input)));
+		values[0] = PointerGetDatum(digest);
+		ret = SPI_execute_with_args("SELECT 1 FROM " PPP_SCHEMA ".dictionary "
+									"WHERE word_sha256 = $1",
+									1, argtypes, values, NULL, true, 1);
+		if (ret != SPI_OK_SELECT)
+			elog(ERROR, "pg_pass_policy: dictionary lookup failed: %s",
+				 SPI_result_code_string(ret));
+		found = (SPI_processed > 0);
 	}
-	ppp_spi_end(&st);
+	PG_FINALLY();
+	{
+		ppp_secure_zero(VARDATA(input), len);
+		pfree(input);
+		if (digest != NULL)
+		{
+			ppp_secure_zero(VARDATA_ANY(digest), VARSIZE_ANY_EXHDR(digest));
+			pfree(digest);
+		}
+	}
+	PG_END_TRY();
 
 	return found;
 }
@@ -456,7 +540,7 @@ ppp_in_dictionary(const char *lower_pw)
  * profile, in the order of SPEC 6.2 step 4.  Returns true if the password is
  * acceptable; otherwise sets *code to a static "PPP-0xx" string.
  *
- * The dictionary lookup opens its own SPI connection.
+ * The dictionary lookup runs in the SPI session of the caller.
  */
 static bool
 ppp_validate(const char *username, const char *password, const pppProfile *p,
@@ -693,7 +777,7 @@ ppp_describe(const char *code, const pppProfile *p, char **msg, char **detail,
 	else if (strcmp(code, "PPP-031") == 0)
 	{
 		*msg = pstrdup("password was used recently");
-		*detail = psprintf("The password must differ from the current one and from the last %d passwords.",
+		*detail = psprintf("The password must differ from the last %d passwords (current one included).",
 						   p->history_count);
 	}
 	else
@@ -712,14 +796,19 @@ ppp_describe(const char *code, const pppProfile *p, char **msg, char **detail,
 
 /*
  * True if the role changed its password less than min_age ago.  Not
- * applicable when the password was force-expired (must_change).
+ * applicable when the password was force-expired (must_change), nor to a
+ * role that does not exist yet (CREATE ROLE).
+ *
+ * The lookup is by OID only: a role_state row carrying the same name but
+ * another OID can only belong to a dropped role (stale until the next
+ * run_maintenance()), whose date must not apply to a re-created role.
+ * Runs inside the SPI session of the caller.
  */
 static bool
-ppp_min_age_violated(const char *username, Oid roleid, const pppProfile *p)
+ppp_min_age_violated(Oid roleid, const pppProfile *p)
 {
-	pppSpiState st;
-	Oid			argtypes[3] = {OIDOID, INTERVALOID, TEXTOID};
-	Datum		values[3];
+	Oid			argtypes[2] = {OIDOID, INTERVALOID};
+	Datum		values[2];
 	int			ret;
 	bool		violated = false;
 
@@ -728,15 +817,13 @@ ppp_min_age_violated(const char *username, Oid roleid, const pppProfile *p)
 
 	values[0] = ObjectIdGetDatum(roleid);
 	values[1] = p->min_age;
-	values[2] = CStringGetTextDatum(username);
 
-	ppp_spi_begin(&st);
-	ret = SPI_execute_with_args("SELECT pg_catalog.bool_or((pg_catalog.now() - password_changed_at) < $2) "
+	ret = SPI_execute_with_args("SELECT (pg_catalog.now() - password_changed_at) < $2 "
 								"FROM " PPP_SCHEMA ".role_state "
-								"WHERE (role_oid = $1 OR role_name = $3) "
+								"WHERE role_oid = $1 "
 								"AND password_changed_at IS NOT NULL "
-								"AND NOT coalesce(must_change, false)",
-								3, argtypes, values, NULL, true, 1);
+								"AND NOT must_change",
+								2, argtypes, values, NULL, true, 1);
 	if (ret != SPI_OK_SELECT)
 		elog(ERROR, "pg_pass_policy: role_state lookup failed: %s",
 			 SPI_result_code_string(ret));
@@ -749,7 +836,6 @@ ppp_min_age_violated(const char *username, Oid roleid, const pppProfile *p)
 						  &isnull);
 		violated = !isnull && DatumGetBool(d);
 	}
-	ppp_spi_end(&st);
 
 	return violated;
 }
@@ -784,54 +870,75 @@ ppp_matches_verifier(const char *username, const char *password,
 /*
  * True if the password matches the current verifier of the role or one of
  * the history_count most recent verifiers of pass_policy.password_history
- * (not older than history_days).
+ * (not older than history_days).  The most recent history row normally is
+ * the current password: "history_count" passwords, current one included.
+ *
+ * Existing role: lookup by OID only (rows of a dropped role of the same
+ * name, not yet purged by run_maintenance(), must not be resurrected for a
+ * re-created role).  Role not created yet (CREATE ROLE ... PASSWORD): only
+ * the rows not yet mapped to an OID (role_oid IS NULL), by name.
+ * Runs inside the SPI session of the caller.
  */
 static bool
 ppp_password_reused(const char *username, Oid roleid, const char *password,
 					const pppProfile *p)
 {
-	pppSpiState st;
-	Oid			argtypes[4] = {OIDOID, INT4OID, INT4OID, TEXTOID};
-	Datum		values[4];
+	Oid			argtypes[3] = {INT4OID, INT4OID, InvalidOid};
+	Datum		values[3];
 	int			ret;
 	bool		reused = false;
 	uint64		i;
-	HeapTuple	tup;
 
-	if (p->history_count <= 0 || !OidIsValid(roleid))
+	if (p->history_count <= 0)
 		return false;
 
-	/* current password (also covers roles that predate the extension) */
-	tup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(roleid));
-	if (HeapTupleIsValid(tup))
+	if (OidIsValid(roleid))
 	{
-		bool		isnull;
-		Datum		d;
+		HeapTuple	tup;
 
-		d = SysCacheGetAttr(AUTHOID, tup, Anum_pg_authid_rolpassword, &isnull);
-		if (!isnull)
+		/* current password (also covers roles that predate the extension) */
+		tup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(roleid));
+		if (HeapTupleIsValid(tup))
 		{
-			char	   *cur = TextDatumGetCString(d);
+			bool		isnull;
+			Datum		d;
 
-			reused = ppp_matches_verifier(username, password, cur);
-			pfree(cur);
+			d = SysCacheGetAttr(AUTHOID, tup, Anum_pg_authid_rolpassword, &isnull);
+			if (!isnull)
+			{
+				char	   *cur = TextDatumGetCString(d);
+
+				reused = ppp_matches_verifier(username, password, cur);
+				pfree(cur);
+			}
+			ReleaseSysCache(tup);
 		}
-		ReleaseSysCache(tup);
+		if (reused)
+			return true;
 	}
-	if (reused)
-		return true;
 
-	values[0] = ObjectIdGetDatum(roleid);
-	values[1] = Int32GetDatum(p->history_days);
-	values[2] = Int32GetDatum(p->history_count);
-	values[3] = CStringGetTextDatum(username);
-
-	ppp_spi_begin(&st);
-	ret = SPI_execute_with_args("SELECT verifier FROM " PPP_SCHEMA ".password_history "
-								"WHERE (role_oid = $1 OR role_name = $4) "
-								"AND ($2 <= 0 OR changed_at > pg_catalog.now() - pg_catalog.make_interval(days => $2)) "
-								"ORDER BY changed_at DESC LIMIT $3",
-								4, argtypes, values, NULL, true, 0);
+	values[0] = Int32GetDatum(p->history_days);
+	values[1] = Int32GetDatum(p->history_count);
+	if (OidIsValid(roleid))
+	{
+		argtypes[2] = OIDOID;
+		values[2] = ObjectIdGetDatum(roleid);
+		ret = SPI_execute_with_args("SELECT verifier FROM " PPP_SCHEMA ".password_history "
+									"WHERE role_oid = $3 "
+									"AND ($1 <= 0 OR changed_at > pg_catalog.now() - pg_catalog.make_interval(days => $1)) "
+									"ORDER BY changed_at DESC, id DESC LIMIT $2",
+									3, argtypes, values, NULL, true, 0);
+	}
+	else
+	{
+		argtypes[2] = TEXTOID;
+		values[2] = CStringGetTextDatum(username);
+		ret = SPI_execute_with_args("SELECT verifier FROM " PPP_SCHEMA ".password_history "
+									"WHERE role_oid IS NULL AND role_name = $3 "
+									"AND ($1 <= 0 OR changed_at > pg_catalog.now() - pg_catalog.make_interval(days => $1)) "
+									"ORDER BY changed_at DESC, id DESC LIMIT $2",
+									3, argtypes, values, NULL, true, 0);
+	}
 	if (ret != SPI_OK_SELECT)
 		elog(ERROR, "pg_pass_policy: password_history lookup failed: %s",
 			 SPI_result_code_string(ret));
@@ -843,7 +950,6 @@ ppp_password_reused(const char *username, Oid roleid, const char *password,
 		if (v != NULL)
 			reused = ppp_matches_verifier(username, password, v);
 	}
-	ppp_spi_end(&st);
 
 	return reused;
 }
@@ -852,16 +958,23 @@ ppp_password_reused(const char *username, Oid roleid, const char *password,
  * Full evaluation shared by the hook and check_password() for a clear-text
  * password: complexity, minimum age, history.  Returns the code of the first
  * failed rule or NULL.
+ *
+ * caller_is_super is the superuser() status of the caller, read before the
+ * SPI session switched to the bootstrap superuser.  check_history covers
+ * both the minimum age and the history: check_password() disables them when
+ * the caller may not learn anything about another role's passwords or
+ * password change date.
  */
 static const char *
 ppp_evaluate_plain(const char *username, Oid roleid, const char *password,
-				   const pppProfile *p, bool skip_complexity, bool check_history)
+				   const pppProfile *p, bool skip_complexity, bool check_history,
+				   bool caller_is_super)
 {
 	const char *code = NULL;
 
 	if (!skip_complexity && !ppp_validate(username, password, p, &code))
 		return code;
-	if (!superuser() && ppp_min_age_violated(username, roleid, p))
+	if (check_history && !caller_is_super && ppp_min_age_violated(roleid, p))
 		return "PPP-030";
 	if (check_history && ppp_password_reused(username, roleid, password, p))
 		return "PPP-031";
@@ -878,6 +991,9 @@ ppp_evaluate_plain(const char *username, Oid roleid, const char *password,
  * Write a password_rejected audit row in a subtransaction.  Any failure is
  * downgraded to a LOG message so that it never hides the main error.
  *
+ * Runs inside the SPI session of the hook (the subtransaction rollback keeps
+ * the identity, GUC level and SPI connection set up before it).
+ *
  * Note: the ERROR raised right after aborts the enclosing transaction, which
  * also discards this row: the durable trace is the server log line written
  * by audit() (RAISE LOG), or by ppp_reject() when the audit failed.
@@ -888,7 +1004,6 @@ ppp_audit_rejection(const char *username, const char *code)
 {
 	MemoryContext oldcxt = CurrentMemoryContext;
 	ResourceOwner oldowner = CurrentResourceOwner;
-	pppSpiState st;
 	volatile bool ok = true;
 
 	if (IsInParallelMode())
@@ -906,13 +1021,11 @@ ppp_audit_rejection(const char *username, const char *code)
 		values[0] = CStringGetTextDatum(username);
 		values[1] = CStringGetTextDatum(code);
 
-		ppp_spi_begin(&st);
 		ret = SPI_execute_with_args("SELECT " PPP_SCHEMA ".audit('password_rejected', $1, "
 									"pg_catalog.jsonb_build_object('code', $2))",
 									2, argtypes, values, NULL, false, 0);
 		if (ret != SPI_OK_SELECT)
 			elog(ERROR, "audit() failed: %s", SPI_result_code_string(ret));
-		ppp_spi_end(&st);
 
 		ReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(oldcxt);
@@ -947,8 +1060,7 @@ ppp_audit_rejection(const char *username, const char *code)
  * Reject the password: log, audit, then ERROR.  The statement (which holds
  * the clear-text password) and the context (which holds it too when the
  * ALTER ROLE is run through EXECUTE, as in rotate_password) are hidden from
- * the server log.  These ereport() run outside ppp_spi_begin/end, so the
- * GUC guard set there does not apply here.
+ * the server log, here and again by ppp_rethrow_hidden() in the hook.
  */
 static void
 ppp_reject(const char *username, const char *code, const pppProfile *p,
@@ -977,11 +1089,13 @@ ppp_reject(const char *username, const char *code, const pppProfile *p,
 			 errhidecontext(true)));
 }
 
-/* Record the accepted verifier through pass_policy.record_password_change */
+/*
+ * Record the accepted verifier through pass_policy.record_password_change,
+ * inside the SPI session of the hook.
+ */
 static void
 ppp_record_change(const char *username, const char *verifier)
 {
-	pppSpiState st;
 	Oid			argtypes[2] = {TEXTOID, TEXTOID};
 	Datum		values[2];
 	int			ret;
@@ -989,13 +1103,11 @@ ppp_record_change(const char *username, const char *verifier)
 	values[0] = CStringGetTextDatum(username);
 	values[1] = CStringGetTextDatum(verifier);
 
-	ppp_spi_begin(&st);
 	ret = SPI_execute_with_args("SELECT " PPP_SCHEMA ".record_password_change($1, $2)",
 								2, argtypes, values, NULL, false, 0);
 	if (ret != SPI_OK_SELECT)
 		elog(ERROR, "pg_pass_policy: record_password_change() failed: %s",
 			 SPI_result_code_string(ret));
-	ppp_spi_end(&st);
 }
 
 
@@ -1003,54 +1115,66 @@ ppp_record_change(const char *username, const char *verifier)
  * check_password_hook
  * ------------------------------------------------------------------------
  */
+
+/*
+ * Steps 2 to 8 of SPEC 6.2, run inside the single SPI session opened by the
+ * hook.  caller_is_super is superuser() of the caller, read before that
+ * session switched to the bootstrap superuser.
+ */
 static void
 ppp_apply_policy(const char *username, const char *shadow_pass,
-				 PasswordType password_type)
+				 PasswordType password_type, bool caller_is_super,
+				 MemoryContext cxt)
 {
 	pppProfile	prof;
 	Oid			roleid;
+	Oid			nspowner;
 	char	   *verifier;
 	const char *code;
 
-	/* step 1 */
-	if (!ppp_enabled || ppp_role_is_exempt(username))
-		return;
-
 	/* step 2: where is the extension? */
-	if (!ppp_schema_exists())
+	switch (ppp_extension_state(&nspowner))
 	{
-		char	   *dbname = get_database_name(MyDatabaseId);
-		bool		in_ppp_db = (dbname != NULL && ppp_database != NULL &&
-								 strcmp(dbname, ppp_database) == 0);
+		case PPP_EXT_TRUSTED:
+			break;
+		case PPP_EXT_UNTRUSTED:
+			ppp_untrusted_error(nspowner);
+			break;
+		case PPP_EXT_ABSENT:
+			{
+				char	   *dbname = get_database_name(MyDatabaseId);
+				bool		in_ppp_db = (dbname != NULL && ppp_database != NULL &&
+										 strcmp(dbname, ppp_database) == 0);
 
-		if (!in_ppp_db && ppp_enforce_database)
-		{
-			memset(&prof, 0, sizeof(prof));
-			prof.name = "?";
-			ppp_reject(username, "PPP-003", &prof, false);
-		}
+				if (!in_ppp_db && ppp_enforce_database)
+				{
+					memset(&prof, 0, sizeof(prof));
+					prof.name = "?";
+					ppp_reject(username, "PPP-003", &prof, false);
+				}
 
-		if (!ppp_missing_schema_warned)
-		{
-			if (in_ppp_db)
-				ereport(WARNING,
-						(errmsg("pg_pass_policy: extension is not installed in database \"%s\", password policy not applied",
-								dbname),
-						 errhint("Run CREATE EXTENSION pg_pass_policy in this database."),
-						 errhidestmt(true),
-						 errhidecontext(true)));
-			else
-				ereport(WARNING,
-						(errmsg("pg_pass_policy: password policy not applied outside database \"%s\"",
-								ppp_database),
-						 errhidestmt(true),
-						 errhidecontext(true)));
-			ppp_missing_schema_warned = true;
-		}
-		return;
+				if (!ppp_missing_schema_warned)
+				{
+					if (in_ppp_db)
+						ereport(WARNING,
+								(errmsg("pg_pass_policy: extension is not installed in database \"%s\", password policy not applied",
+										dbname),
+								 errhint("Run CREATE EXTENSION pg_pass_policy in this database."),
+								 errhidestmt(true),
+								 errhidecontext(true)));
+					else
+						ereport(WARNING,
+								(errmsg("pg_pass_policy: password policy not applied outside database \"%s\"",
+										ppp_database),
+								 errhidestmt(true),
+								 errhidecontext(true)));
+					ppp_missing_schema_warned = true;
+				}
+				return;
+			}
 	}
 
-	ppp_load_effective_profile(username, &prof);
+	ppp_load_effective_profile(username, &prof, cxt);
 	roleid = get_role_oid(username, true);
 
 	if (password_type != PASSWORD_TYPE_PLAINTEXT)
@@ -1060,7 +1184,7 @@ ppp_apply_policy(const char *username, const char *shadow_pass,
 			ppp_reject(username, "PPP-001", &prof, true);
 		if (password_type == PASSWORD_TYPE_MD5 && ppp_require_scram)
 			ppp_reject(username, "PPP-002", &prof, true);
-		if (!superuser() && ppp_min_age_violated(username, roleid, &prof))
+		if (!caller_is_super && ppp_min_age_violated(roleid, &prof))
 			ppp_reject(username, "PPP-030", &prof, true);
 		verifier = pstrdup(shadow_pass);
 	}
@@ -1071,7 +1195,8 @@ ppp_apply_policy(const char *username, const char *shadow_pass,
 
 		/* steps 4 to 6 */
 		code = ppp_evaluate_plain(username, roleid, shadow_pass, &prof,
-								  ppp_superuser_bypass && superuser(), true);
+								  ppp_superuser_bypass && caller_is_super,
+								  true, caller_is_super);
 		if (code != NULL)
 			ppp_reject(username, code, &prof, true);
 
@@ -1090,25 +1215,37 @@ ppp_check_password_hook(const char *username, const char *shadow_pass,
 						PasswordType password_type, Datum validuntil_time,
 						bool validuntil_null)
 {
-	bool		save_in_hook = ppp_in_hook;
-	Oid			save_userid;
-	int			save_sec_context;
-
-	GetUserIdAndSecContext(&save_userid, &save_sec_context);
-
-	/* steps 1 to 8 */
-	ppp_in_hook = true;
-	PG_TRY();
+	/* step 1 */
+	if (ppp_enabled && !ppp_role_is_exempt(username))
 	{
-		ppp_apply_policy(username, shadow_pass, password_type);
-	}
-	PG_FINALLY();
-	{
-		/* also restore the identity changed by ppp_spi_begin() on error */
+		MemoryContext cxt = CurrentMemoryContext;
+		bool		save_in_hook = ppp_in_hook;
+		bool		caller_is_super = superuser();
+		Oid			save_userid;
+		int			save_sec_context;
+		pppSpiState st;
+
+		GetUserIdAndSecContext(&save_userid, &save_sec_context);
+
+		/* steps 2 to 8, in one elevated SPI session */
+		ppp_in_hook = true;
+		PG_TRY();
+		{
+			ppp_spi_begin(&st);
+			ppp_apply_policy(username, shadow_pass, password_type,
+							 caller_is_super, cxt);
+			ppp_spi_end(&st);
+		}
+		PG_CATCH();
+		{
+			/* GUC level and SPI connection are released by the abort */
+			ppp_in_hook = save_in_hook;
+			SetUserIdAndSecContext(save_userid, save_sec_context);
+			ppp_rethrow_hidden(cxt);
+		}
+		PG_END_TRY();
 		ppp_in_hook = save_in_hook;
-		SetUserIdAndSecContext(save_userid, save_sec_context);
 	}
-	PG_END_TRY();
 
 	/* step 9 */
 	if (prev_check_password_hook)
@@ -1129,13 +1266,83 @@ ppp_policy_init(void)
  * ------------------------------------------------------------------------
  */
 
+/* ERROR unless the extension is installed here and trusted (PPP-004) */
 static void
-ppp_require_schema(void)
+ppp_require_extension(void)
 {
-	if (!ppp_schema_exists())
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("pg_pass_policy is not installed in this database")));
+	Oid			nspowner;
+
+	switch (ppp_extension_state(&nspowner))
+	{
+		case PPP_EXT_TRUSTED:
+			break;
+		case PPP_EXT_UNTRUSTED:
+			ppp_untrusted_error(nspowner);
+			break;
+		case PPP_EXT_ABSENT:
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("pg_pass_policy is not installed in this database"),
+					 errhidestmt(true),
+					 errhidecontext(true)));
+			break;
+	}
+}
+
+/*
+ * Evaluate the password argument (#1) of check_password(); the copies of the
+ * secret are wiped even if a check raises an ERROR.
+ */
+static const char *
+ppp_check_secret(FunctionCallInfo fcinfo, const char *username, Oid roleid,
+				 const pppProfile *prof, bool may_check_history,
+				 bool caller_is_super)
+{
+	text	   *volatile pwtext = NULL;
+	char	   *volatile password = NULL;
+	const char *volatile code = NULL;
+
+	PG_TRY();
+	{
+		pwtext = PG_GETARG_TEXT_PP(1);
+		password = text_to_cstring(pwtext);
+
+		switch (get_password_type(password))
+		{
+			case PASSWORD_TYPE_PLAINTEXT:
+				if (ppp_require_scram && Password_encryption == PASSWORD_TYPE_MD5)
+					code = "PPP-002";
+				else
+					code = ppp_evaluate_plain(username, roleid, password, prof,
+											  false, may_check_history,
+											  caller_is_super);
+				break;
+			case PASSWORD_TYPE_MD5:
+				if (prof->reject_prehashed)
+					code = "PPP-001";
+				else if (ppp_require_scram)
+					code = "PPP-002";
+				break;
+			default:
+				if (prof->reject_prehashed)
+					code = "PPP-001";
+				break;
+		}
+	}
+	PG_FINALLY();
+	{
+		if (password != NULL)
+		{
+			ppp_secure_zero(password, strlen(password));
+			pfree(password);
+		}
+		/* wipe the detoasted copy, if any (never the caller's datum) */
+		if (pwtext != NULL && (Pointer) pwtext != PG_GETARG_POINTER(1))
+			ppp_secure_zero(VARDATA_ANY(pwtext), VARSIZE_ANY_EXHDR(pwtext));
+	}
+	PG_END_TRY();
+
+	return code;
 }
 
 /*
@@ -1144,81 +1351,79 @@ ppp_require_schema(void)
  * NULL if the password complies with the effective profile of the role,
  * otherwise "PPP-0xx: reason".  No side effect, no audit.
  *
- * The history (and current password) comparison is only done when the
- * caller is a superuser or the role itself, so that the function cannot be
- * used as an oracle on another role's passwords.
+ * The minimum age, history and current password checks are only done when
+ * the caller is a superuser or the role itself, so that the function cannot
+ * be used as an oracle on another role's passwords or on the date of its
+ * last change.
+ *
+ * The whole body runs in one elevated SPI session whose GUC guard keeps
+ * STATEMENT/CONTEXT (which hold the password) out of the messages emitted
+ * meanwhile; an ERROR is re-thrown with both hidden (ppp_rethrow_hidden).
  */
 Datum
 ppp_check_password(PG_FUNCTION_ARGS)
 {
+	MemoryContext cxt = CurrentMemoryContext;
 	char	   *username;
-	text	   *volatile pwtext;
-	char	   *volatile password;
-	pppProfile	prof;
-	Oid			roleid;
-	const char *volatile code = NULL;
-	char	   *msg;
-	char	   *detail;
-	char	   *hint;
-	char	   *result;
-	bool		may_check_history;
+	bool		caller_is_super;
+	Oid			caller;
+	Oid			save_userid;
+	int			save_sec_context;
+	pppSpiState st;
+	text	   *volatile result = NULL;
 
 	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
 		PG_RETURN_NULL();
 
-	ppp_require_schema();
-
-	/* everything that can fail without needing the secret comes first */
+	/* identity of the caller, before the SPI session elevates it */
+	caller_is_super = superuser();
+	caller = GetUserId();
+	GetUserIdAndSecContext(&save_userid, &save_sec_context);
 	username = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	ppp_load_effective_profile(username, &prof);
-	roleid = get_role_oid(username, true);
-	may_check_history = superuser() ||
-		(OidIsValid(roleid) && roleid == GetUserId());
 
-	pwtext = PG_GETARG_TEXT_PP(1);
-	password = text_to_cstring(pwtext);
-
-	/* the copies of the secret are wiped even if a check raises an ERROR */
 	PG_TRY();
 	{
-		switch (get_password_type(password))
+		const char *code;
+		pppProfile	prof;
+		Oid			roleid;
+		bool		may_check_history;
+
+		ppp_spi_begin(&st);
+		ppp_require_extension();
+
+		/* everything that can fail without needing the secret comes first */
+		ppp_load_effective_profile(username, &prof, cxt);
+		roleid = get_role_oid(username, true);
+		may_check_history = caller_is_super ||
+			(OidIsValid(roleid) && roleid == caller);
+
+		code = ppp_check_secret(fcinfo, username, roleid, &prof,
+								may_check_history, caller_is_super);
+
+		/* back to the caller's identity, GUC level and memory context */
+		ppp_spi_end(&st);
+
+		if (code != NULL)
 		{
-			case PASSWORD_TYPE_PLAINTEXT:
-				if (ppp_require_scram && Password_encryption == PASSWORD_TYPE_MD5)
-					code = "PPP-002";
-				else
-					code = ppp_evaluate_plain(username, roleid, password, &prof,
-											  false, may_check_history);
-				break;
-			case PASSWORD_TYPE_MD5:
-				if (prof.reject_prehashed)
-					code = "PPP-001";
-				else if (ppp_require_scram)
-					code = "PPP-002";
-				break;
-			default:
-				if (prof.reject_prehashed)
-					code = "PPP-001";
-				break;
+			char	   *msg;
+			char	   *detail;
+			char	   *hint;
+
+			ppp_describe(code, &prof, &msg, &detail, &hint);
+			result = cstring_to_text(detail ? psprintf("%s: %s. %s", code, msg, detail)
+									 : psprintf("%s: %s", code, msg));
 		}
 	}
-	PG_FINALLY();
+	PG_CATCH();
 	{
-		ppp_secure_zero(password, strlen(password));
-		pfree(password);
-		/* wipe the detoasted copy, if any (never the caller's datum) */
-		if ((Pointer) pwtext != PG_GETARG_POINTER(1))
-			ppp_secure_zero(VARDATA_ANY(pwtext), VARSIZE_ANY_EXHDR(pwtext));
+		SetUserIdAndSecContext(save_userid, save_sec_context);
+		ppp_rethrow_hidden(cxt);
 	}
 	PG_END_TRY();
 
-	if (code == NULL)
+	if (result == NULL)
 		PG_RETURN_NULL();
-
-	ppp_describe(code, &prof, &msg, &detail, &hint);
-	result = detail ? psprintf("%s: %s. %s", code, msg, detail)
-		: psprintf("%s: %s", code, msg);
-	PG_RETURN_TEXT_P(cstring_to_text(result));
+	PG_RETURN_TEXT_P(result);
 }
 
 /* Uniform random integer in [0, n) from pg_strong_random (rejection sampling) */
@@ -1252,116 +1457,140 @@ ppp_random_char(const char *alphabet)
  *
  * Builds a password from pg_strong_random only, satisfying the class minima
  * of the given profile (or "default"), then shuffles it (Fisher-Yates).
+ * Runs in one elevated SPI session (profile lookup), like check_password();
+ * the work buffer is wiped on every path.
  */
 Datum
 ppp_generate_password(PG_FUNCTION_ARGS)
 {
+	MemoryContext cxt = CurrentMemoryContext;
 	int32		length;
-	const char *profname;
-	pppProfile	prof;
-	pppProfile	genprof;
-	int			need_lower,
-				need_upper,
-				need_digit,
-				need_special;
-	int			nclasses_forced;
-	char	   *buf;
-	text	   *result;
-	int			tries;
+	char	   *profname;
+	Oid			save_userid;
+	int			save_sec_context;
+	pppSpiState st;
+	char	   *volatile buf = NULL;
+	text	   *volatile result = NULL;
 
 	length = PG_ARGISNULL(0) ? 24 : PG_GETARG_INT32(0);
 	if (length < PPP_GEN_MIN_LENGTH || length > PPP_GEN_MAX_LENGTH)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("password length must be between %d and %d",
-						PPP_GEN_MIN_LENGTH, PPP_GEN_MAX_LENGTH)));
+						PPP_GEN_MIN_LENGTH, PPP_GEN_MAX_LENGTH),
+				 errhidestmt(true),
+				 errhidecontext(true)));
 
-	ppp_require_schema();
 	profname = PG_ARGISNULL(1) ? "default" : text_to_cstring(PG_GETARG_TEXT_PP(1));
-	ppp_load_named_profile(profname, &prof);
+	GetUserIdAndSecContext(&save_userid, &save_sec_context);
 
-	if (length < prof.min_length ||
-		(prof.max_length > 0 && length > prof.max_length))
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("password length %d does not comply with profile \"%s\"",
-						length, prof.name),
-				 errdetail("The profile requires between %d and %d characters.",
-						   prof.min_length, prof.max_length)));
-
-	need_lower = Max(prof.min_lower, 1);
-	need_upper = Max(prof.min_upper, 1);
-	need_digit = Max(prof.min_digit, 1);
-	need_special = Max(prof.min_special, 0);
-
-	/*
-	 * Specials are only forced when the profile asks for them, or when the
-	 * three other classes are not enough to reach min_classes.
-	 */
-	nclasses_forced = 3 + (need_special > 0);
-	if (nclasses_forced < prof.min_classes)
-		need_special = 1;
-
-	if (need_lower + need_upper + need_digit + need_special > length)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("password length %d is too small for the character class minima of profile \"%s\"",
-						length, prof.name)));
-
-	/* the generated password is re-validated without username/dictionary */
-	genprof = prof;
-	genprof.reject_username = false;
-	genprof.reject_dictionary = false;
-
-	buf = palloc(length + 1);
-	for (tries = 0;; tries++)
+	PG_TRY();
 	{
-		const char *code;
-		int			pos = 0;
-		int			i;
-		char	   *all;
+		pppProfile	prof;
+		pppProfile	genprof;
+		int			need_lower,
+					need_upper,
+					need_digit,
+					need_special;
+		int			nclasses_forced;
+		int			tries;
 
-		for (i = 0; i < need_lower; i++)
-			buf[pos++] = ppp_random_char(ppp_alpha_lower);
-		for (i = 0; i < need_upper; i++)
-			buf[pos++] = ppp_random_char(ppp_alpha_upper);
-		for (i = 0; i < need_digit; i++)
-			buf[pos++] = ppp_random_char(ppp_alpha_digit);
-		for (i = 0; i < need_special; i++)
-			buf[pos++] = ppp_random_char(ppp_alpha_special);
+		ppp_spi_begin(&st);
+		ppp_require_extension();
+		ppp_load_named_profile(profname, &prof, cxt);
 
-		all = psprintf("%s%s%s%s", ppp_alpha_lower, ppp_alpha_upper,
-					   ppp_alpha_digit, ppp_alpha_special);
-		while (pos < length)
-			buf[pos++] = ppp_random_char(all);
-		pfree(all);
-		buf[length] = '\0';
-
-		/* Fisher-Yates shuffle */
-		for (i = length - 1; i > 0; i--)
-		{
-			int			j = (int) ppp_random_uniform((uint32) i + 1);
-			char		tmp = buf[i];
-
-			buf[i] = buf[j];
-			buf[j] = tmp;
-		}
-
-		if (ppp_validate("", buf, &genprof, &code))
-			break;
-		if (tries >= PPP_GEN_MAX_TRIES)
-		{
-			ppp_secure_zero(buf, length);
+		if (length < prof.min_length ||
+			(prof.max_length > 0 && length > prof.max_length))
 			ereport(ERROR,
-					(errcode(ERRCODE_INTERNAL_ERROR),
-					 errmsg("pg_pass_policy: could not generate a password compliant with profile \"%s\" (%s)",
-							prof.name, code)));
-		}
-	}
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("password length %d does not comply with profile \"%s\"",
+							length, prof.name),
+					 errdetail("The profile requires between %d and %d characters.",
+							   prof.min_length, prof.max_length)));
 
-	result = cstring_to_text_with_len(buf, length);
-	ppp_secure_zero(buf, length + 1);
-	pfree(buf);
+		need_lower = Max(prof.min_lower, 1);
+		need_upper = Max(prof.min_upper, 1);
+		need_digit = Max(prof.min_digit, 1);
+		need_special = Max(prof.min_special, 0);
+
+		/*
+		 * Specials are only forced when the profile asks for them, or when
+		 * the three other classes are not enough to reach min_classes.
+		 */
+		nclasses_forced = 3 + (need_special > 0);
+		if (nclasses_forced < prof.min_classes)
+			need_special = 1;
+
+		if (need_lower + need_upper + need_digit + need_special > length)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("password length %d is too small for the character class minima of profile \"%s\"",
+							length, prof.name)));
+
+		/* the generated password is re-validated without username/dictionary */
+		genprof = prof;
+		genprof.reject_username = false;
+		genprof.reject_dictionary = false;
+
+		buf = palloc(length + 1);
+		for (tries = 0;; tries++)
+		{
+			const char *code;
+			int			pos = 0;
+			int			i;
+
+			for (i = 0; i < need_lower; i++)
+				buf[pos++] = ppp_random_char(ppp_alpha_lower);
+			for (i = 0; i < need_upper; i++)
+				buf[pos++] = ppp_random_char(ppp_alpha_upper);
+			for (i = 0; i < need_digit; i++)
+				buf[pos++] = ppp_random_char(ppp_alpha_digit);
+			for (i = 0; i < need_special; i++)
+				buf[pos++] = ppp_random_char(ppp_alpha_special);
+			while (pos < length)
+				buf[pos++] = ppp_random_char(ppp_alpha_all);
+			buf[length] = '\0';
+
+			/* Fisher-Yates shuffle */
+			for (i = length - 1; i > 0; i--)
+			{
+				int			j = (int) ppp_random_uniform((uint32) i + 1);
+				char		tmp = buf[i];
+
+				buf[i] = buf[j];
+				buf[j] = tmp;
+			}
+
+			if (ppp_validate("", buf, &genprof, &code))
+				break;
+			if (tries >= PPP_GEN_MAX_TRIES)
+				ereport(ERROR,
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("pg_pass_policy: could not generate a password compliant with profile \"%s\" (%s)",
+								prof.name, code)));
+		}
+
+		/* the result must survive SPI_finish() */
+		{
+			MemoryContext old = MemoryContextSwitchTo(cxt);
+
+			result = cstring_to_text_with_len(buf, length);
+			MemoryContextSwitchTo(old);
+		}
+		ppp_secure_zero(buf, length + 1);
+		pfree(buf);
+		buf = NULL;
+
+		ppp_spi_end(&st);
+	}
+	PG_CATCH();
+	{
+		if (buf != NULL)
+			ppp_secure_zero(buf, length + 1);
+		SetUserIdAndSecContext(save_userid, save_sec_context);
+		ppp_rethrow_hidden(cxt);
+	}
+	PG_END_TRY();
 
 	PG_RETURN_TEXT_P(result);
 }

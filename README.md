@@ -181,7 +181,11 @@ worker ne fait plus que la synchronisation de la mémoire partagée : il faut
 appeler `run_maintenance()` soi-même.
 
 Autres fonctions : `purge_audit(interval DEFAULT '365 days')`,
-`load_dictionary(text[])`, `audit(event_type, role_name, details jsonb)`.
+`load_dictionary(text[])`, `audit(event_type, role_name, details jsonb)`
+(réservée à `pass_policy_admin`). Aucune fonction ni le schéma ne sont
+accordés à `PUBLIC` : un utilisateur ordinaire change son propre mot de passe
+par `ALTER ROLE … PASSWORD`, les requêtes internes du hook s'exécutant avec
+les droits du superutilisateur.
 
 ## Paramètres (GUC)
 
@@ -198,7 +202,7 @@ Tous préfixés `pg_pass_policy.`. Contexte `postmaster` = redémarrage ;
 | `manage_valid_until` | bool | `on` | SIGHUP | le worker écrit `pg_authid.rolvaliduntil` |
 | `log_events` | bool | `on` | SIGHUP | une ligne `LOG: pg_pass_policy: …` par événement |
 | `notify_channel` | string | `pg_pass_policy` | SIGHUP | canal `NOTIFY` (charge utile JSON `event`/`role`/`at`/`details`) |
-| `exempt_roles` | liste | `''` | SIGHUP | rôles exemptés de la politique **et** du verrouillage (noms non cités mis en minuscules) |
+| `exempt_roles` | liste | `''` | SIGHUP | rôles exemptés de la politique **et** du verrouillage, séparés par des virgules, règles des identifiants SQL : noms non cités mis en minuscules, noms entre guillemets conservés tels quels (`'postgres, "App User"'`). `rotate_password()` et `switch_rotation_pair()` ne posent pas de `VALID UNTIL` sur un rôle exempté (ils relèvent seulement une borne déjà passée) |
 | `superuser_bypass` | bool | `off` | SIGHUP | `on` : les superutilisateurs échappent à la complexité (pas à l'historique) |
 | `require_scram` | bool | `on` | SIGHUP | refuse les mots de passe MD5 (`PPP-002`) |
 | `enforce_database` | bool | `on` | SIGHUP | hors de `database`, `ALTER ROLE … PASSWORD` est refusé (`PPP-003`) ; `off` : accepté sans contrôle avec un `WARNING` |
@@ -214,6 +218,7 @@ texte. Le mot de passe n'apparaît jamais dans le message, le log ni l'audit.
 | `PPP-001` | mot de passe pré-haché (MD5 ou SCRAM) refusé : la politique ne peut pas être vérifiée (`reject_prehashed`) |
 | `PPP-002` | mot de passe MD5 refusé (`require_scram = on`) |
 | `PPP-003` | changement de mot de passe hors de la base `pg_pass_policy.database` (`enforce_database = on`) |
+| `PPP-004` | l'extension est installée mais son schéma `pass_policy` n'est pas fiable (propriétaire non superutilisateur) : tout changement de mot de passe est refusé (SQLSTATE `55000`) |
 | `PPP-010` | trop court (`min_length`) |
 | `PPP-011` | trop long (`max_length`) |
 | `PPP-012` | pas assez de classes de caractères (`min_classes`) |
@@ -226,7 +231,7 @@ texte. Le mot de passe n'apparaît jamais dans le message, le log ni l'audit.
 | `PPP-019` | trop de caractères identiques consécutifs (`max_repeat`) |
 | `PPP-020` | caractère de contrôle, ou espace en début ou en fin |
 | `PPP-030` | changé trop récemment (`min_age` ; non appliqué à un superutilisateur) |
-| `PPP-031` | déjà utilisé récemment (`history_count` / `history_days`) |
+| `PPP-031` | parmi les `history_count` derniers mots de passe, l'actuel compris (`history_days`) |
 
 Les caractères sont comptés en points de code UTF-8 ; tout caractère non ASCII
 compte comme « spécial ».
@@ -281,9 +286,17 @@ compte comme « spécial ».
   `rotate_password`, `switch_rotation_pair`, `run_maintenance`) ; ces appels
   n'apparaissent donc pas dans les plans d'auto_explain.
 - **`manage_valid_until = off`** : le worker ne touche plus à `VALID UNTIL`,
-  sauf pour relever une borne qu'il a lui-même posée (`expire_password`,
-  ancienne synchronisation) une fois le mot de passe changé ; sans cela le
-  rôle resterait bloqué indéfiniment après un `ALTER ROLE … PASSWORD` classique.
+  sauf pour relever (à `infinity`) une borne passée qu'il a lui-même posée
+  (`expire_password`, ancienne synchronisation) une fois le mot de passe
+  changé ; sans cela le rôle resterait bloqué indéfiniment après un
+  `ALTER ROLE … PASSWORD` classique. `rotate_password()` et
+  `switch_rotation_pair()` ne posent alors pas non plus de `VALID UNTIL` sur
+  le rôle dont le mot de passe change.
+- **Propriétaire du schéma** : le schéma `pass_policy` doit appartenir à un
+  superutilisateur (celui qui a fait `CREATE EXTENSION`). S'il est cédé à un
+  autre rôle (`ALTER SCHEMA … OWNER TO`) ou si son propriétaire perd l'attribut
+  `SUPERUSER`, le hook refuse tout changement de mot de passe avec `PPP-004`
+  plutôt que d'accepter sans politique.
 - **Base du worker** : `pg_pass_policy.database` doit exister au démarrage ;
   sinon le worker échoue avec le FATAL standard « database "x" does not
   exist » et le postmaster le relance toutes les 10 secondes (une ligne par

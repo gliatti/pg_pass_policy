@@ -183,6 +183,54 @@ SELECT ppp_test.try($$ALTER ROLE regress_hist PASSWORD 'weak'$$) AS self_weak;
 (1 row)
 
 RESET SESSION AUTHORIZATION;
+-- Rôle supprimé puis recréé sous le même nom (avant run_maintenance) : les
+-- lignes périmées de l'ancien rôle (role_state, password_history, OID disparu)
+-- ne s'appliquent pas au nouveau. La recherche se fait par OID : ni PPP-030
+-- (min_age, contrôlé pour le rôle lui-même) ni PPP-031 (ancien mot de passe).
+INSERT INTO ppp_test.secrets VALUES ('reborn', 'Reborn-Pass#2024a'), ('born', 'Born-Pass#2024ab');
+CREATE ROLE regress_reborn LOGIN;
+ALTER ROLE regress_reborn PASSWORD 'Reborn-Pass#2024a';
+DROP ROLE regress_reborn;
+CREATE ROLE regress_reborn LOGIN;
+SELECT count(*) AS stale_state_rows FROM pass_policy.role_state
+ WHERE role_name = 'regress_reborn' AND role_oid <> 'regress_reborn'::regrole::oid;
+ stale_state_rows 
+------------------
+                1
+(1 row)
+
+SET SESSION AUTHORIZATION regress_reborn;
+SELECT ppp_test.try($$ALTER ROLE regress_reborn PASSWORD 'Reborn-Pass#2024a'$$) AS reborn_same_password;
+ reborn_same_password 
+----------------------
+ ok
+(1 row)
+
+RESET SESSION AUTHORIZATION;
+SELECT count(*) AS history_new_oid FROM pass_policy.password_history
+ WHERE role_oid = 'regress_reborn'::regrole::oid;
+ history_new_oid 
+-----------------
+               1
+(1 row)
+
+-- CREATE ROLE … PASSWORD (pas encore d'OID) : seules les lignes sans OID
+-- (role_oid IS NULL), cherchées par nom, sont comparées
+CREATE ROLE regress_born LOGIN PASSWORD 'Born-Pass#2024ab';
+DROP ROLE regress_born;
+SELECT ppp_test.try($$CREATE ROLE regress_born LOGIN PASSWORD 'Born-Pass#2024ab'$$) AS born_unmapped_row;
+ born_unmapped_row 
+-------------------
+ 28P01 PPP-031
+(1 row)
+
+SELECT ppp_test.try($$CREATE ROLE regress_born LOGIN PASSWORD 'Born-Pass#2024ab-2'$$) AS born_other_password;
+ born_other_password 
+---------------------
+ ok
+(1 row)
+
+INSERT INTO ppp_test.secrets VALUES ('born2', 'Born-Pass#2024ab-2');
 -- Jamais de clair : aucun vérificateur ne contient un mot de passe de test
 SELECT bool_and(verifier LIKE 'SCRAM-SHA-256$%') AS all_scram,
        count(*) FILTER (WHERE verifier !~ '^SCRAM-SHA-256\$[0-9]+:[A-Za-z0-9+/=]+\$[A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+$') AS malformed

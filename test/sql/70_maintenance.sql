@@ -113,6 +113,32 @@ SELECT (SELECT count(*) FROM pass_policy.role_state WHERE role_name = 'regress_g
        (SELECT count(*) FROM pass_policy.role_profile WHERE role_name = 'regress_gone') AS profile_rows,
        (SELECT count(*) FROM pass_policy.password_history WHERE role_name = 'regress_gone') AS history_rows;
 
+-- Renommage puis recréation de l'ancien nom : les lignes suivent l'OID. Le
+-- rôle renommé garde verrou, profil et historique ; le nouveau rôle qui porte
+-- l'ancien nom n'hérite de rien (seules les lignes dont l'OID a disparu sont
+-- rattachées par nom).
+CREATE ROLE regress_alice LOGIN;
+ALTER ROLE regress_alice PASSWORD 'Alice-Rename#2024';
+INSERT INTO ppp_test.secrets VALUES ('alice', 'Alice-Rename#2024');
+SELECT pass_policy.assign_profile('regress_alice', 'p_never');
+SELECT pass_policy.lock_role('regress_alice', NULL, 'rename test');
+ALTER ROLE regress_alice RENAME TO regress_bob;
+CREATE ROLE regress_alice LOGIN;
+CREATE TEMP TABLE m_rename AS SELECT * FROM pass_policy.run_maintenance();
+SELECT count(*) AS remapped FROM m_rename WHERE action = 'remap';
+SELECT s.role_name, s.locked_until = 'infinity' AS locked, s.role_oid = 'regress_bob'::regrole::oid AS oid_ok
+  FROM pass_policy.role_state s WHERE s.role_name IN ('regress_alice', 'regress_bob')
+ ORDER BY 1;
+SELECT p.role_name, p.role_oid = 'regress_bob'::regrole::oid AS oid_ok
+  FROM pass_policy.role_profile p WHERE p.role_name IN ('regress_alice', 'regress_bob')
+ ORDER BY 1;
+SELECT h.role_name, count(*) AS history_rows,
+       bool_and(h.role_oid = 'regress_bob'::regrole::oid) AS oid_ok
+  FROM pass_policy.password_history h WHERE h.role_name IN ('regress_alice', 'regress_bob')
+ GROUP BY 1 ORDER BY 1;
+SELECT pass_policy.unlock_role('regress_bob');
+SELECT pass_policy.unassign_profile('regress_bob');
+
 -- Réconciliation 1 : rôle dont le mot de passe a été posé avant CREATE EXTENSION
 -- (regress_legacy, créé dans 00_setup, statut unknown vérifié dans 00_setup).
 -- Des run_maintenance() ont eu lieu depuis (20, 60, ici) : l'historique
@@ -173,6 +199,21 @@ ALTER ROLE regress_unblock PASSWORD 'Unblock-Pw#2024y';
 SELECT action, role_name, details->>'mode' AS mode
   FROM pass_policy.run_maintenance() WHERE role_name = 'regress_unblock';
 SELECT rolvaliduntil > now() AS unblocked FROM pg_roles WHERE rolname = 'regress_unblock';
+-- … à « infinity », et non à grace_until : personne ne relèverait plus
+-- cette nouvelle borne une fois passée (manage_valid_until = off)
+SELECT rolvaliduntil = 'infinity' AS unblocked_infinity FROM pg_roles WHERE rolname = 'regress_unblock';
+-- rotate_password() et switch_rotation_pair() suivent la même règle : pas de
+-- VALID UNTIL posé quand manage_valid_until = off
+CREATE ROLE regress_off_rot LOGIN;
+INSERT INTO ppp_test.secrets SELECT 'off_rot', pass_policy.rotate_password('regress_off_rot');
+SELECT rolvaliduntil IS NULL AS rotate_no_valid_until FROM pg_roles WHERE rolname = 'regress_off_rot';
+CREATE ROLE regress_off_grp NOLOGIN;
+SELECT pass_policy.create_rotation_pair('off_pair', 'regress_off_a', 'regress_off_b', 'regress_off_grp');
+CREATE TEMP TABLE off_switch AS SELECT * FROM pass_policy.switch_rotation_pair('off_pair');
+INSERT INTO ppp_test.secrets SELECT 'off_pair', password FROM off_switch;
+SELECT r.rolvaliduntil IS NULL AS switch_no_valid_until
+  FROM off_switch o JOIN pg_roles r ON r.rolname = o.active_role;
+DROP TABLE off_switch;
 ALTER SYSTEM RESET pg_pass_policy.manage_valid_until;
 SELECT pg_reload_conf();
 SELECT pg_sleep(0.5);

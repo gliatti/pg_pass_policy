@@ -25,6 +25,7 @@
 #include "storage/shmem.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/memutils.h"
 #include "utils/timestamp.h"
 #include "utils/tuplestore.h"
 #include "utils/varlena.h"
@@ -134,6 +135,25 @@ ppp_shmem_startup(void)
 }
 
 /*
+ * pg_pass_policy.exempt_roles, parsed once per assignment.
+ *
+ * The check hook validates the syntax (SplitIdentifierString()); the
+ * assign hook then stores the split names in ppp_exempt_cxt, so that
+ * ppp_role_is_exempt() (called by both hooks at every password change and
+ * every authentication) only compares strings.  The GUC "extra" pointer is
+ * not used: it must be malloc()ed up to PG 15 and guc_malloc()ed from PG 16,
+ * a version test that only compat.h may make (SPEC 6.5); a private memory
+ * context gives the same result on every version.
+ *
+ * ppp_exempt_valid is false when the last assignment could not be parsed
+ * (out of memory): ppp_role_is_exempt() then parses the raw value itself.
+ */
+static MemoryContext ppp_exempt_cxt = NULL;
+static char **ppp_exempt_names = NULL;
+static int	ppp_exempt_count = 0;
+static bool ppp_exempt_valid = false;
+
+/*
  * GUC check hook for pg_pass_policy.exempt_roles: the value must be a valid
  * comma-separated list of identifiers.
  */
@@ -154,11 +174,73 @@ ppp_check_exempt_roles(char **newval, void **extra, GucSource source)
 }
 
 /*
+ * GUC assign hook for pg_pass_policy.exempt_roles.  Assign hooks should not
+ * throw: the copies are allocated with MCXT_ALLOC_NO_OOM, a failure only
+ * leaves the cache invalid (ppp_role_is_exempt() then parses the raw value).
+ */
+static void
+ppp_assign_exempt_roles(const char *newval, void *extra)
+{
+	char	   *rawstring;
+	List	   *elemlist = NIL;
+	ListCell   *lc;
+	char	  **names;
+	int			n = 0;
+	size_t		len;
+
+	ppp_exempt_valid = false;
+	ppp_exempt_names = NULL;
+	ppp_exempt_count = 0;
+	if (ppp_exempt_cxt == NULL)
+		return;
+	MemoryContextReset(ppp_exempt_cxt);
+
+	if (newval == NULL || newval[0] == '\0')
+	{
+		ppp_exempt_valid = true;
+		return;
+	}
+
+	len = strlen(newval) + 1;
+	rawstring = MemoryContextAllocExtended(ppp_exempt_cxt, len, MCXT_ALLOC_NO_OOM);
+	if (rawstring == NULL)
+		return;
+	memcpy(rawstring, newval, len);
+
+	/*
+	 * The value was accepted by the check hook, so SplitIdentifierString()
+	 * cannot fail on its syntax; its small list allocations go to
+	 * ppp_exempt_cxt and could only fail on out of memory.
+	 */
+	{
+		MemoryContext old = MemoryContextSwitchTo(ppp_exempt_cxt);
+		bool		ok = SplitIdentifierString(rawstring, ',', &elemlist);
+
+		MemoryContextSwitchTo(old);
+		if (!ok)
+			return;
+	}
+
+	names = MemoryContextAllocExtended(ppp_exempt_cxt,
+									   sizeof(char *) * Max(list_length(elemlist), 1),
+									   MCXT_ALLOC_NO_OOM);
+	if (names == NULL)
+		return;
+	foreach(lc, elemlist)
+		names[n++] = (char *) lfirst(lc);	/* point into rawstring */
+
+	ppp_exempt_names = names;
+	ppp_exempt_count = n;
+	ppp_exempt_valid = true;
+}
+
+/*
  * Is the role exempted from the policy and from the lockout?
  *
  * The list follows the SQL identifier rules of SplitIdentifierString():
  * unquoted names are down-cased, double-quoted names keep their case.  The
- * comparison with the role name is then exact.
+ * comparison with the role name is then exact.  pass_policy._is_exempt()
+ * implements the same rules in SQL.
  *
  * Safe to call from the ClientAuthentication hook (no catalog access).
  */
@@ -169,11 +251,21 @@ ppp_role_is_exempt(const char *rolename)
 	List	   *elemlist;
 	ListCell   *lc;
 	bool		result = false;
+	int			i;
 
 	if (rolename == NULL || ppp_exempt_roles == NULL ||
 		ppp_exempt_roles[0] == '\0')
 		return false;
 
+	if (ppp_exempt_valid)
+	{
+		for (i = 0; i < ppp_exempt_count; i++)
+			if (strcmp(ppp_exempt_names[i], rolename) == 0)
+				return true;
+		return false;
+	}
+
+	/* cache unavailable (out of memory at assignment): parse here */
 	rawstring = pstrdup(ppp_exempt_roles);
 	if (!SplitIdentifierString(rawstring, ',', &elemlist))
 	{
@@ -200,47 +292,72 @@ ppp_role_is_exempt(const char *rolename)
 }
 
 /*
- * Wipe memory that held a secret.  explicit_bzero() cannot be optimized away;
- * the volatile loop is the portable fallback.
- */
-/*
- * ppp_extension_installed
+ * ppp_extension_state
  *
  * The password hook runs in every database of the cluster and executes SPI
  * queries as the bootstrap superuser against schema-qualified objects.  Merely
  * finding a schema named PPP_SCHEMA is not enough: a user with CREATE on a
  * database could create a look-alike schema whose effective_profile() would
- * then run with superuser rights.  Require the real extension, bound to that
- * very schema, and a superuser owner of the schema.
+ * then run with superuser rights.  Trusted = the real extension, bound to
+ * that very schema, and a superuser owner of the schema.
+ *
+ * PPP_EXT_ABSENT: no pg_pass_policy extension in this database (a schema of
+ * that name may exist, it is ignored).  PPP_EXT_UNTRUSTED: the extension is
+ * installed but one of the other conditions fails (schema re-owned by a
+ * non-superuser, owner demoted, schema renamed): the caller must refuse
+ * rather than apply no policy.  *nspowner (optional) receives the owner of
+ * schema PPP_SCHEMA, InvalidOid if it does not exist.
  */
-bool
-ppp_extension_installed(void)
+pppExtensionState
+ppp_extension_state(Oid *nspowner)
 {
 	Oid			extoid;
 	Oid			nspoid;
 	HeapTuple	tup;
-	Oid			nspowner;
+	Oid			owner;
+
+	if (nspowner)
+		*nspowner = InvalidOid;
 
 	extoid = get_extension_oid(PPP_LIBRARY_NAME, true);
 	if (!OidIsValid(extoid))
-		return false;
+		return PPP_EXT_ABSENT;
 
 	nspoid = get_namespace_oid(PPP_SCHEMA, true);
 	if (!OidIsValid(nspoid))
-		return false;
-
-	if (get_extension_schema(extoid) != nspoid)
-		return false;
+		return PPP_EXT_UNTRUSTED;
 
 	tup = SearchSysCache1(NAMESPACEOID, ObjectIdGetDatum(nspoid));
 	if (!HeapTupleIsValid(tup))
-		return false;
-	nspowner = ((Form_pg_namespace) GETSTRUCT(tup))->nspowner;
+		return PPP_EXT_UNTRUSTED;
+	owner = ((Form_pg_namespace) GETSTRUCT(tup))->nspowner;
 	ReleaseSysCache(tup);
+	if (nspowner)
+		*nspowner = owner;
 
-	return superuser_arg(nspowner);
+	if (get_extension_schema(extoid) != nspoid)
+		return PPP_EXT_UNTRUSTED;
+
+	return superuser_arg(owner) ? PPP_EXT_TRUSTED : PPP_EXT_UNTRUSTED;
 }
 
+/*
+ * ppp_extension_installed
+ *
+ * True only when the extension is installed and trusted (see
+ * ppp_extension_state()).  Kept for the background worker, which waits
+ * while it is false.
+ */
+bool
+ppp_extension_installed(void)
+{
+	return ppp_extension_state(NULL) == PPP_EXT_TRUSTED;
+}
+
+/*
+ * Wipe memory that held a secret.  explicit_bzero() cannot be optimized away;
+ * the volatile loop is the portable fallback.
+ */
 void
 ppp_secure_zero(void *p, size_t len)
 {
@@ -334,6 +451,11 @@ _PG_init(void)
 				 errmsg("pg_pass_policy must be loaded via shared_preload_libraries"),
 				 errhint("Add pg_pass_policy to shared_preload_libraries in postgresql.conf and restart the server.")));
 
+	/* must exist before the assign hook of exempt_roles first runs */
+	ppp_exempt_cxt = AllocSetContextCreate(TopMemoryContext,
+										   "pg_pass_policy exempt_roles",
+										   ALLOCSET_SMALL_SIZES);
+
 	DefineCustomBoolVariable("pg_pass_policy.enabled",
 							 "Enables the password policy and the lockout.",
 							 "When off, the hooks do nothing and the background worker does not modify anything.",
@@ -408,7 +530,7 @@ _PG_init(void)
 							   "",
 							   PGC_SIGHUP,
 							   GUC_LIST_INPUT,
-							   ppp_check_exempt_roles, NULL, NULL);
+							   ppp_check_exempt_roles, ppp_assign_exempt_roles, NULL);
 
 	DefineCustomBoolVariable("pg_pass_policy.superuser_bypass",
 							 "Superusers setting a password are not subject to the complexity rules.",
