@@ -1,0 +1,22 @@
+# build PGXS
+*.o
+*.so
+*.bc
+*.dylib
+*.dll
+results/
+regression.diffs
+regression.out
+log/
+tmp_check/
+# python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+# rust
+cli/target/
+# divers
+*.swp
+.env

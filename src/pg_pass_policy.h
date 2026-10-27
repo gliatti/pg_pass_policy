@@ -1,0 +1,92 @@
+/*
+ * pg_pass_policy.h — contrat C partagé entre pg_pass_policy.c, policy.c,
+ * lockout.c et worker.c. Voir docs/SPEC.md §6.
+ */
+#ifndef PG_PASS_POLICY_H
+#define PG_PASS_POLICY_H
+
+#include "postgres.h"
+#include "datatype/timestamp.h"
+#include "port/atomics.h"
+#include "storage/lwlock.h"
+#include "utils/hsearch.h"
+
+#define PPP_SCHEMA        "pg_pass_policy"
+#define PPP_LIBRARY_NAME  "pg_pass_policy"
+#define PPP_LWLOCK_TRANCHE "pg_pass_policy"
+#define PPP_LOG_PREFIX    "pg_pass_policy: "
+
+/* ---- GUC (définis dans pg_pass_policy.c) ---------------------------------- */
+extern bool  ppp_enabled;
+extern char *ppp_database;
+extern int   ppp_worker_interval;      /* secondes, 0 = worker en sommeil */
+extern int   ppp_max_tracked_roles;    /* taille du hash shmem (postmaster) */
+extern bool  ppp_manage_valid_until;
+extern bool  ppp_log_events;
+extern char *ppp_notify_channel;
+extern char *ppp_exempt_roles;         /* liste séparée par des virgules */
+extern bool  ppp_superuser_bypass;
+extern bool  ppp_require_scram;
+extern bool  ppp_enforce_database;
+
+/* ---- Mémoire partagée (remplie par le worker, lue par le hook auth) ------- */
+typedef struct pppRoleKey
+{
+	char		rolename[NAMEDATALEN];
+} pppRoleKey;
+
+typedef struct pppRoleEntry
+{
+	pppRoleKey	key;
+
+	/* paramètres copiés depuis le profil effectif par le worker */
+	int32		max_failures;			/* 0 = verrouillage désactivé */
+	int32		failure_window_secs;
+	int32		lock_duration_secs;		/* -1 = déverrouillage manuel */
+	bool		from_profile;			/* false = valeurs par défaut */
+
+	/* compteurs maintenus par le hook d'authentification */
+	int32		failed_count;
+	TimestampTz first_failure_at;
+	TimestampTz last_failure_at;
+	TimestampTz locked_until;			/* 0 = non verrouillé, DT_NOEND = manuel */
+	bool		lock_pending_audit;		/* posé par le hook, effacé par le worker */
+	int32		pending_failures;		/* échecs non encore journalisés */
+} pppRoleEntry;
+
+typedef struct pppSharedState
+{
+	LWLock	   *lock;
+
+	/* valeurs du profil "default", appliquées aux rôles absents du hash */
+	int32		default_max_failures;
+	int32		default_failure_window_secs;
+	int32		default_lock_duration_secs;
+
+	pg_atomic_uint32 reload_requested;	/* posé par shmem_reload(), lu par le worker */
+	pid_t		worker_pid;
+	TimestampTz worker_last_run;
+	TimestampTz worker_last_reload;
+} pppSharedState;
+
+extern pppSharedState *ppp_shared;
+extern HTAB *ppp_role_hash;
+
+/* ---- pg_pass_policy.c -------------------------------------------------- */
+extern Size ppp_shmem_size(void);
+extern bool ppp_role_is_exempt(const char *rolename);
+/* efface une zone mémoire contenant un secret avant de la libérer */
+extern void ppp_secure_zero(void *p, size_t len);
+
+/* ---- policy.c ---------------------------------------------------------- */
+extern void ppp_policy_init(void);		/* installe check_password_hook */
+
+/* ---- lockout.c --------------------------------------------------------- */
+extern void ppp_lockout_init(void);		/* installe ClientAuthentication_hook */
+extern void ppp_lockout_shmem_init(void); /* appelé depuis shmem_startup_hook */
+
+/* ---- worker.c ---------------------------------------------------------- */
+extern void ppp_worker_register(void);	/* appelé depuis _PG_init */
+extern PGDLLEXPORT void ppp_worker_main(Datum main_arg);
+
+#endif							/* PG_PASS_POLICY_H */

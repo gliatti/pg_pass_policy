@@ -1,0 +1,6 @@
+comment = 'Password policy, history, expiration/rotation and lockout for PostgreSQL roles'
+default_version = '1.0'
+module_pathname = '$libdir/pg_pass_policy'
+relocatable = false
+schema = pg_pass_policy
+superuser = true
