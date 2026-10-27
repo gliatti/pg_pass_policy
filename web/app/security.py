@@ -15,15 +15,20 @@ def route_path(scope: Scope) -> str:
 
     ASGI servers (uvicorn >= 0.26) put the root_path in front of scope["path"]:
     the application compares its own paths (/healthz, /static/...) against
-    this value, never against request.url.path.  Same rule as Starlette's
-    router (starlette._utils.get_route_path, private).
+    this value, never against request.url.path.  Faithful copy of Starlette's
+    router rule (starlette._utils.get_route_path, private): in particular the
+    root path itself ("/pgpp" with --root-path /pgpp) gives "", not "/".
     """
-    path: str = scope.get("path", "")
+    path: str = scope["path"]
     root_path: str = scope.get("root_path", "")
-    if root_path and path.startswith(root_path):
-        rest = path[len(root_path) :]
-        if rest == "" or rest.startswith("/"):
-            return rest or "/"
+    if not root_path:
+        return path
+    if not path.startswith(root_path):
+        return path
+    if path == root_path:
+        return ""
+    if path[len(root_path)] == "/":
+        return path[len(root_path) :]
     return path
 
 

@@ -143,13 +143,13 @@ def test_anonymous_page_issues_no_token(unit_app):
     client = _two_users_client()
     response = client.get("/_whoami")
     assert response.status_code == 401
-    # the 401 page carries no token and sets no session cookie
+    # the 401 page (minimal, without base.html) carries no token and sets no
+    # session cookie
     assert "set-cookie" not in response.headers
-    match = re.search(r'<meta name="csrf-token" content="([^"]*)"', response.text)
-    assert match is not None and match.group(1) == ""
+    assert re.search(r'<meta name="csrf-token"', response.text) is None
     assert not client.cookies
-    # whatever was obtained anonymously is refused with bob's credentials
-    headers = {"X-CSRF-Token": match.group(1), **_basic(BOB, TEST_PASSWORD)}
+    # whatever was obtained anonymously (nothing) is refused with bob's credentials
+    headers = {"X-CSRF-Token": "", **_basic(BOB, TEST_PASSWORD)}
     assert client.post("/_echo", data={"a": "1"}, headers=headers).status_code == 403
 
 

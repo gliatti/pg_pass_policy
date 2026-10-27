@@ -135,18 +135,27 @@ WORKER_STATUS_SQL = (
 )
 
 
+WORKER_UNAVAILABLE_ERRORS: tuple[type[psycopg.Error], ...] = (
+    psycopg.errors.ObjectNotInPrerequisiteState,
+    psycopg.ProgrammingError,
+)
+
+
 def worker_status(conn: Connection) -> dict[str, Any] | None:
     """The worker state, or None when it cannot be read.
 
-    worker_status() raises an error when the library is not in
-    shared_preload_libraries (no shared memory): the pages then show "worker
-    not running" instead of failing.  The savepoint keeps the request
-    transaction usable for the queries that follow.
+    worker_status() raises ObjectNotInPrerequisiteState (55000) when the
+    library is not in shared_preload_libraries (no shared memory); a
+    ProgrammingError (42xxx: function missing, insufficient privilege) means
+    the same for the page.  Both show "worker not running" instead of
+    failing; the savepoint keeps the request transaction usable for the
+    queries that follow.  Any other error (lost connection, server shutting
+    down...) is not about the worker and propagates.
     """
     try:
         with conn.transaction():
             return conn.execute(WORKER_STATUS_SQL).fetchone()
-    except psycopg.Error as exc:
+    except WORKER_UNAVAILABLE_ERRORS as exc:
         log.warning("worker status unavailable: %s", error_message(exc))
         return None
 

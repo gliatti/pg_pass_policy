@@ -14,7 +14,7 @@
 <header class="topbar">
   <a class="brand" href="{{ path_for('dashboard') }}">pg_pass_policy</a>
   <nav>
-    <a href="{{ path_for('dashboard') }}"{% if route_path == '/' %} class="active"{% endif %}>Dashboard</a>
+    <a href="{{ path_for('dashboard') }}"{% if route_path in ('', '/') %} class="active"{% endif %}>Dashboard</a>
     <a href="{{ path_for('roles') }}"{% if route_path.startswith('/roles') %} class="active"{% endif %}>Roles</a>
     <a href="{{ path_for('profiles') }}"{% if route_path.startswith('/profiles') %} class="active"{% endif %}>Profiles</a>
     <a href="{{ path_for('audit') }}"{% if route_path.startswith('/audit') %} class="active"{% endif %}>Audit</a>
@@ -24,6 +24,7 @@
   <span class="whoami">{% if user %}signed in as <strong>{{ user }}</strong>{% endif %}</span>
 </header>
 <main>
+<div id="alerts" aria-live="polite"></div>
 {% block content %}{% endblock %}
 </main>
 </body>

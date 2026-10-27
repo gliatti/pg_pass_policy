@@ -10,9 +10,16 @@ from fastapi import APIRouter, Depends, Form, Request
 from psycopg import Connection
 
 from app import db
+from app.logfilter import get_logger
 from app.templating import NO_STORE, render
 
 router = APIRouter(prefix="/pairs")
+log = get_logger("pairs")
+
+REREAD_WARNING = (
+    "The pair was switched, but the pair list could not be read back: reload the page"
+    " to see the current state."
+)
 
 
 def _content(
@@ -25,8 +32,21 @@ def _content(
     switched: dict[str, Any] | None = None,
     form: dict[str, str] | None = None,
 ) -> Any:
+    warning = None
+    if switched is None:
+        pairs = db.list_pairs(conn)
+    else:
+        # the switch is committed: whatever happens to the re-read, this
+        # response is the only place the new password will ever be shown
+        try:
+            with conn.transaction():
+                pairs = db.list_pairs(conn)
+        except psycopg.Error as exc:
+            log.error("pair %s switched, the pairs could not be re-read: %s", switched["pair"], exc)
+            pairs, warning = [], REREAD_WARNING
     context = {
-        "pairs": db.list_pairs(conn),
+        "pairs": pairs,
+        "warning": warning,
         "error": error,
         "notice": notice,
         "switched": switched,
@@ -88,5 +108,8 @@ def pair_switch(
             result = db.switch_pair(conn, pair, length)
     except psycopg.Error as exc:
         return _content(request, conn, "pairs/_content.html", error=db.error_message(exc))
+    # committed before anything is shown: a password is displayed only once it
+    # is durable (the request's own commit would come after the rendering)
+    conn.commit()
     # the password is in this response only (no-store); never logged nor stored
     return _content(request, conn, "pairs/_content.html", switched={"pair": pair, **result})

@@ -42,10 +42,12 @@
     {% endif %}
   </td>
 </tr>
+{% elif reread_failed %}
+<tr class="role-row"><td colspan="9"><strong>{{ role_name }}</strong></td></tr>
 {% else %}
 <tr class="role-row"><td colspan="9"><div class="alert alert-error">Role {{ role_name }} is not a login role or does not exist any more.</div></td></tr>
 {% endif %}
-{% if error or notice or password %}
+{% if error or notice or warning or password %}
 <tr class="row-note"><td colspan="9">
   {% include "_alert.html" %}
   {% if password %}{% with reveal_role = role_name %}{% include "_reveal.html" %}{% endwith %}{% endif %}

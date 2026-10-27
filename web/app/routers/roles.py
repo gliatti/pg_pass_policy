@@ -10,9 +10,16 @@ from fastapi import APIRouter, Depends, Form, Query, Request
 from psycopg import Connection
 
 from app import db
+from app.logfilter import get_logger
 from app.templating import NO_STORE, render
 
 router = APIRouter(prefix="/roles")
+log = get_logger("roles")
+
+REREAD_WARNING = (
+    "The password was changed, but the role could not be read back: reload the page"
+    " to see its current state."
+)
 
 
 def _filters(
@@ -67,12 +74,25 @@ def _row_response(
     notice: str | None = None,
     password: str | None = None,
 ) -> Any:
-    row = db.get_role(conn, role)
+    reread_failed = False
+    if password is None:
+        row = db.get_role(conn, role)
+    else:
+        # the rotation is committed: whatever happens to the re-read, this
+        # response is the only place the new password will ever be shown
+        try:
+            with conn.transaction():
+                row = db.get_role(conn, role)
+        except psycopg.Error as exc:
+            log.error("role %s rotated, its row could not be re-read: %s", role, exc)
+            row, reread_failed = None, True
     context = {
         "r": row,
         "role_name": role,
         "error": error,
         "notice": notice,
+        "warning": REREAD_WARNING if reread_failed else None,
+        "reread_failed": reread_failed,
         "password": password,
         "uid": secrets.token_hex(4),
     }

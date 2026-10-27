@@ -116,22 +116,34 @@ def validation_detail(exc: RequestValidationError) -> str:
     return "Invalid request: " + ("; ".join(parts) or "invalid value")
 
 
+# global alert container of base.html: htmx error fragments are swapped there
+ALERTS_TARGET = "#alerts"
+
+
 def _error_response(
     request: Request, status_code: int, detail: str, headers: dict[str, str] | None = None
 ) -> Any:
-    if status_code == 401 and request.headers.get("hx-request") == "true":
-        # htmx cannot answer a basic-auth challenge: ask for a full reload
-        headers = {**(headers or {}), "HX-Refresh": "true"}
     if request.headers.get("hx-request") == "true":
+        # the fragment is a bare alert, not what the triggering element
+        # expects (a role row, a form...): it goes to the page's alert area
+        # so that the target stays in place
+        headers = {**(headers or {}), "HX-Retarget": ALERTS_TARGET, "HX-Reswap": "innerHTML"}
+        if status_code == 401:
+            # htmx cannot answer a basic-auth challenge: ask for a full reload
+            headers["HX-Refresh"] = "true"
         return render(
             request, "_alert.html", {"error": detail}, status_code=status_code, headers=headers
         )
     if "session" not in request.scope:
         # outside the middleware stack (should not happen): plain text
         return PlainTextResponse(detail, status_code=status_code, headers=headers)
+    # no navigation for an unidentified client: the router's 404 / 405 and
+    # the 401 / 403 of the authentication are raised before (or instead of)
+    # require_user, request.state.user is then unset
+    template = "error.html" if getattr(request.state, "user", None) else "error_anonymous.html"
     return render(
         request,
-        "error.html",
+        template,
         {"status_code": status_code, "detail": detail},
         status_code=status_code,
         headers=headers,

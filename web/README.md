@@ -206,7 +206,21 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
   sont affichés tels quels dans les fragments d'action (422) ; toute autre
   erreur PostgreSQL (vue, pool, droits) donne une page 500 générique, le texte
   complet (noms de tables, détails de connexion libpq) n'allant qu'au journal
-  du serveur.
+  du serveur. Une erreur générique survenue pendant un échange HTMX (422 de
+  validation, 404, 500, 503) est renvoyée avec `HX-Retarget: #alerts` et
+  `HX-Reswap: innerHTML` : l'alerte s'affiche dans la zone d'alertes de la page
+  et l'élément visé (ligne de rôle, formulaire) reste en place. Un client non
+  identifié (404 ou 405 du routeur, levées avant l'authentification, 401, 403)
+  reçoit une page d'erreur minimale, sans navigation ni lien. Seules les
+  erreurs propres au worker (`55000`, bibliothèque non préchargée, et classe
+  `42`, fonction absente ou droit manquant) donnent « worker not running » sur
+  le tableau de bord : une connexion perdue reste une erreur 500.
+- **Noms dans les URL** : un nom de rôle ou de paire peut contenir `/` ; il est
+  encodé (`%2F`), le serveur le décode avant le routage et les routes
+  `/{role:path}/action` le reconstituent. Les routes des profils gardent un
+  segment simple (`/profiles/{name}`) : la contrainte `CHECK (name ~
+  '^[A-Za-z0-9_.-]{1,63}$')` de `pass_policy.profile` interdit `/` (un profil
+  `x/delete` ne peut pas exister, ce que vérifie un test d'intégration).
 - **Droits** : le rôle de service est seulement membre de `pass_policy_admin` ;
   les fonctions `SECURITY DEFINER` de l'extension refusent de toucher aux rôles
   privilégiés. L'application applique la même règle de son côté : si le rôle
@@ -216,7 +230,12 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
 - **Affichage unique** : le fragment d'une rotation remplace tout le `<tbody>`
   du rôle (ligne + note) ; la prochaine action sur le même rôle, ou tout autre
   échange HTMX sur la page, retire le mot de passe affiché (`htmx:beforeSwap`
-  dans `app.js`), de même que le déchargement de la page (`pagehide`).
+  dans `app.js`), de même que le déchargement de la page (`pagehide`). La
+  rotation et la bascule de paire sont validées (`COMMIT`) avant tout affichage :
+  un mot de passe n'est montré qu'une fois appliqué. Si la relecture qui suit
+  (ligne du rôle, liste des paires) échoue, le mot de passe est affiché quand
+  même, avec un avertissement invitant à recharger la page : il n'existe nulle
+  part ailleurs.
 
 ## Tests
 
@@ -235,7 +254,7 @@ dans un fichier `pgpass` (0600), jamais sur une ligne de commande :
 
 ```sh
 eval "$(scripts/test-instance.sh start /tmp/pgpp-web-test 54332)"
-pytest                     # 48 tests : unitaires + intégration
+pytest                     # 112 tests : unitaires + intégration
 scripts/test-instance.sh stop /tmp/pgpp-web-test
 ```
 

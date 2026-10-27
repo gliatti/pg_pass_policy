@@ -474,3 +474,70 @@ def test_audit_page_past_the_end_keeps_the_total(client):
     total = first.text.split(" event", 1)[0].rsplit(">", 1)[1]
     assert int(total) > 0
     assert f"{total} event" in far.text
+
+
+def test_profile_name_cannot_contain_a_slash(client, super_conn):
+    """Profile routes keep a single-segment {name}: the CHECK constraint of
+    pass_policy.profile forbids '/', so "x/delete" (which would be routed as
+    the delete action on "x" once %2F is decoded) can never exist."""
+    super_conn.execute("SELECT pass_policy.create_profile('web_t_x', '{}')")
+    try:
+        with pytest.raises(psycopg.errors.CheckViolation):
+            super_conn.execute("SELECT pass_policy.create_profile('web_t_x/delete', '{}')")
+        with pytest.raises(psycopg.errors.CheckViolation):
+            super_conn.execute(
+                "UPDATE pass_policy.profile SET name = 'web_t_x/delete' WHERE name = 'web_t_x'"
+            )
+
+        token = csrf_token(client, "/profiles")
+        headers = {"X-CSRF-Token": token, "HX-Request": "true"}
+        data = {
+            "name": "web_t_x/delete",
+            "min_length": "12",
+            "max_length": "128",
+            "min_lower": "1",
+            "min_upper": "1",
+            "min_digit": "1",
+            "min_special": "1",
+            "min_classes": "3",
+            "max_repeat": "3",
+            "history_count": "5",
+            "history_days": "365",
+            "max_age": "90 days",
+            "min_age": "1 day",
+            "grace_period": "7 days",
+            "warn_before": "14 days",
+            "max_failures": "5",
+            "failure_window": "15 minutes",
+            "lock_duration": "30 minutes",
+        }
+        response = client.post("/profiles", data=data, headers=headers)
+        assert response.status_code == 422, response.text
+        assert "profile_name_check" in response.text or "check constraint" in response.text
+        assert super_conn.execute(
+            "SELECT count(*) FROM pass_policy.profile WHERE name LIKE '%%/%%'"
+        ).fetchone() == (0,)
+        # "web_t_x" is untouched
+        assert super_conn.execute(
+            "SELECT count(*) FROM pass_policy.profile WHERE name = 'web_t_x'"
+        ).fetchone() == (1,)
+    finally:
+        super_conn.execute("SELECT pass_policy.drop_profile('web_t_x')")
+
+
+def test_htmx_validation_error_keeps_the_role_row(client):
+    """A 422 on a role row action is shown in the page's alert area
+    (HX-Retarget), the row's <tbody> is not replaced by a bare alert."""
+    token = csrf_token(client, "/roles")
+    page = client.get("/roles")
+    assert '<div id="alerts" aria-live="polite"></div>' in page.text
+    headers = {"X-CSRF-Token": token, "HX-Request": "true"}
+    response = client.post("/roles/web_t_alpha/rotate", data={"length": "4"}, headers=headers)
+    assert response.status_code == 422
+    assert response.headers["HX-Retarget"] == "#alerts"
+    assert response.headers["HX-Reswap"] == "innerHTML"
+    # an action error from the extension still replaces the row itself
+    response = client.post("/roles/web_t_no_such_role/expire", headers=headers)
+    assert response.status_code == 422
+    assert "HX-Retarget" not in response.headers
+    assert response.text.lstrip().startswith('<tbody class="role">')

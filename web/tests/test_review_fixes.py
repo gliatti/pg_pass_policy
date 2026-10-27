@@ -8,7 +8,7 @@ from urllib.parse import quote
 
 import psycopg
 import pytest
-from fastapi import Query, Request
+from fastapi import HTTPException, Query, Request
 from fastapi.testclient import TestClient
 
 from app import db
@@ -26,7 +26,8 @@ AUTH = {"Authorization": f"Basic {_TOKEN}"}
     [
         ("/healthz", "", "/healthz"),
         ("/pgpp/healthz", "/pgpp", "/healthz"),
-        ("/pgpp", "/pgpp", "/"),
+        # same as Starlette's router: the root path itself is "", not "/"
+        ("/pgpp", "/pgpp", ""),
         ("/pgpp/", "/pgpp", "/"),
         ("/pgppx/healthz", "/pgpp", "/pgppx/healthz"),
         # server that does not prefix scope["path"] with root_path
@@ -67,9 +68,14 @@ def test_auth_still_required_behind_root_path(prefixed_client):
 
 
 def test_active_nav_and_links_behind_root_path(prefixed_client):
-    # 405 is raised by the router (no database needed) and rendered with base.html
-    response = prefixed_client.get("/pgpp/roles/x/rotate", headers=AUTH)
-    assert response.status_code == 405
+    # an error raised after authentication (no database needed) is rendered
+    # with base.html and its navigation
+    @prefixed_client.app.get("/roles/_missing")
+    def missing() -> None:
+        raise HTTPException(status_code=404, detail="nothing here")
+
+    response = prefixed_client.get("/pgpp/roles/_missing", headers=AUTH)
+    assert response.status_code == 404
     assert '<a href="/pgpp/roles" class="active">Roles</a>' in response.text
     assert '<a href="/pgpp/" class="active">' not in response.text
     assert 'href="/pgpp/static/app.css"' in response.text

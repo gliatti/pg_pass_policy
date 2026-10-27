@@ -174,6 +174,10 @@ def profile_unassign(
     return _assignments_fragment(request, conn, notice=f"{role} is back on the default profile")
 
 
+# {name} (not {name:path}): the CHECK constraint of pass_policy.profile
+# (name ~ '^[A-Za-z0-9_.-]{1,63}$') forbids '/', so a decoded profile name never
+# spans two segments and "x/delete" cannot be mistaken for the delete action
+# on "x" (tests/test_integration.py checks that such a name is refused)
 @router.get("/{name}", name="profile_edit")
 def profile_edit(request: Request, name: str, conn: Connection = Depends(db.get_conn)):
     profile = db.get_profile(conn, name)
