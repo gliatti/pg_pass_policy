@@ -72,6 +72,42 @@ INSERT INTO ppp_test.secrets SELECT 'pair3', password FROM ppp_test.switches WHE
 SELECT s3.active_role = s1.active_role AS back_to_first
   FROM ppp_test.switches s1, ppp_test.switches s3 WHERE s1.n = 1 AND s3.n = 3;
 
+-- L'ancien rôle est borné dans role_state (statut grace jusqu'à la borne), pas
+-- seulement par dérivation de rotation_pair : si la ligne de la paire disparaît,
+-- la synchronisation suivante ne doit pas réactiver l'ancien mot de passe.
+SELECT v.status, s.must_change,
+       abs(extract(epoch FROM s.grace_until - w.previous_valid_until)) < 2 AS state_bounded
+  FROM ppp_test.switches w
+  JOIN pass_policy.v_role_status v ON v.role_name = w.previous_role
+  JOIN pass_policy.role_state s ON s.role_name = w.previous_role
+ WHERE w.n = 3;
+CREATE TEMP TABLE pair_backup AS SELECT * FROM pass_policy.rotation_pair WHERE pair_name = 'app';
+DELETE FROM pass_policy.rotation_pair WHERE pair_name = 'app';
+CREATE TEMP TABLE m_pair AS SELECT * FROM pass_policy.run_maintenance();
+SELECT abs(extract(epoch FROM r.rolvaliduntil - w.previous_valid_until)) < 2 AS unchanged_after_delete,
+       r.rolvaliduntil <= now() + interval '7 days 01:00' AS still_bounded
+  FROM ppp_test.switches w JOIN pg_roles r ON r.rolname = w.previous_role
+ WHERE w.n = 3;
+INSERT INTO pass_policy.rotation_pair SELECT * FROM pair_backup;
+-- Filet de run_maintenance (étape a) pour une paire basculée avant que
+-- role_state porte la borne (simulé) : la purge de la paire, ici parce que le
+-- groupe n'existe plus, reporte previous_valid_until dans role_state
+UPDATE pass_policy.role_state
+   SET must_change = false, expires_at = now() + interval '30 days', grace_until = now() + interval '37 days'
+ WHERE role_name = (SELECT previous_role FROM ppp_test.switches WHERE n = 3);
+ALTER ROLE regress_app_grp RENAME TO regress_app_grp_gone;
+CREATE TEMP TABLE m_pair2 AS SELECT * FROM pass_policy.run_maintenance();
+SELECT count(*) AS pair_purged FROM m_pair2 WHERE action = 'purge' AND details->>'table' = 'rotation_pair';
+SELECT s.must_change,
+       abs(extract(epoch FROM s.grace_until - w.previous_valid_until)) < 2 AS state_bounded,
+       abs(extract(epoch FROM r.rolvaliduntil - w.previous_valid_until)) < 2 AS valid_until_unchanged
+  FROM ppp_test.switches w
+  JOIN pass_policy.role_state s ON s.role_name = w.previous_role
+  JOIN pg_roles r ON r.rolname = w.previous_role
+ WHERE w.n = 3;
+ALTER ROLE regress_app_grp_gone RENAME TO regress_app_grp;
+INSERT INTO pass_policy.rotation_pair SELECT * FROM pair_backup;
+
 -- Les deux rôles restent membres du groupe
 SELECT count(*) AS members
   FROM pg_auth_members m

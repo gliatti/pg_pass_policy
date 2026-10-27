@@ -15,7 +15,10 @@
  */
 #include "postgres.h"
 
+#include <ctype.h>
+#include <locale.h>
 #include <string.h>
+#include <wctype.h>
 
 #include "access/xact.h"
 #include "catalog/namespace.h"
@@ -133,12 +136,31 @@ ppp_spi_begin(pppSpiState *st)
 							 GUC_ACTION_SAVE, true, 0, false);
 
 	/*
-	 * Messages raised on the SQL side (e.g. RAISE LOG in audit()) must not
-	 * carry the STATEMENT, which may be ALTER ROLE ... PASSWORD 'clear text'.
+	 * Messages raised on the SQL side (e.g. RAISE LOG in audit(), or an
+	 * ERROR from record_password_change()) must carry neither the STATEMENT
+	 * nor the CONTEXT: when the hook runs inside an EXECUTE (rotate_password
+	 * -> _set_password), both would hold ALTER ROLE ... PASSWORD 'clear text'.
+	 * Both settings are popped by ppp_spi_end() / AtEOXact_GUC.
 	 */
 	(void) set_config_option("log_min_error_statement", "panic",
 							 PGC_SUSET, PGC_S_SESSION,
 							 GUC_ACTION_SAVE, true, 0, false);
+	(void) set_config_option("log_error_verbosity", "terse",
+							 PGC_SUSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
+
+	/*
+	 * auto_explain (log_nested_statements = on) would log the parameters of
+	 * the nested statements run here, record_password_change($1, $2) in
+	 * particular, whose $2 is the SCRAM verifier of the new password
+	 * (offline-cracking material).  Disabled for the duration of the SPI
+	 * call when the module is loaded.
+	 */
+	if (GetConfigOption("auto_explain.log_min_duration", true, false) != NULL)
+		(void) set_config_option("auto_explain.log_min_duration", "-1",
+								 PGC_SUSET, PGC_S_SESSION,
+								 GUC_ACTION_SAVE, true, 0, false);
+
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "pg_pass_policy: SPI_connect failed");
 }
@@ -301,11 +323,64 @@ ppp_load_named_profile(const char *profname, pppProfile *p)
  * ------------------------------------------------------------------------
  */
 
-/* Lower-case a secret; the caller must ppp_secure_zero() the result. */
+/*
+ * Lower-case a secret; the caller must ppp_secure_zero() the result.
+ *
+ * Same result as str_tolower(s, len, DEFAULT_COLLATION_OID) with the libc
+ * provider, but without leaving an unwiped copy of the password behind:
+ * str_tolower() converts multi-byte strings through a wchar_t workspace
+ * that it pfree()s without clearing.  Here the workspace is ours and wiped.
+ *   - single-byte encoding, or LC_CTYPE = C: converted in place (ASCII only
+ *     under C, like the server);
+ *   - UTF-8 with another LC_CTYPE: pg_wchar (= Unicode code point) +
+ *     towlower() on the backend's LC_CTYPE (datctype), the same calls the
+ *     server makes for the default libc collation.  With an ICU default
+ *     collation, ICU special casing is not applied (documented, SPEC 8.5);
+ *   - other multi-byte encodings: str_tolower() (residual copy, documented).
+ */
+static bool
+ppp_ctype_is_c(void)
+{
+	const char *ctype = setlocale(LC_CTYPE, NULL);
+
+	return ctype == NULL || strcmp(ctype, "C") == 0 || strcmp(ctype, "POSIX") == 0;
+}
+
 static char *
 ppp_lower(const char *s)
 {
-	return str_tolower(s, strlen(s), DEFAULT_COLLATION_OID);
+	size_t		len = strlen(s);
+	bool		ctype_c = ppp_ctype_is_c();
+	char	   *result;
+
+	if (pg_database_encoding_max_length() == 1 || ctype_c)
+	{
+		char	   *p;
+
+		result = pstrdup(s);
+		for (p = result; *p; p++)
+			*p = ctype_c ? pg_tolower((unsigned char) *p)
+				: (char) tolower((unsigned char) *p);
+		return result;
+	}
+
+	if (GetDatabaseEncoding() == PG_UTF8)
+	{
+		size_t		wsize = (len + 1) * sizeof(pg_wchar);
+		pg_wchar   *ws = palloc(wsize);
+		int			nchars = pg_mb2wchar_with_len(s, ws, (int) len);
+		int			i;
+
+		for (i = 0; i < nchars; i++)
+			ws[i] = (pg_wchar) towlower((wint_t) ws[i]);
+		result = palloc((size_t) nchars * pg_database_encoding_max_length() + 1);
+		pg_wchar2mb_with_len(ws, result, nchars);
+		ppp_secure_zero(ws, wsize);
+		pfree(ws);
+		return result;
+	}
+
+	return str_tolower(s, len, DEFAULT_COLLATION_OID);
 }
 
 /* Reverse a string character by character (multibyte aware) */
@@ -459,36 +534,47 @@ ppp_validate(const char *username, const char *password, const pppProfile *p,
 
 	if (p->reject_username || p->reject_dictionary)
 	{
-		char	   *lower_pw = ppp_lower(password);
-		bool		bad = false;
+		char	   *volatile lower_pw = ppp_lower(password);
+		volatile bool bad = false;
 
 		/*
-		 * Role names of fewer than 3 characters are ignored: they would
-		 * reject nearly every password.
+		 * The dictionary lookup goes through SPI and may raise an ERROR:
+		 * the lower-cased copy of the password is wiped whatever happens.
 		 */
-		if (p->reject_username && pg_mbstrlen(username) >= 3)
+		PG_TRY();
 		{
-			char	   *lower_user = ppp_lower(username);
-			char	   *rev_user = ppp_reverse(lower_user);
-
-			if (strstr(lower_pw, lower_user) != NULL ||
-				strstr(lower_pw, rev_user) != NULL)
+			/*
+			 * Role names of fewer than 3 characters are ignored: they would
+			 * reject nearly every password.
+			 */
+			if (p->reject_username && pg_mbstrlen(username) >= 3)
 			{
-				*code = "PPP-017";
+				char	   *lower_user = ppp_lower(username);
+				char	   *rev_user = ppp_reverse(lower_user);
+
+				if (strstr(lower_pw, lower_user) != NULL ||
+					strstr(lower_pw, rev_user) != NULL)
+				{
+					*code = "PPP-017";
+					bad = true;
+				}
+				pfree(lower_user);
+				pfree(rev_user);
+			}
+
+			if (!bad && p->reject_dictionary && ppp_in_dictionary(lower_pw))
+			{
+				*code = "PPP-018";
 				bad = true;
 			}
-			pfree(lower_user);
-			pfree(rev_user);
 		}
-
-		if (!bad && p->reject_dictionary && ppp_in_dictionary(lower_pw))
+		PG_FINALLY();
 		{
-			*code = "PPP-018";
-			bad = true;
+			ppp_secure_zero(lower_pw, strlen(lower_pw));
+			pfree(lower_pw);
 		}
+		PG_END_TRY();
 
-		ppp_secure_zero(lower_pw, strlen(lower_pw));
-		pfree(lower_pw);
 		if (bad)
 			return false;
 	}
@@ -845,7 +931,8 @@ ppp_audit_rejection(const char *username, const char *code)
 		ereport(LOG,
 				(errmsg(PPP_LOG_PREFIX "could not write audit event password_rejected for role \"%s\": %s",
 						username, edata->message),
-				 errhidestmt(true)));
+				 errhidestmt(true),
+				 errhidecontext(true)));
 		FreeErrorData(edata);
 	}
 	PG_END_TRY();
@@ -855,7 +942,10 @@ ppp_audit_rejection(const char *username, const char *code)
 
 /*
  * Reject the password: log, audit, then ERROR.  The statement (which holds
- * the clear-text password) is hidden from the server log.
+ * the clear-text password) and the context (which holds it too when the
+ * ALTER ROLE is run through EXECUTE, as in rotate_password) are hidden from
+ * the server log.  These ereport() run outside ppp_spi_begin/end, so the
+ * GUC guard set there does not apply here.
  */
 static void
 ppp_reject(const char *username, const char *code, const pppProfile *p,
@@ -872,14 +962,16 @@ ppp_reject(const char *username, const char *code, const pppProfile *p,
 		ereport(LOG,
 				(errmsg(PPP_LOG_PREFIX "password_rejected role=\"%s\" code=%s",
 						username, code),
-				 errhidestmt(true)));
+				 errhidestmt(true),
+				 errhidecontext(true)));
 
 	ereport(ERROR,
 			(errcode(ERRCODE_INVALID_PASSWORD),
 			 errmsg("%s: %s", code, msg),
 			 detail ? errdetail("%s", detail) : 0,
 			 hint ? errhint("%s", hint) : 0,
-			 errhidestmt(true)));
+			 errhidestmt(true),
+			 errhidecontext(true)));
 }
 
 /* Record the accepted verifier through pass_policy.record_password_change */
@@ -941,11 +1033,15 @@ ppp_apply_policy(const char *username, const char *shadow_pass,
 				ereport(WARNING,
 						(errmsg("pg_pass_policy: extension is not installed in database \"%s\", password policy not applied",
 								dbname),
-						 errhint("Run CREATE EXTENSION pg_pass_policy in this database.")));
+						 errhint("Run CREATE EXTENSION pg_pass_policy in this database."),
+						 errhidestmt(true),
+						 errhidecontext(true)));
 			else
 				ereport(WARNING,
 						(errmsg("pg_pass_policy: password policy not applied outside database \"%s\"",
-								ppp_database)));
+								ppp_database),
+						 errhidestmt(true),
+						 errhidecontext(true)));
 			ppp_missing_schema_warned = true;
 		}
 		return;
@@ -1053,11 +1149,11 @@ Datum
 ppp_check_password(PG_FUNCTION_ARGS)
 {
 	char	   *username;
-	text	   *pwtext;
-	char	   *password;
+	text	   *volatile pwtext;
+	char	   *volatile password;
 	pppProfile	prof;
 	Oid			roleid;
-	const char *code = NULL;
+	const char *volatile code = NULL;
 	char	   *msg;
 	char	   *detail;
 	char	   *hint;
@@ -1069,41 +1165,49 @@ ppp_check_password(PG_FUNCTION_ARGS)
 
 	ppp_require_schema();
 
+	/* everything that can fail without needing the secret comes first */
 	username = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	pwtext = PG_GETARG_TEXT_PP(1);
-	password = text_to_cstring(pwtext);
-
 	ppp_load_effective_profile(username, &prof);
 	roleid = get_role_oid(username, true);
 	may_check_history = superuser() ||
 		(OidIsValid(roleid) && roleid == GetUserId());
 
-	switch (get_password_type(password))
-	{
-		case PASSWORD_TYPE_PLAINTEXT:
-			if (ppp_require_scram && Password_encryption == PASSWORD_TYPE_MD5)
-				code = "PPP-002";
-			else
-				code = ppp_evaluate_plain(username, roleid, password, &prof,
-										  false, may_check_history);
-			break;
-		case PASSWORD_TYPE_MD5:
-			if (prof.reject_prehashed)
-				code = "PPP-001";
-			else if (ppp_require_scram)
-				code = "PPP-002";
-			break;
-		default:
-			if (prof.reject_prehashed)
-				code = "PPP-001";
-			break;
-	}
+	pwtext = PG_GETARG_TEXT_PP(1);
+	password = text_to_cstring(pwtext);
 
-	ppp_secure_zero(password, strlen(password));
-	pfree(password);
-	/* wipe the detoasted copy, if any (never the caller's datum) */
-	if ((Pointer) pwtext != PG_GETARG_POINTER(1))
-		ppp_secure_zero(VARDATA_ANY(pwtext), VARSIZE_ANY_EXHDR(pwtext));
+	/* the copies of the secret are wiped even if a check raises an ERROR */
+	PG_TRY();
+	{
+		switch (get_password_type(password))
+		{
+			case PASSWORD_TYPE_PLAINTEXT:
+				if (ppp_require_scram && Password_encryption == PASSWORD_TYPE_MD5)
+					code = "PPP-002";
+				else
+					code = ppp_evaluate_plain(username, roleid, password, &prof,
+											  false, may_check_history);
+				break;
+			case PASSWORD_TYPE_MD5:
+				if (prof.reject_prehashed)
+					code = "PPP-001";
+				else if (ppp_require_scram)
+					code = "PPP-002";
+				break;
+			default:
+				if (prof.reject_prehashed)
+					code = "PPP-001";
+				break;
+		}
+	}
+	PG_FINALLY();
+	{
+		ppp_secure_zero(password, strlen(password));
+		pfree(password);
+		/* wipe the detoasted copy, if any (never the caller's datum) */
+		if ((Pointer) pwtext != PG_GETARG_POINTER(1))
+			ppp_secure_zero(VARDATA_ANY(pwtext), VARSIZE_ANY_EXHDR(pwtext));
+	}
+	PG_END_TRY();
 
 	if (code == NULL)
 		PG_RETURN_NULL();

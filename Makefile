@@ -7,8 +7,11 @@ DATA         = sql/pg_pass_policy--$(EXTVERSION).sql
 PGFILEDESC   = "pg_pass_policy - password policy, rotation and lockout for roles"
 
 REGRESS      = $(notdir $(basename $(wildcard test/sql/*.sql)))
-REGRESS_OPTS = --inputdir=test --outputdir=test --temp-config=test/pg_pass_policy.conf --temp-instance=test/tmp_check
-EXTRA_CLEAN  = test/results test/tmp_check
+# TEMP_INSTANCE : répertoire de l'instance temporaire de pg_regress (surchargé
+# par docker/test-in-container.sh pour écrire dans le tmpfs /tmp).
+TEMP_INSTANCE ?= test/tmp_check
+REGRESS_OPTS = --inputdir=test --outputdir=test --temp-config=test/pg_pass_policy.conf --temp-instance=$(TEMP_INSTANCE)
+EXTRA_CLEAN  = test/results test/tmp_check $(TEMP_INSTANCE)
 
 PG_CONFIG   ?= pg_config
 PGXS        := $(shell $(PG_CONFIG) --pgxs)

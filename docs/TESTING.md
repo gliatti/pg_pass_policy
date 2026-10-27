@@ -28,15 +28,15 @@ l'instance de développement courante.
 ```sh
 make PG_CONFIG=/chemin/vers/pg_config
 make PG_CONFIG=/chemin/vers/pg_config install
-make PG_CONFIG=/chemin/vers/pg_config installcheck \
-     EXTRA_REGRESS_OPTS=--temp-instance=test/tmp_check
+make PG_CONFIG=/chemin/vers/pg_config installcheck
 # en cas d'échec :
 less test/regression.diffs
 ```
 
-`EXTRA_REGRESS_OPTS` évite de modifier le Makefile. Il est proposé d'ajouter
-`--temp-instance=test/tmp_check` à `REGRESS_OPTS` (et `test/tmp_check` à
-`EXTRA_CLEAN`) pour que `make installcheck` suffise.
+Le `Makefile` place déjà `--temp-instance=test/tmp_check` dans `REGRESS_OPTS`
+(et `test/tmp_check` dans `EXTRA_CLEAN`) : `make installcheck` suffit, aucune
+instance n'est laissée en route. La cible `make test` enchaîne `make install`,
+`make installcheck` et `test/shell/run-all.sh`.
 
 La base de test s'appelle `contrib_regression` (ajoutée par PGXS) : c'est la
 valeur de `pg_pass_policy.database` dans `test/pg_pass_policy.conf`.
@@ -85,12 +85,12 @@ exact d'actions renvoyées par `run_maintenance()`).
 | `30_history` | `history_count = 3` (troncature, réutilisation `PPP-031`, sortie de l'historique), `history_count = 0`, `history_days`, `min_age` (`PPP-030`) pour un non-superutilisateur qui change son propre mot de passe, contournement par superutilisateur, complexité appliquée au changement par soi-même, historique 100 % SCRAM bien formé et sans clair |
 | `40_generate` | longueurs (défaut 24, 8 et 512 avec un profil large), bornes absolues (< 8, > 512) et bornes du profil, 200 tirages : 4 classes, aucun caractère ambigu `0O1lI|`, ASCII imprimable sans espace, tous distincts, conformes (`check_password` NULL) ; minima par classe d'un profil exigeant ; aucune écriture d'audit |
 | `50_rotation` | `rotate_password` : longueur, classes, mot de passe effectivement en place (réutilisation détectée), `role_state` (+30 j, +7 j), `rolvaliduntil = grace_until`, audit `password_rotated` sans le mot de passe, acteur ; longueur 32 ; erreurs ; nom de rôle à guillemets ; `expire_password` (must_change, VALID UNTIL, statut `expired`, `v_expiring`, audit) puis rotation qui remet en état |
-| `55_pair` | `create_rotation_pair` (groupe inexistant, rôle existant/créé, LOGIN, INHERIT, membres, doublon), trois `switch_rotation_pair` (alternance, `previous_valid_until` borné par `grace_period`, appliqué à `rolvaliduntil`, `rotation_pair` à jour), audit `pair_switched`, paire inconnue |
+| `55_pair` | `create_rotation_pair` (groupe inexistant, rôle existant/créé, LOGIN, INHERIT, membres, doublon), trois `switch_rotation_pair` (alternance, `previous_valid_until` borné par `grace_period`, appliqué à `rolvaliduntil`, `rotation_pair` à jour), ancien rôle borné dans `role_state` (statut `grace`) et toujours borné après `DELETE FROM rotation_pair` + `run_maintenance()`, filet de l'étape a (paire purgée parce que le groupe a disparu), audit `pair_switched`, paire inconnue |
 | `60_lock_unlock` | `lock_role` manuel (`infinity`, `manual`, raison, `v_locked`, statut `locked`, shmem via `failed_attempts()`, audit), re-verrouillage, `unlock_role` (role_state, vue, shmem, audit), verrou de 1 s levé par `run_maintenance`, rôles inconnus, fonctions `shmem_*` |
-| `70_maintenance` | `expiry_warning` + `last_warned_at`, `expires_at`/`grace_until`, statuts `expired`/`grace`/`warning`/`never_expires`, `v_expiring`, `rolvaliduntil` et `valid_until_synced`, `password_expired` non dupliqué, valeur de retour sans secret, resynchronisation après `alter_profile`, purge d'un rôle supprimé, réconciliation du rôle antérieur à l'extension et d'un changement fait avec `enabled = off` (via `ALTER SYSTEM` + `pg_reload_conf()` : `enabled` est de contexte SIGHUP, `SET` est refusé) |
+| `70_maintenance` | `expiry_warning` + `last_warned_at`, `expires_at`/`grace_until`, statuts `expired`/`grace`/`warning`/`never_expires`, `v_expiring`, `rolvaliduntil` et `valid_until_synced`, `password_expired` non dupliqué, valeur de retour sans secret, resynchronisation après `alter_profile`, purge d'un rôle supprimé, réconciliation du rôle antérieur à l'extension et d'un changement fait avec `enabled = off` (via `ALTER SYSTEM` + `pg_reload_conf()` : `enabled` est de contexte SIGHUP, `SET` est refusé), `manage_valid_until = off` : `VALID UNTIL` posé par `expire_password` relevé en mode `unblock` après changement du mot de passe |
 | `80_audit` | `audit()` (acteur, base, détails, défaut `{}`, rôle NULL, type inconnu refusé), `v_recent_audit` limitée à 1000, `purge_audit` (défaut 365 j, seuil personnalisé), types d'événements ⊂ SPEC §3.6, aucun `PASSWORD `, `ALTER ROLE`, secret ni vérificateur dans l'audit |
-| `90_privileges` | utilisateur ordinaire : toutes les fonctions d'administration, `audit()`, `shmem_*`, `record_password_change` (autre rôle et soi-même), lecture/écriture des tables et vues → 42501 ; viewer : vues et tables en lecture, aucune écriture ni administration ; admin non superutilisateur : administration OK, mais pas sur un superutilisateur |
-| `99_teardown` | `DROP EXTENSION` (schéma supprimé, rôles admin/viewer conservés), suppression des rôles `regress_%`, réinstallation avec rôles déjà présents |
+| `90_privileges` | utilisateur ordinaire : toutes les fonctions d'administration, `audit()`, `shmem_*`, `record_password_change` (autre rôle et soi-même), lecture/écriture des tables et vues → 42501 ; viewer : vues et tables en lecture, aucune écriture ni administration ; admin non superutilisateur : administration OK, mais pas sur un superutilisateur ni sur un rôle membre (direct, transitif) d'un superutilisateur ou de `pg_execute_server_program`, ni `create_rotation_pair` sur un tel groupe (et le `CREATE ROLE` est annulé) ; groupe ordinaire propriétaire de la base accepté ; en superutilisateur les mêmes appels réussissent |
+| `99_teardown` | `DROP EXTENSION` (le schéma `pass_policy`, vide, survit : il est déclaré par la clé `schema` du `.control` et n'appartient pas à l'extension), `DROP SCHEMA pass_policy` manuel, rôles admin/viewer conservés, suppression des rôles `regress_%`, réinstallation avec rôles déjà présents, suppression finale extension + schéma |
 
 LISTEN/NOTIFY n'est pas testable en pg_regress (psql affiche le PID émetteur et
 un horodatage) : voir `test/shell/notify.sh`.
@@ -102,23 +102,26 @@ l'état du code au moment de l'écriture des tests, puis relus. **Ils doivent ê
 revus à chaque changement de comportement** :
 
 ```sh
-make PG_CONFIG=… installcheck EXTRA_REGRESS_OPTS=--temp-instance=test/tmp_check
+make PG_CONFIG=… installcheck
 less test/regression.diffs          # relire chaque différence
-cp test/results/*.out test/expected/   # seulement après revue
+cp test/results/X.out test/expected/X.out   # seulement après revue, test par test
 ```
 
 Ne jamais copier les résultats sans lire le diff : un `f` à la place d'un `t`
 ou un code PPP différent est un bogue, pas une mise à jour.
 
-Exception connue : `99_teardown.out` attend `schema = 0` après `DROP EXTENSION`
-(comportement voulu) ; tant que le schéma `pass_policy` créé par la clé
-`schema` du fichier `.control` survit à `DROP EXTENSION`, ce test échoue.
+Le schéma `pass_policy` survit à `DROP EXTENSION` (clé `schema` du `.control`,
+comportement standard de PostgreSQL) : `99_teardown` le constate puis le
+supprime à la main avec `DROP SCHEMA pass_policy`.
 
 ## 2. Tests shell
 
 Chaque script démarre sa propre instance temporaire (`test/shell/common.sh`) :
-`initdb` dans `mktemp -d`, port TCP libre, `listen_addresses = 127.0.0.1`, pas
-de socket Unix, configuration = `test/pg_pass_policy.conf` + surcharges
+`initdb` dans `mktemp -d`, port TCP libre (54400-54899 ; cette plage est dans
+la plage éphémère de Linux, un port peut donc être occupé côté client par une
+connexion d'un test précédent : en cas de « Address already in use » au
+démarrage, un autre port est tiré, 5 essais au plus), `listen_addresses =
+127.0.0.1`, pas de socket Unix, configuration = `test/pg_pass_policy.conf` + surcharges
 (`pg_pass_policy.database = postgres`, `worker_interval = 2`,
 `log_connections = on`), `pg_hba.conf` : superutilisateur de test en `trust`,
 tous les autres rôles en `scram-sha-256`. L'instance est arrêtée par un `trap
@@ -134,23 +137,37 @@ PPP_KEEP_TMP=1 PG_CONFIG=… test/shell/expiry.sh   # conserve données + log
 
 | script | couvre |
 |---|---|
-| `lockout.sh` | rechargement shmem par le worker après `assign_profile`, 5 échecs puis refus « locked » même avec le bon mot de passe, `failed_attempts()`, audit `role_locked`/`auth_failed` écrit par le worker, déverrouillage automatique après `lock_duration = 5 s`, remise à zéro du compteur après un succès, `failure_window`, `lock_role`/`unlock_role` manuels persistants après un tour du worker, `exempt_roles`, échecs sur rôle inexistant |
+| `lockout.sh` | (instance avec `fsync = on`) rechargement shmem par le worker après `assign_profile` et application effective des nouveaux paramètres (`max_failures = 2`), 5 échecs puis refus « locked » même avec le bon mot de passe, `failed_attempts()`, audit `role_locked`/`auth_failed` et `role_state` écrits par le worker, déverrouillage automatique après `lock_duration = 5 s`, remise à zéro du compteur après un succès, verrou expiré avant le passage du worker (`worker_interval = 60` : audit conservé, reverrouillage après 5 nouveaux échecs), `failure_window`, `lock_duration` de 100 ans (pas d'« integer out of range ») et NULL (`infinity`), `lock_role`/`unlock_role` manuels persistants après un tour du worker, `lock_role`/`unlock_role` sous `ROLLBACK` et `SAVEPOINT` (shmem appliquée au COMMIT seulement), `exempt_roles`, échecs sur rôle inexistant, aucun échec de cycle du worker |
 | `expiry.sh` | `max_age = 1 s` : le worker pose `rolvaliduntil = grace_until`, connexion refusée (côté client « password authentication failed », côté serveur « has an expired password »), audit `password_expired`, `v_role_status`/`v_expiring`, connexion avec le mot de passe de `rotate_password`, **absence du mot de passe généré dans le log serveur**, `expire_password` non annulé par le worker |
 | `notify.sh` | NOTIFY dans la même session (déterministe) et dans une autre session (écouteur en `pg_sleep`), charge utile JSON `event`/`role`/`at`/`details`, absence de mot de passe et de vérificateur, absence du mot de passe dans le log serveur, canal personnalisé `notify_channel` |
+| `auto_explain.sh` | instance avec `auto_explain` (`log_min_duration = 0`, `log_nested_statements = on`, `log_verbose = on`) : `rotate_password`, `switch_rotation_pair`, `ALTER ROLE … PASSWORD`, `run_maintenance` + tour du worker → aucun mot de passe ni `SCRAM-SHA-256$` dans le log serveur, auto_explain bien actif par ailleurs |
+| `unicode.sh` | instance en `C.UTF-8` (`PPP_LOCALE`, ignoré si la locale manque) : `PPP-018` et `PPP-017` insensibles à la casse sur des lettres non ASCII (`Été` / `été`), via `check_password` et par un vrai `ALTER ROLE`, mot de passe non ASCII accepté et absent du log |
 
 Le mauvais mot de passe est toujours fourni explicitement (`PGPASSWORD`) : une
 connexion abandonnée avant l'envoi du mot de passe n'est pas comptée comme un
 échec (SPEC §11). PostgreSQL n'indique jamais au client que le mot de passe a
 expiré : `expiry.sh` le vérifie dans le log serveur.
 
+Locale : les scripts shell forcent `initdb --locale=C` (variable `PPP_LOCALE`
+pour changer, `unicode.sh` la met à `C.UTF-8`), alors que pg_regress hérite de
+`LANG` de l'environnement : les tests pg_regress n'utilisent donc que des mots
+de passe ASCII pour le dictionnaire et le nom de rôle.
+
 ## 3. Matrice Docker (PostgreSQL 14 → 18)
 
 `docker/Dockerfile` (`ARG PG_MAJOR`, `ARG DEBIAN_SUITE=bookworm`) part de
-`postgres:${PG_MAJOR}-bookworm`, installe `build-essential` et
+`postgres:${PG_MAJOR}-bookworm`, installe `build-essential`, `libkrb5-dev`
+(les en-têtes PGDG `libpq/libpq-be.h` incluent `gssapi/gssapi.h`) et
 `postgresql-server-dev-${PG_MAJOR}`, compile et installe l'extension en root
 puis lance `docker/test-in-container.sh` en utilisateur `postgres` :
-`make installcheck EXTRA_REGRESS_OPTS=--temp-instance=/tmp/ppp_regress` puis
+`make installcheck TEMP_INSTANCE=/tmp/ppp_regress` puis
 `test/shell/run-all.sh`. Pas de volume : `/tmp` est un tmpfs jeté à la fin.
+`TEMP_INSTANCE` (variable du `Makefile`, défaut `test/tmp_check`) place
+l'instance temporaire de pg_regress dans ce tmpfs : la couche overlay du
+conteneur peut être presque pleine (Docker Desktop) et `initdb` y échouer sur
+« No space left on device ». Chaque image fait environ 1,4 Go : sur un disque
+Docker étroit, construire et tester une version à la fois puis
+`docker rmi pg_pass_policy-test:NN` et `docker builder prune`.
 
 Les tags `postgres:14-bookworm` … `postgres:18-bookworm` existent (vérifié par
 `docker manifest inspect` en octobre 2026 ; `18-trixie` existe aussi :

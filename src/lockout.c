@@ -13,6 +13,14 @@
  *	 failed_attempts(), shmem_reload(), shmem_lock_role(),
  *	 shmem_unlock_role(), shmem_reset_failures().
  *
+ * Shared memory is not transactional while the SQL functions that call the
+ * shmem_* functions are (lock_role() updates role_state, then the shared
+ * memory, in one transaction).  The writes requested by shmem_lock_role(),
+ * shmem_unlock_role() and shmem_reset_failures(), and the signal sent by
+ * shmem_reload(), are therefore deferred to the COMMIT of the calling
+ * transaction through a transaction callback (ppp_xact_callback), with
+ * sub-transaction support: a ROLLBACK (TO SAVEPOINT) discards them.
+ *
  * See docs/SPEC.md, sections 4 and 6.3.
  *
  *-------------------------------------------------------------------------
@@ -21,6 +29,7 @@
 
 #include <signal.h>
 
+#include "access/xact.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "libpq/auth.h"
@@ -235,11 +244,20 @@ ppp_client_auth_hook(Port *port, int status)
 		{
 			if (entry->locked_until != 0)
 			{
-				/* lock expired: start afresh */
-				entry->locked_until = 0;
-				entry->failed_count = 0;
-				entry->first_failure_at = 0;
-				entry->lock_pending_audit = false;
+				/*
+				 * Lock expired.  The failures that led to it (first_failure_at
+				 * predates the lock) are forgotten, once: later attempts are
+				 * counted afresh while locked_until stays set.  locked_until
+				 * is kept while the worker has not written the role_locked
+				 * audit row yet (ppp_sync_cleanup clears it afterwards).
+				 */
+				if (entry->first_failure_at < entry->locked_until)
+				{
+					entry->failed_count = 0;
+					entry->first_failure_at = 0;
+				}
+				if (!entry->lock_pending_audit)
+					entry->locked_until = 0;
 			}
 
 			if (status == STATUS_OK)
@@ -319,6 +337,258 @@ ppp_client_auth_hook(Port *port, int status)
  * SQL-callable functions
  * ------------------------------------------------------------------------
  */
+
+/* ------------------------------------------------------------------------
+ * Deferred shared memory writes (applied at COMMIT)
+ * ------------------------------------------------------------------------
+ */
+typedef enum pppShmemOp
+{
+	PPP_OP_LOCK,
+	PPP_OP_UNLOCK,
+	PPP_OP_RESET
+} pppShmemOp;
+
+typedef struct pppPendingOp
+{
+	pppShmemOp	op;
+	char		rolename[NAMEDATALEN];
+	TimestampTz until;			/* PPP_OP_LOCK only */
+	SubTransactionId subxid;	/* sub-transaction that requested it */
+	struct pppPendingOp *next;
+} pppPendingOp;
+
+/* list of the current transaction, allocated in TopTransactionContext */
+static pppPendingOp *ppp_pending_ops = NULL;
+static pppPendingOp *ppp_pending_ops_tail = NULL;
+
+/* shmem_reload() was called in the current transaction */
+static bool ppp_reload_in_xact = false;
+
+/* callbacks registered once per backend */
+static bool ppp_xact_cb_registered = false;
+
+/*
+ * Set reload_requested and wake the worker up (SIGHUP = reload the
+ * configuration and run a cycle now).  Not signalled when called from the
+ * worker itself (run_maintenance() calls shmem_reload()), which would
+ * otherwise loop forever.  Runs after COMMIT: never raises an ERROR.
+ */
+static void
+ppp_signal_worker_reload(void)
+{
+	pid_t		pid;
+
+	if (ppp_shared == NULL)
+		return;
+
+	pg_atomic_write_u32(&ppp_shared->reload_requested, 1);
+
+	LWLockAcquire(ppp_shared->lock, LW_SHARED);
+	pid = ppp_shared->worker_pid;
+	LWLockRelease(ppp_shared->lock);
+
+	if (pid > 0 && pid != MyProcPid)
+	{
+		if (kill(pid, SIGHUP) != 0)
+			ereport(DEBUG1,
+					(errmsg(PPP_LOG_PREFIX "could not signal worker process %d: %m",
+							(int) pid)));
+	}
+}
+
+/*
+ * Apply the deferred writes, in order, under the lock.  Runs after COMMIT:
+ * nothing here may raise an ERROR (a full hash is reported as a WARNING).
+ */
+static void
+ppp_apply_pending_ops(void)
+{
+	pppPendingOp *op;
+
+	if (ppp_pending_ops == NULL || ppp_shared == NULL || ppp_role_hash == NULL)
+		return;
+
+	LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
+	for (op = ppp_pending_ops; op != NULL; op = op->next)
+	{
+		pppRoleKey	key;
+		pppRoleEntry *entry;
+
+		switch (op->op)
+		{
+			case PPP_OP_LOCK:
+				entry = ppp_enter_role(op->rolename);
+				if (entry != NULL)
+				{
+					entry->locked_until = op->until;
+					/* the SQL caller writes its own audit row */
+					entry->lock_pending_audit = false;
+				}
+				else
+					ereport(WARNING,
+							(errmsg(PPP_LOG_PREFIX "cannot lock role \"%s\" in shared memory: too many tracked roles",
+									op->rolename),
+							 errhint("Increase pg_pass_policy.max_tracked_roles.")));
+				break;
+			case PPP_OP_UNLOCK:
+				ppp_make_key(&key, op->rolename);
+				entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key, HASH_FIND, NULL);
+				if (entry != NULL)
+				{
+					entry->locked_until = 0;
+					entry->lock_pending_audit = false;
+				}
+				break;
+			case PPP_OP_RESET:
+				ppp_make_key(&key, op->rolename);
+				entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key, HASH_FIND, NULL);
+				if (entry != NULL)
+				{
+					entry->failed_count = 0;
+					entry->first_failure_at = 0;
+					entry->last_failure_at = 0;
+				}
+				break;
+		}
+	}
+	LWLockRelease(ppp_shared->lock);
+}
+
+static void
+ppp_xact_callback(XactEvent event, void *arg)
+{
+	switch (event)
+	{
+		case XACT_EVENT_COMMIT:
+		case XACT_EVENT_PARALLEL_COMMIT:
+			/* after ProcArrayEndTransaction: our rows are visible to the worker */
+			ppp_apply_pending_ops();
+			ppp_pending_ops = NULL;
+			ppp_pending_ops_tail = NULL;
+			if (ppp_reload_in_xact)
+			{
+				ppp_reload_in_xact = false;
+				ppp_signal_worker_reload();
+			}
+			break;
+
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PARALLEL_ABORT:
+			/* memory goes away with TopTransactionContext */
+			ppp_pending_ops = NULL;
+			ppp_pending_ops_tail = NULL;
+			ppp_reload_in_xact = false;
+			break;
+
+		case XACT_EVENT_PRE_PREPARE:
+			/*
+			 * Raised here (as postgres_fdw does) rather than at PREPARE,
+			 * which runs after the transaction has been prepared.  The
+			 * COMMIT PREPARED may come from another backend: the shared
+			 * memory could not be updated then.
+			 */
+			if (ppp_pending_ops != NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot PREPARE a transaction that has pending pg_pass_policy shared memory updates")));
+			break;
+
+		case XACT_EVENT_PREPARE:
+			/* a reload request is simply dropped: the next run_maintenance() catches up */
+			ppp_reload_in_xact = false;
+			break;
+
+		default:
+			break;
+	}
+}
+
+static void
+ppp_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+					 SubTransactionId parentSubid, void *arg)
+{
+	pppPendingOp *op;
+
+	if (ppp_pending_ops == NULL)
+		return;
+
+	switch (event)
+	{
+		case SUBXACT_EVENT_COMMIT_SUB:
+			/* the parent now owns the requests of this sub-transaction */
+			for (op = ppp_pending_ops; op != NULL; op = op->next)
+				if (op->subxid == mySubid)
+					op->subxid = parentSubid;
+			break;
+
+		case SUBXACT_EVENT_ABORT_SUB:
+			{
+				/*
+				 * Drop the requests of this sub-transaction.  Its children
+				 * have already been aborted (their requests removed) or
+				 * committed (their requests reassigned to mySubid).
+				 */
+				pppPendingOp *prev = NULL;
+				pppPendingOp *next;
+
+				ppp_pending_ops_tail = NULL;
+				for (op = ppp_pending_ops; op != NULL; op = next)
+				{
+					next = op->next;
+					if (op->subxid == mySubid)
+					{
+						if (prev)
+							prev->next = next;
+						else
+							ppp_pending_ops = next;
+					}
+					else
+					{
+						prev = op;
+						ppp_pending_ops_tail = op;
+					}
+				}
+			}
+			break;
+
+		default:
+			break;
+	}
+}
+
+static void
+ppp_register_xact_callbacks(void)
+{
+	if (!ppp_xact_cb_registered)
+	{
+		RegisterXactCallback(ppp_xact_callback, NULL);
+		RegisterSubXactCallback(ppp_subxact_callback, NULL);
+		ppp_xact_cb_registered = true;
+	}
+}
+
+/* Queue a write for the COMMIT of the current (sub-)transaction. */
+static void
+ppp_defer_op(pppShmemOp opcode, const char *rolename, TimestampTz until)
+{
+	pppPendingOp *op;
+
+	ppp_register_xact_callbacks();
+
+	op = (pppPendingOp *) MemoryContextAlloc(TopTransactionContext, sizeof(pppPendingOp));
+	op->op = opcode;
+	strlcpy(op->rolename, rolename, NAMEDATALEN);
+	op->until = until;
+	op->subxid = GetCurrentSubTransactionId();
+	op->next = NULL;
+
+	if (ppp_pending_ops_tail != NULL)
+		ppp_pending_ops_tail->next = op;
+	else
+		ppp_pending_ops = op;
+	ppp_pending_ops_tail = op;
+}
 
 static void
 ppp_check_shmem(void)
@@ -465,33 +735,23 @@ ppp_failed_attempts(PG_FUNCTION_ARGS)
  * shmem_reload() RETURNS void
  *
  * Ask the worker to reload the lockout parameters of the profiles and the
- * persisted locks of role_state into shared memory.  Sets reload_requested
- * and sends SIGHUP to the worker (whose PID is published in
- * ppp_shared->worker_pid); the worker treats SIGHUP as "reload the
- * configuration file and run a cycle now".  Not signalled when called from
- * the worker itself (run_maintenance() calls shmem_reload()), which would
- * otherwise loop forever.
+ * persisted locks of role_state into shared memory.  The request is made
+ * when the calling transaction commits (ppp_xact_callback, after the
+ * commit is visible): reload_requested is set and SIGHUP is sent to the
+ * worker (whose PID is published in ppp_shared->worker_pid), which treats
+ * it as "reload the configuration file and run a cycle now".  Signalling
+ * before the COMMIT would let the worker read the tables before the
+ * caller's changes are visible and consume the request for nothing.  Not
+ * signalled when called from the worker itself (run_maintenance() calls
+ * shmem_reload()): the worker consumes reload_requested at its next step.
+ * A ROLLBACK drops the request.
  */
 Datum
 ppp_shmem_reload(PG_FUNCTION_ARGS)
 {
-	pid_t		pid;
-
 	ppp_check_shmem();
-
-	pg_atomic_write_u32(&ppp_shared->reload_requested, 1);
-
-	LWLockAcquire(ppp_shared->lock, LW_SHARED);
-	pid = ppp_shared->worker_pid;
-	LWLockRelease(ppp_shared->lock);
-
-	if (pid > 0 && pid != MyProcPid)
-	{
-		if (kill(pid, SIGHUP) != 0)
-			ereport(DEBUG1,
-					(errmsg(PPP_LOG_PREFIX "could not signal worker process %d: %m",
-							(int) pid)));
-	}
+	ppp_register_xact_callbacks();
+	ppp_reload_in_xact = true;
 
 	PG_RETURN_VOID();
 }
@@ -512,14 +772,14 @@ ppp_text_to_rolename(text *t, char *buf)
 /*
  * shmem_lock_role(role text, until timestamptz) RETURNS void
  *
- * until NULL (or 'infinity') = locked until manual unlock.
+ * until NULL (or 'infinity') = locked until manual unlock.  The write is
+ * applied at COMMIT; a full hash is then reported as a WARNING.
  */
 Datum
 ppp_shmem_lock_role(PG_FUNCTION_ARGS)
 {
 	char		rolename[NAMEDATALEN];
 	TimestampTz until;
-	pppRoleEntry *entry;
 
 	ppp_require_superuser("shmem_lock_role");
 	ppp_check_shmem();
@@ -543,22 +803,7 @@ ppp_shmem_lock_role(PG_FUNCTION_ARGS)
 					 errmsg("lock end time must not be -infinity")));
 	}
 
-	LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
-	entry = ppp_enter_role(rolename);
-	if (entry != NULL)
-	{
-		entry->locked_until = until;
-		/* the SQL caller writes its own audit row */
-		entry->lock_pending_audit = false;
-	}
-	LWLockRelease(ppp_shared->lock);
-
-	if (entry == NULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_OUT_OF_MEMORY),
-				 errmsg("cannot lock role \"%s\" in shared memory: too many tracked roles",
-						rolename),
-				 errhint("Increase pg_pass_policy.max_tracked_roles.")));
+	ppp_defer_op(PPP_OP_LOCK, rolename, until);
 
 	PG_RETURN_VOID();
 }
@@ -566,15 +811,13 @@ ppp_shmem_lock_role(PG_FUNCTION_ARGS)
 /*
  * shmem_unlock_role(role text) RETURNS void
  *
- * Removes the lock; the failure counter is left alone (see
+ * Removes the lock at COMMIT; the failure counter is left alone (see
  * shmem_reset_failures).
  */
 Datum
 ppp_shmem_unlock_role(PG_FUNCTION_ARGS)
 {
 	char		rolename[NAMEDATALEN];
-	pppRoleKey	key;
-	pppRoleEntry *entry;
 
 	ppp_require_superuser("shmem_unlock_role");
 	ppp_check_shmem();
@@ -582,16 +825,8 @@ ppp_shmem_unlock_role(PG_FUNCTION_ARGS)
 	if (PG_ARGISNULL(0))
 		PG_RETURN_VOID();
 	ppp_text_to_rolename(PG_GETARG_TEXT_PP(0), rolename);
-	ppp_make_key(&key, rolename);
 
-	LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
-	entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key, HASH_FIND, NULL);
-	if (entry != NULL)
-	{
-		entry->locked_until = 0;
-		entry->lock_pending_audit = false;
-	}
-	LWLockRelease(ppp_shared->lock);
+	ppp_defer_op(PPP_OP_UNLOCK, rolename, 0);
 
 	PG_RETURN_VOID();
 }
@@ -599,15 +834,13 @@ ppp_shmem_unlock_role(PG_FUNCTION_ARGS)
 /*
  * shmem_reset_failures(role text) RETURNS void
  *
- * Resets the failure counter.  Failures not yet written to the audit log
- * (pending_failures) are kept: they did happen.
+ * Resets the failure counter at COMMIT.  Failures not yet written to the
+ * audit log (pending_failures) are kept: they did happen.
  */
 Datum
 ppp_shmem_reset_failures(PG_FUNCTION_ARGS)
 {
 	char		rolename[NAMEDATALEN];
-	pppRoleKey	key;
-	pppRoleEntry *entry;
 
 	ppp_require_superuser("shmem_reset_failures");
 	ppp_check_shmem();
@@ -615,17 +848,8 @@ ppp_shmem_reset_failures(PG_FUNCTION_ARGS)
 	if (PG_ARGISNULL(0))
 		PG_RETURN_VOID();
 	ppp_text_to_rolename(PG_GETARG_TEXT_PP(0), rolename);
-	ppp_make_key(&key, rolename);
 
-	LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
-	entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key, HASH_FIND, NULL);
-	if (entry != NULL)
-	{
-		entry->failed_count = 0;
-		entry->first_failure_at = 0;
-		entry->last_failure_at = 0;
-	}
-	LWLockRelease(ppp_shared->lock);
+	ppp_defer_op(PPP_OP_RESET, rolename, 0);
 
 	PG_RETURN_VOID();
 }

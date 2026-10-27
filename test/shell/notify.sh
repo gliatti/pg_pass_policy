@@ -6,7 +6,9 @@
 #    notifications après COMMIT) — déterministe ;
 # 2. deux sessions : un écouteur en pg_sleep, rotation depuis une autre session ;
 #    la notification est délivrée quand l'écouteur redevient inactif ;
-# 3. canal personnalisé via pg_pass_policy.notify_channel.
+# 3. canal personnalisé via pg_pass_policy.notify_channel ;
+# 4. refus PPP-xxx par le hook : le mot de passe refusé n'apparaît ni dans le
+#    log serveur (STATEMENT, CONTEXT) ni dans l'audit.
 set -euo pipefail
 . "$(dirname "$0")/common.sh"
 
@@ -82,5 +84,34 @@ out=$(printf '%s\n' \
 check_contains "notification sur le canal personnalisé" 'Asynchronous notification "ppp_custom"' "$out"
 check_not_contains "plus rien sur l'ancien canal" 'Asynchronous notification "pg_pass_policy"' "$out"
 check_contains "details transmis" '"source" ?: ?"notify.sh"' "$out"
+
+# --- 4. refus du hook : rien dans le log serveur (SPEC §8.1) ---------------------------
+# Une ERROR est écrite dans le log au moment où elle est levée, même si un bloc
+# EXCEPTION la rattrape ensuite : ni la ligne STATEMENT ni la ligne CONTEXT
+# (« SQL statement "ALTER ROLE … PASSWORD '…'" » quand l'ALTER ROLE passe par
+# EXECUTE) ne doivent contenir le mot de passe. Trois chemins, un mot de passe
+# unique (trop court : PPP-010) par chemin, pour savoir lequel fuit.
+# superuser_bypass est à off par défaut : le superutilisateur est refusé aussi.
+leak_probe() {
+	local desc=$1 probe=$2 sql=$3 out n
+	out=$(psql_admin "$sql" 2>&1) || true
+	check_contains "$desc : refus PPP-010" 'PPP-010' "$out"
+	sleep 0.5
+	n=$(grep -cF -- "$probe" "$PPP_TMP/server.log" || true)
+	check_eq "$desc : mot de passe absent du log serveur" "0" "$n"
+}
+leak_probe "ALTER ROLE direct" 'leakprobe1' \
+	"ALTER ROLE regress_notify PASSWORD 'leakprobe1'"
+leak_probe "ALTER ROLE via EXECUTE (CONTEXT)" 'leakprobe2' \
+	"DO \$\$ BEGIN EXECUTE 'ALTER ROLE regress_notify PASSWORD ''leakprobe2'''; END \$\$"
+leak_probe "_set_password (chemin de rotate_password)" 'leakprobe3' \
+	"SELECT pass_policy._set_password('regress_notify', 'leakprobe3')"
+# La ligne d'audit password_rejected est écrite dans une sous-transaction, mais
+# la transaction englobante est annulée par l'ERROR : seule la ligne LOG
+# (RAISE LOG de _audit, sans CONTEXT) subsiste.
+n=$(grep -cE 'password_rejected role=regress_notify .*PPP-010' "$PPP_TMP/server.log" || true)
+check_eq "trois refus journalisés (LOG password_rejected, code seul)" "3" "$n"
+out=$(psql_admin "SELECT count(*) FROM pass_policy.audit_log WHERE details::text LIKE '%leakprobe%'")
+check_eq "aucun mot de passe refusé dans l'audit" "0" "$out"
 
 ppp_finish

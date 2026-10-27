@@ -143,7 +143,7 @@ SELECT count(*) AS rows_with_password_cmd FROM pass_policy.audit_log
 SELECT count(*) AS known_secrets FROM ppp_test.secrets;
  known_secrets 
 ---------------
-            46
+            48
 (1 row)
 
 SELECT ppp_test.leaks();

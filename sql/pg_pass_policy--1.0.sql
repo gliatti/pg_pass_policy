@@ -399,7 +399,16 @@ COMMENT ON FUNCTION _require_admin() IS 'Internal: raises an error unless sessio
 
 /*
  * A member of pass_policy_admin who is not superuser must not be able to
- * take over a more privileged role by rotating/expiring/locking it.
+ * take over a more privileged role by rotating/expiring/locking it, nor to
+ * grant such a role to the login roles of a rotation pair.  A role is
+ * privileged when it has SUPERUSER, REPLICATION or BYPASSRLS, when it is a
+ * predefined pg_* role (pg_execute_server_program runs OS commands,
+ * pg_write_server_files writes any server file...; pg_database_owner is
+ * excluded: every database owner is an implicit member and it carries no
+ * privilege beyond the ownership already held), when it is a member, even
+ * indirectly, of such a role (SET ROLE / INHERIT give its privileges), or,
+ * on PostgreSQL <= 15, when it has CREATEROLE (which could then grant pg_*
+ * roles and change the password of any non-superuser).
  */
 CREATE FUNCTION _require_target_allowed(p_role name)
 RETURNS oid
@@ -409,22 +418,31 @@ AS $$
 DECLARE
     r record;
 BEGIN
-    SELECT a.oid, a.rolsuper, a.rolreplication, a.rolbypassrls INTO r
+    SELECT a.oid, a.rolname, a.rolsuper, a.rolreplication, a.rolbypassrls, a.rolcreaterole INTO r
       FROM pg_catalog.pg_authid a WHERE a.rolname = p_role;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'pg_pass_policy: role "%" does not exist', p_role
               USING ERRCODE = 'undefined_object';
     END IF;
-    IF (r.rolsuper OR r.rolreplication OR r.rolbypassrls)
-       AND NOT coalesce((SELECT x.rolsuper FROM pg_catalog.pg_roles x WHERE x.rolname = session_user), false) THEN
+    IF coalesce((SELECT x.rolsuper FROM pg_catalog.pg_roles x WHERE x.rolname = session_user), false) THEN
+        RETURN r.oid;
+    END IF;
+    IF r.rolsuper OR r.rolreplication OR r.rolbypassrls
+       OR (starts_with(r.rolname, 'pg_') AND r.rolname <> 'pg_database_owner')
+       OR (r.rolcreaterole AND current_setting('server_version_num')::int < 160000)
+       OR EXISTS (SELECT FROM pg_catalog.pg_authid x
+                   WHERE x.oid <> r.oid
+                     AND (x.rolsuper OR x.rolreplication OR x.rolbypassrls
+                          OR (starts_with(x.rolname, 'pg_') AND x.rolname <> 'pg_database_owner'))
+                     AND pg_catalog.pg_has_role(r.oid, x.oid, 'MEMBER')) THEN
         RAISE EXCEPTION 'pg_pass_policy: only a superuser can manage privileged role "%"', p_role
               USING ERRCODE = 'insufficient_privilege',
-                    DETAIL = 'The role has SUPERUSER, REPLICATION or BYPASSRLS.';
+                    DETAIL = 'The role has, or is a member of a role having, SUPERUSER, REPLICATION, BYPASSRLS or predefined (pg_*) privileges.';
     END IF;
     RETURN r.oid;
 END
 $$;
-COMMENT ON FUNCTION _require_target_allowed(name) IS 'Internal: returns the role OID; refuses privileged targets for non-superusers';
+COMMENT ON FUNCTION _require_target_allowed(name) IS 'Internal: returns the role OID; refuses privileged targets (directly or by membership) for non-superusers';
 
 CREATE FUNCTION _guc_on(p_name text, p_default bool)
 RETURNS bool
@@ -627,9 +645,22 @@ COMMENT ON FUNCTION _apply_valid_until(oid, text) IS 'Internal: writes VALID UNT
  * Executes ALTER ROLE ... PASSWORD with a generated password.
  * - pg_stat_statements.track_utility is switched off locally (if the module
  *   is loaded) so the statement text is not stored ;
+ * - log_error_verbosity = terse and log_min_error_statement = panic for the
+ *   whole function: any message written to the server log meanwhile (RAISE
+ *   LOG of the audit, a PPP-xxx ERROR raised by the hook, which is logged
+ *   when raised even if caught below) carries neither CONTEXT nor STATEMENT,
+ *   both of which would contain the ALTER ROLE text, hence the password ;
  * - an error is re-raised WITHOUT its CONTEXT (which would contain the
  *   statement text, hence the password) ;
- * - this statement is nested, so log_statement never logs it.
+ * - this statement is nested, so log_statement never logs it ;
+ * - auto_explain (log_nested_statements = on) is silenced for the duration
+ *   of the function: with log_verbose it would print the parameters of the
+ *   nested statements of the hook (the SCRAM verifier of the new password).
+ * The set_config(..., true) calls are made outside the inner block so that
+ * they survive its subtransaction rollback; they are undone at function exit
+ * (the function has a SET clause, so its GUC nesting level is restored).
+ * Callers are SECURITY DEFINER functions owned by a superuser, which allows
+ * setting these superuser-only parameters.
  */
 CREATE FUNCTION _set_password(p_role name, p_password text)
 RETURNS void
@@ -643,6 +674,11 @@ DECLARE
     v_detail  text;
     v_hint    text;
 BEGIN
+    PERFORM set_config('log_error_verbosity', 'terse', true);
+    PERFORM set_config('log_min_error_statement', 'panic', true);
+    IF current_setting('auto_explain.log_min_duration', true) IS NOT NULL THEN
+        PERFORM set_config('auto_explain.log_min_duration', '-1', true);
+    END IF;
     IF v_pgss IS NOT NULL THEN
         PERFORM set_config('pg_stat_statements.track_utility', 'off', true);
     END IF;
@@ -1175,6 +1211,10 @@ BEGIN
               USING ERRCODE = 'undefined_object',
                     HINT = 'Create the group role holding the privileges first.';
     END IF;
+    -- GRANT group_role TO role_a/role_b runs below as superuser (SECURITY
+    -- DEFINER): a non-superuser admin must not obtain a LOGIN member of a
+    -- superuser, of a pg_* role or of a member of one (SPEC §8.4).
+    PERFORM pass_policy._require_target_allowed(v_group);
     IF EXISTS (SELECT FROM pass_policy.rotation_pair rp WHERE rp.pair_name = v_pair) THEN
         RAISE EXCEPTION 'pg_pass_policy: rotation pair "%" already exists', v_pair
               USING ERRCODE = 'duplicate_object';
@@ -1249,6 +1289,15 @@ BEGIN
         UPDATE pass_policy.rotation_pair r SET previous_valid_until = v_bound
          WHERE r.pair_name = rp.pair_name;
         PERFORM pass_policy._ensure_state(v_old_oid);
+        -- The bound is recorded in role_state too (as expire_password() does),
+        -- not only derived from rotation_pair: should the pair row disappear
+        -- (group role dropped, manual DELETE), the old password must not
+        -- become valid again at the next VALID UNTIL synchronisation.
+        -- last_warned_at = now() avoids an immediate expiry_warning.
+        UPDATE pass_policy.role_state s
+           SET must_change = true, expires_at = v_bound, grace_until = v_bound,
+               last_warned_at = now(), valid_until_synced = v_bound
+         WHERE s.role_oid = v_old_oid;
         PERFORM pass_policy._apply_valid_until(v_old_oid, 'force');
     END IF;
 
@@ -1273,7 +1322,10 @@ COMMENT ON FUNCTION switch_rotation_pair(text, int) IS 'Rotates a pair: new pass
  *  a.  purge rows of roles that no longer exist ;
  *  b.  reconcile pg_authid.rolpassword with the history ;
  *  c.  recompute expires_at / grace_until ;
- *  d.  VALID UNTIL synchronisation (pass_policy.manage_valid_until) ;
+ *  d.  VALID UNTIL synchronisation (pass_policy.manage_valid_until); when
+ *      it is off, only lifts a VALID UNTIL in the past that the extension
+ *      wrote itself (expire_password, former sync) once the password has
+ *      been changed ('unblock') ;
  *  e.  expiry_warning (max once a day) / password_expired (once) ;
  *  f.  automatic unlock of expired locks ;
  *  g.  'maintenance' audit row only if something was done ;
@@ -1295,6 +1347,11 @@ DECLARE
     v_actions  int := 0;
 BEGIN
     PERFORM pass_policy._require_admin();
+    -- step b updates password_history.verifier with pg_authid.rolpassword:
+    -- keep auto_explain from logging those values (see _set_password)
+    IF current_setting('auto_explain.log_min_duration', true) IS NOT NULL THEN
+        PERFORM set_config('auto_explain.log_min_duration', '-1', true);
+    END IF;
 
     ---------------------------------------------------------------- a0
     -- name wins: rows whose role_name exists with another OID get that OID
@@ -1373,8 +1430,20 @@ BEGIN
          WHERE NOT EXISTS (SELECT FROM pg_catalog.pg_authid a WHERE a.rolname = rp.role_a)
             OR NOT EXISTS (SELECT FROM pg_catalog.pg_authid a WHERE a.rolname = rp.role_b)
             OR NOT EXISTS (SELECT FROM pg_catalog.pg_authid a WHERE a.rolname = rp.group_role)
-        RETURNING rp.pair_name AS pname
+        RETURNING rp.pair_name AS pname, rp.previous_role AS prev_role,
+                  rp.previous_valid_until AS prev_until,
+                  (SELECT a.oid FROM pg_catalog.pg_authid a WHERE a.rolname = rp.previous_role) AS prev_oid
     LOOP
+        -- the bound of the previous role must survive the pair row (pairs
+        -- switched before role_state carried it)
+        IF r.prev_oid IS NOT NULL AND r.prev_until IS NOT NULL THEN
+            PERFORM pass_policy._ensure_state(r.prev_oid);
+            UPDATE pass_policy.role_state s
+               SET must_change = true, expires_at = r.prev_until, grace_until = r.prev_until,
+                   last_warned_at = coalesce(s.last_warned_at, now())
+             WHERE s.role_oid = r.prev_oid
+               AND (NOT s.must_change OR s.grace_until IS NULL OR s.grace_until > r.prev_until);
+        END IF;
         action := 'purge'; role_name := NULL;
         details := jsonb_build_object('table', 'rotation_pair', 'pair', r.pname);
         v_actions := v_actions + 1;
@@ -1456,22 +1525,26 @@ BEGIN
     END IF;
 
     ---------------------------------------------------------------- d
-    IF v_manage THEN
-        FOR r IN
-            SELECT s.role_oid, s.role_name AS rname
-              FROM pass_policy.role_state s
-              JOIN pg_catalog.pg_authid a ON a.oid = s.role_oid
-             WHERE a.rolcanlogin AND NOT pass_policy._is_exempt(a.rolname)
-        LOOP
-            v_res := pass_policy._apply_valid_until(r.role_oid, 'sync');
-            IF v_res IS NOT NULL THEN
-                PERFORM pass_policy._audit('valid_until_synced', r.rname, v_res);
-                action := 'valid_until_synced'; role_name := r.rname; details := v_res;
-                v_actions := v_actions + 1;
-                RETURN NEXT;
-            END IF;
-        END LOOP;
-    END IF;
+    -- manage_valid_until = off: only roles whose current VALID UNTIL was
+    -- written by the extension (= valid_until_synced) and whose password has
+    -- been changed since (must_change cleared) are considered, in 'unblock'
+    -- mode (rewrites only a VALID UNTIL already in the past).
+    FOR r IN
+        SELECT s.role_oid, s.role_name AS rname
+          FROM pass_policy.role_state s
+          JOIN pg_catalog.pg_authid a ON a.oid = s.role_oid
+         WHERE a.rolcanlogin AND NOT pass_policy._is_exempt(a.rolname)
+           AND (v_manage
+                OR (NOT s.must_change AND a.rolvaliduntil IS NOT DISTINCT FROM s.valid_until_synced))
+    LOOP
+        v_res := pass_policy._apply_valid_until(r.role_oid, CASE WHEN v_manage THEN 'sync' ELSE 'unblock' END);
+        IF v_res IS NOT NULL THEN
+            PERFORM pass_policy._audit('valid_until_synced', r.rname, v_res);
+            action := 'valid_until_synced'; role_name := r.rname; details := v_res;
+            v_actions := v_actions + 1;
+            RETURN NEXT;
+        END IF;
+    END LOOP;
 
     ---------------------------------------------------------------- e
     FOR r IN
@@ -1542,6 +1615,7 @@ SELECT q.role_name, q.profile, q.password_changed_at, q.expires_at, q.grace_unti
        q.locked_until, q.failed_count,
        CASE
            WHEN q.locked_until > now()                         THEN 'locked'
+           WHEN q.must_change AND now() < q.grace_until        THEN 'grace'   -- previous role of a pair, still usable until its bound
            WHEN q.must_change                                  THEN 'expired'
            WHEN q.max_age IS NULL                              THEN 'never_expires'
            WHEN q.password_changed_at IS NULL                  THEN 'unknown'

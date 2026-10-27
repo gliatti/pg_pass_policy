@@ -152,6 +152,32 @@ SELECT count(*) AS history_after FROM pass_policy.password_history
  WHERE role_name = 'regress_recon';
 SELECT ppp_test.code(pass_policy.check_password('regress_recon', 'Recon-Disabled#01')) AS reuse;
 
+-- manage_valid_until = off : le worker ne gère plus VALID UNTIL, mais une
+-- borne qu'il a posée lui-même (expire_password) est levée une fois le mot de
+-- passe changé (mode unblock), sinon le rôle resterait bloqué indéfiniment.
+ALTER SYSTEM SET pg_pass_policy.manage_valid_until = off;
+SELECT pg_reload_conf();
+SELECT pg_sleep(0.5);
+SHOW pg_pass_policy.manage_valid_until;
+CREATE ROLE regress_unblock LOGIN;
+ALTER ROLE regress_unblock PASSWORD 'Unblock-Pw#2024x';
+INSERT INTO ppp_test.secrets VALUES ('unblock1', 'Unblock-Pw#2024x'), ('unblock2', 'Unblock-Pw#2024y');
+SELECT pass_policy.expire_password('regress_unblock');
+SELECT rolvaliduntil <= now() AS blocked FROM pg_roles WHERE rolname = 'regress_unblock';
+-- tant que le mot de passe n'est pas changé, rien n'est relevé
+CREATE TEMP TABLE m9 AS SELECT * FROM pass_policy.run_maintenance();
+SELECT count(*) AS synced_before_change FROM m9
+ WHERE role_name = 'regress_unblock' AND action = 'valid_until_synced';
+SELECT rolvaliduntil <= now() AS still_blocked FROM pg_roles WHERE rolname = 'regress_unblock';
+ALTER ROLE regress_unblock PASSWORD 'Unblock-Pw#2024y';
+SELECT action, role_name, details->>'mode' AS mode
+  FROM pass_policy.run_maintenance() WHERE role_name = 'regress_unblock';
+SELECT rolvaliduntil > now() AS unblocked FROM pg_roles WHERE rolname = 'regress_unblock';
+ALTER SYSTEM RESET pg_pass_policy.manage_valid_until;
+SELECT pg_reload_conf();
+SELECT pg_sleep(0.5);
+SHOW pg_pass_policy.manage_valid_until;
+
 SELECT ppp_test.leaks();
 
 -- Nettoyage des profils (les rôles sont supprimés dans 99_teardown)

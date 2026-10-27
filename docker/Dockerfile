@@ -16,6 +16,7 @@ ENV PG_MAJOR=${PG_MAJOR} \
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         build-essential \
+        libkrb5-dev \
         "postgresql-server-dev-${PG_MAJOR}" \
  && rm -rf /var/lib/apt/lists/*
 

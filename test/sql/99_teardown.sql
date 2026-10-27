@@ -1,5 +1,5 @@
 --
--- 99_teardown — suppression de l'extension et des rôles de test
+-- 99_teardown — suppression de l'extension, du schéma et des rôles de test
 --
 -- Les rôles pass_policy_admin et pass_policy_viewer sont des objets globaux
 -- (pg_authid) : DROP EXTENSION ne les supprime pas. Ils restent en place pour
@@ -16,7 +16,20 @@ DROP SCHEMA ppp_test CASCADE;
 DROP EXTENSION pg_pass_policy;
 
 SELECT count(*) AS ext FROM pg_extension WHERE extname = 'pg_pass_policy';
-SELECT count(*) AS schema FROM pg_namespace WHERE nspname = 'pass_policy';
+
+-- Le schéma pass_policy est déclaré par la clé « schema » du fichier .control :
+-- CREATE EXTENSION le crée mais il n'appartient pas à l'extension, donc
+-- DROP EXTENSION le laisse en place (comportement standard de PostgreSQL).
+-- Il doit être vide et se supprimer à la main.
+SELECT count(*) AS schema_after_drop_extension
+  FROM pg_namespace WHERE nspname = 'pass_policy';
+SELECT count(*) AS objects_left
+  FROM pg_class WHERE relnamespace = 'pass_policy'::regnamespace;
+DROP SCHEMA pass_policy;
+SELECT count(*) AS schema_after_drop_schema
+  FROM pg_namespace WHERE nspname = 'pass_policy';
+
+-- Les rôles survivent aussi (objets globaux)
 SELECT rolname FROM pg_roles
  WHERE rolname IN ('pass_policy_admin', 'pass_policy_viewer') ORDER BY 1;
 
@@ -34,7 +47,9 @@ BEGIN
 END $$;
 SELECT count(*) AS regress_roles_left FROM pg_roles WHERE rolname LIKE 'regress\_%';
 
--- Réinstallation possible (rôles déjà présents), puis suppression
+-- Réinstallation possible (rôles déjà présents), puis suppression complète
 CREATE EXTENSION pg_pass_policy;
 SELECT count(*) AS reinstalled FROM pass_policy.profile WHERE name = 'default';
 DROP EXTENSION pg_pass_policy;
+DROP SCHEMA pass_policy;
+SELECT count(*) AS schema_left FROM pg_namespace WHERE nspname = 'pass_policy';

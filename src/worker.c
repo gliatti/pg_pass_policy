@@ -8,13 +8,19 @@
  * Each cycle, in pg_pass_policy.database:
  *	 1. SELECT * FROM pass_policy.run_maintenance()  (own transaction;
  *		skipped when pg_pass_policy.worker_interval = 0)
- *	 2. shared memory synchronisation (own transaction):
- *		a. audit rows for pending failures / locks, locks copied to
- *		   role_state;
- *		b. expired locks cleared, inactive entries purged;
- *		c. when requested (shmem_reload() or first cycle): lockout
+ *	 2. pending audit (own transaction): audit rows for pending failures /
+ *		locks, locks copied to role_state.  The shared memory counters are
+ *		acknowledged only after this transaction has committed, so that a
+ *		failure (or an error in a later step) never loses an audit row or
+ *		a persisted lock.
+ *	 3. shared memory synchronisation (own transaction):
+ *		a. expired locks cleared, inactive entries purged;
+ *		b. when requested (shmem_reload() or first cycle): lockout
  *		   parameters reloaded from the profiles, persisted locks re-injected
  *		   from role_state.
+ *
+ * The worker connects as superuser: every SQL it runs is schema-qualified
+ * and search_path is pinned to pg_catalog, pg_temp.
  *
  * Signals: SIGHUP = reload the configuration file and run a cycle now
  * (shmem_reload() sends it); SIGTERM = exit.
@@ -91,6 +97,15 @@ static MemoryContext ppp_worker_cxt = NULL;
  * immediately, in a busy loop.  Retried on the next timed cycle.
  */
 static bool ppp_reload_pending = false;
+
+/*
+ * Copies of the shared memory entries written to the tables by the current
+ * cycle (allocated in ppp_worker_cxt so that they survive SPI_finish and the
+ * end of the transaction).  They are acknowledged in shared memory by
+ * ppp_ack_pending() once the transaction that wrote them has committed.
+ */
+static pppPendingRow *ppp_pending_rows = NULL;
+static int	ppp_pending_nrows = 0;
 
 
 /*
@@ -204,7 +219,11 @@ ppp_step_maintenance(void)
 }
 
 /* ------------------------------------------------------------------------
- * Step 2a: pending audit rows and locks -> tables
+ * Step 2: pending audit rows and locks -> tables
+ *
+ * Runs inside its own transaction (ppp_run_in_xact).  The rows copied here
+ * are kept in ppp_pending_rows; nothing is modified in shared memory until
+ * ppp_ack_pending() is called after the commit.
  * ------------------------------------------------------------------------
  */
 static void
@@ -217,7 +236,10 @@ ppp_sync_pending(void)
 	int			maxrows = ppp_max_tracked_roles > 0 ? ppp_max_tracked_roles : 1;
 	int			i;
 
-	rows = (pppPendingRow *) palloc(sizeof(pppPendingRow) * maxrows);
+	Assert(ppp_pending_rows == NULL);
+	rows = (pppPendingRow *) MemoryContextAlloc(ppp_worker_cxt,
+												sizeof(pppPendingRow) * maxrows);
+	ppp_pending_rows = rows;
 
 	LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
 	hash_seq_init(&seq, ppp_role_hash);
@@ -239,6 +261,7 @@ ppp_sync_pending(void)
 		nrows++;
 	}
 	LWLockRelease(ppp_shared->lock);
+	ppp_pending_nrows = nrows;
 
 	for (i = 0; i < nrows; i++)
 	{
@@ -259,7 +282,7 @@ ppp_sync_pending(void)
 
 			ret = SPI_execute_with_args(
 										"SELECT pass_policy.audit('auth_failed', $1, "
-										"jsonb_build_object('count', $2, 'last_failure_at', $3, "
+										"pg_catalog.jsonb_build_object('count', $2, 'last_failure_at', $3, "
 										"'source', 'auth_hook'))",
 										3, argtypes, values, nulls, false, 0);
 			if (ret != SPI_OK_SELECT)
@@ -278,7 +301,7 @@ ppp_sync_pending(void)
 
 			ret = SPI_execute_with_args(
 										"SELECT pass_policy.audit('role_locked', $1, "
-										"jsonb_build_object('locked_until', $2, 'failed_count', $3, "
+										"pg_catalog.jsonb_build_object('locked_until', $2, 'failed_count', $3, "
 										"'locked_by', 'auto', "
 										"'reason', 'too many failed authentication attempts'))",
 										3, argtypes, values, nulls, false, 0);
@@ -303,39 +326,60 @@ ppp_sync_pending(void)
 		}
 	}
 
-	/*
-	 * Everything was written: acknowledge what we copied.  Failures counted
-	 * by the hook meanwhile stay pending for the next cycle.
-	 */
 	if (nrows > 0)
+		elog(DEBUG1, PPP_LOG_PREFIX "wrote %d pending shared memory entries", nrows);
+}
+
+/*
+ * Acknowledge in shared memory what ppp_sync_pending() wrote, once its
+ * transaction has committed.  Failures counted by the hook meanwhile stay
+ * pending for the next cycle; a lock set again since (different
+ * locked_until) keeps its pending flag.
+ */
+static void
+ppp_ack_pending(void)
+{
+	int			i;
+
+	if (ppp_pending_nrows <= 0)
+		return;
+
+	LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
+	for (i = 0; i < ppp_pending_nrows; i++)
 	{
-		LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
-		for (i = 0; i < nrows; i++)
-		{
-			pppRoleKey	key;
+		pppPendingRow *r = &ppp_pending_rows[i];
+		pppRoleKey	key;
+		pppRoleEntry *entry;
 
-			memset(&key, 0, sizeof(key));
-			strlcpy(key.rolename, rows[i].rolename, NAMEDATALEN);
-			entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key, HASH_FIND, NULL);
-			if (entry == NULL)
-				continue;
-			entry->pending_failures -= rows[i].pending_failures;
-			if (entry->pending_failures < 0)
-				entry->pending_failures = 0;
-			if (rows[i].lock_pending_audit &&
-				entry->locked_until == rows[i].locked_until)
-				entry->lock_pending_audit = false;
-		}
-		LWLockRelease(ppp_shared->lock);
-
-		elog(DEBUG1, PPP_LOG_PREFIX "synchronised %d shared memory entries", nrows);
+		memset(&key, 0, sizeof(key));
+		strlcpy(key.rolename, r->rolename, NAMEDATALEN);
+		entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key, HASH_FIND, NULL);
+		if (entry == NULL)
+			continue;
+		entry->pending_failures -= r->pending_failures;
+		if (entry->pending_failures < 0)
+			entry->pending_failures = 0;
+		if (r->lock_pending_audit && entry->locked_until == r->locked_until)
+			entry->lock_pending_audit = false;
 	}
+	LWLockRelease(ppp_shared->lock);
 
-	pfree(rows);
+	elog(DEBUG1, PPP_LOG_PREFIX "synchronised %d shared memory entries",
+		 ppp_pending_nrows);
+}
+
+/* Free the copies, acknowledged or not. */
+static void
+ppp_free_pending(void)
+{
+	if (ppp_pending_rows != NULL)
+		pfree(ppp_pending_rows);
+	ppp_pending_rows = NULL;
+	ppp_pending_nrows = 0;
 }
 
 /* ------------------------------------------------------------------------
- * Step 2b: expired locks and inactive entries (shared memory only)
+ * Step 3a: expired locks and inactive entries (shared memory only)
  * ------------------------------------------------------------------------
  */
 static void
@@ -352,13 +396,21 @@ ppp_sync_cleanup(void)
 	hash_seq_init(&seq, ppp_role_hash);
 	while ((entry = (pppRoleEntry *) hash_seq_search(&seq)) != NULL)
 	{
-		/* expired lock */
+		/*
+		 * Expired lock (once its role_locked audit row has been written).
+		 * The authentication hook may already have counted new failures
+		 * after the expiry while locked_until was still set: those belong to
+		 * a new episode (first_failure_at >= locked_until) and are kept.
+		 */
 		if (entry->locked_until != 0 && entry->locked_until != DT_NOEND &&
 			entry->locked_until <= now && !entry->lock_pending_audit)
 		{
+			if (entry->first_failure_at < entry->locked_until)
+			{
+				entry->failed_count = 0;
+				entry->first_failure_at = 0;
+			}
 			entry->locked_until = 0;
-			entry->failed_count = 0;
-			entry->first_failure_at = 0;
 		}
 
 		/*
@@ -383,7 +435,7 @@ ppp_sync_cleanup(void)
 }
 
 /* ------------------------------------------------------------------------
- * Step 2c: reload profiles and persisted locks
+ * Step 3b: reload profiles and persisted locks
  * ------------------------------------------------------------------------
  */
 static int32
@@ -412,10 +464,16 @@ ppp_sync_reload(void)
 	pppRoleEntry *entry;
 	int			not_tracked = 0;
 
+	/*
+	 * Durations are clamped to INT_MAX seconds (about 68 years) before the
+	 * int4 cast: a longer (legal) interval, or 'infinity', would otherwise
+	 * raise "integer out of range" at every cycle.  COALESCE comes first so
+	 * that NULL (manual unlock only) stays -1.
+	 */
 	/* profile "default" */
 	ret = SPI_execute("SELECT p.max_failures, "
-					  "extract(epoch FROM p.failure_window)::int4, "
-					  "COALESCE(extract(epoch FROM p.lock_duration)::int4, -1) "
+					  "LEAST(extract(epoch FROM p.failure_window), 2147483647)::int4, "
+					  "LEAST(COALESCE(extract(epoch FROM p.lock_duration), -1), 2147483647)::int4 "
 					  "FROM pass_policy.profile p WHERE p.name = 'default'",
 					  true, 1);
 	if (ret != SPI_OK_SELECT)
@@ -433,8 +491,8 @@ ppp_sync_reload(void)
 
 	/* roles with an assigned profile; current name taken from pg_roles */
 	ret = SPI_execute("SELECT COALESCE(r.rolname::text, rp.role_name), p.max_failures, "
-					  "extract(epoch FROM p.failure_window)::int4, "
-					  "COALESCE(extract(epoch FROM p.lock_duration)::int4, -1) "
+					  "LEAST(extract(epoch FROM p.failure_window), 2147483647)::int4, "
+					  "LEAST(COALESCE(extract(epoch FROM p.lock_duration), -1), 2147483647)::int4 "
 					  "FROM pass_policy.role_profile rp "
 					  "JOIN pass_policy.profile p USING (profile_id) "
 					  "LEFT JOIN pg_catalog.pg_roles r ON r.oid = rp.role_oid",
@@ -596,7 +654,6 @@ ppp_sync_reload(void)
 static void
 ppp_step_sync(void)
 {
-	ppp_sync_pending();
 	ppp_sync_cleanup();
 	if (ppp_reload_pending)
 	{
@@ -628,6 +685,17 @@ ppp_worker_cycle(bool run_full)
 	if (pg_atomic_exchange_u32(&ppp_shared->reload_requested, 0) != 0)
 		ppp_reload_pending = true;
 
+	/*
+	 * Pending audit rows and locks, in their own transaction: the shared
+	 * memory is acknowledged only once they are committed, and an error in
+	 * the synchronisation step below cannot roll them back.
+	 */
+	if (ppp_run_in_xact("pending audit", ppp_sync_pending))
+		ppp_ack_pending();
+	ppp_free_pending();
+
+	CHECK_FOR_INTERRUPTS();
+
 	(void) ppp_run_in_xact("shared memory synchronisation", ppp_step_sync);
 
 	LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
@@ -654,6 +722,13 @@ ppp_worker_main(Datum main_arg)
 				(errmsg(PPP_LOG_PREFIX "shared memory is not initialized")));
 
 	BackgroundWorkerInitializeConnection(ppp_database, NULL, 0);
+
+	/*
+	 * Defence in depth: the worker runs as superuser and every query it
+	 * issues is schema-qualified, but a safe search_path makes sure that no
+	 * object created in a user schema (public) can ever be picked up.
+	 */
+	SetConfigOption("search_path", "pg_catalog, pg_temp", PGC_SUSET, PGC_S_SESSION);
 
 	ppp_worker_cxt = AllocSetContextCreate(TopMemoryContext,
 										   "pg_pass_policy worker",

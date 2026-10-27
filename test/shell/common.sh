@@ -13,7 +13,8 @@
 #   ok / fail / check_eq / check_contains / check_not_contains / ppp_finish
 #
 # Variables : PG_CONFIG (défaut pg_config), PPP_KEEP_TMP=1 pour conserver le
-# répertoire temporaire (données + log) après exécution.
+# répertoire temporaire (données + log) après exécution, PPP_LOCALE (défaut C)
+# pour la locale de l'initdb (unicode.sh utilise C.UTF-8).
 #
 # L'extension doit avoir été installée au préalable (make install).
 
@@ -21,6 +22,7 @@ PG_CONFIG=${PG_CONFIG:-pg_config}
 PPP_BINDIR=$("$PG_CONFIG" --bindir)
 PPP_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 PPP_SUPERUSER=ppp_test_super
+PPP_LOCALE=${PPP_LOCALE:-C}
 PPP_DB=postgres
 PPP_TMP=""
 PPP_PORT=""
@@ -99,11 +101,9 @@ trap 'exit 130' INT TERM
 # ppp_start [paramètre=valeur …] : surcharges ajoutées en fin de postgresql.conf
 ppp_start() {
 	PPP_TMP=$(mktemp -d "${TMPDIR:-/tmp}/ppp_test.XXXXXX")
-	PPP_PORT=$(ppp_free_port)
-	log "instance temporaire : $PPP_TMP (port $PPP_PORT, $("$PPP_BINDIR/postgres" --version))"
 
 	"$PPP_BINDIR/initdb" -D "$PPP_TMP/data" -U "$PPP_SUPERUSER" -A trust \
-		--no-sync -E UTF8 --locale=C >"$PPP_TMP/initdb.log" 2>&1 || {
+		--no-sync -E UTF8 --locale="$PPP_LOCALE" >"$PPP_TMP/initdb.log" 2>&1 || {
 		cat "$PPP_TMP/initdb.log"
 		return 1
 	}
@@ -113,7 +113,7 @@ ppp_start() {
 		echo
 		echo "# --- surcharges test/shell/common.sh ---"
 		echo "listen_addresses = '127.0.0.1'"
-		echo "port = $PPP_PORT"
+		echo "# port : passé par pg_ctl -o '-p N' (nouveau tirage si le port est pris)"
 		echo "unix_socket_directories = ''"
 		echo "pg_pass_policy.database = '$PPP_DB'"
 		echo "pg_pass_policy.worker_interval = 2"
@@ -132,16 +132,39 @@ ppp_start() {
 		host all all            127.0.0.1/32 scram-sha-256
 	HBA
 
-	"$PPP_BINDIR/pg_ctl" -D "$PPP_TMP/data" -l "$PPP_TMP/server.log" -w -t 60 start >/dev/null || {
+	# La plage 54400-54899 est dans la plage éphémère de Linux : un port libre
+	# à l'écoute peut être occupé côté client (psql d'un test précédent) et le
+	# bind() échouer. On retire alors un autre port, au plus 5 fois.
+	local attempt
+	for attempt in 1 2 3 4 5; do
+		PPP_PORT=$(ppp_free_port)
+		rm -f "$PPP_TMP/server.log"
+		if "$PPP_BINDIR/pg_ctl" -D "$PPP_TMP/data" -l "$PPP_TMP/server.log" \
+			-o "-p $PPP_PORT" -w -t 60 start >/dev/null 2>&1; then
+			break
+		fi
+		if grep -q 'Address already in use' "$PPP_TMP/server.log" 2>/dev/null &&
+			[ "$attempt" -lt 5 ]; then
+			log "port $PPP_PORT déjà pris, nouveau tirage ($attempt/5)"
+			continue
+		fi
 		tail -n 30 "$PPP_TMP/server.log"
 		return 1
-	}
+	done
+	log "instance temporaire : $PPP_TMP (port $PPP_PORT, $("$PPP_BINDIR/postgres" --version))"
 	psql_admin "CREATE EXTENSION pg_pass_policy" >/dev/null
 }
 
 psql_admin() {
 	"$PPP_BINDIR/psql" -X -q -At -v ON_ERROR_STOP=1 \
 		-h 127.0.0.1 -p "$PPP_PORT" -U "$PPP_SUPERUSER" -d "$PPP_DB" -c "$1"
+}
+
+# psql_admin_script : comme psql_admin, mais lit un script SQL sur l'entrée
+# standard (transactions explicites, SAVEPOINT…) ; stdout+stderr sur la sortie
+psql_admin_script() {
+	"$PPP_BINDIR/psql" -X -q -At -v ON_ERROR_STOP=1 \
+		-h 127.0.0.1 -p "$PPP_PORT" -U "$PPP_SUPERUSER" -d "$PPP_DB" 2>&1
 }
 
 # psql_as ROLE PASSWORD [SQL] : vraie authentification SCRAM sur 127.0.0.1.
