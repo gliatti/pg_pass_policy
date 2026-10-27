@@ -3,8 +3,12 @@
 install_log_masking() installs two hooks, once, for every logger and
 handler (the ones uvicorn configures included):
 
-- a LogRecord factory masks the arguments and the formatted message as soon
-  as a record is created, once per record;
+- a LogRecord factory masks the arguments as soon as a record is created,
+  and the formatted message when it may hold a secret (a secret-like word
+  in the template or in a string argument, or an argument of another type
+  than str / number / bool / None, whose text is unknown until formatted):
+  the other records, most of them, are formatted once only, by their
+  handler;
 - Logger.makeRecord, wrapped on the Logger class itself (so that loggers
   created before the installation, the root logger and subclasses set with
   logging.setLoggerClass are covered), masks the `extra` attributes, which
@@ -12,10 +16,15 @@ handler (the ones uvicorn configures included):
   thus masked before any filter, handler or formatter sees the record,
   whatever it reads (getMessage() or record.__dict__ directly).
 
-A Logger subclass that overrides makeRecord without calling it, or a record
-built by hand (logging.makeLogRecord), escapes the second hook:
-PasswordMaskFilter, put on a handler, covers that case.
-The application itself never logs a password; this is a safety net.
+Limits: a Logger subclass that overrides makeRecord without calling it
+escapes the second hook (its `extra` attributes are not masked), and a
+record rebuilt by logging.makeLogRecord(dict) escapes both: the factory is
+called with an empty record, the dict's attributes (msg, args...) are set
+afterwards.  No hook is installed on a logger or a handler for these cases:
+a logger's filter does not see the records propagated from its children.
+PasswordMaskFilter applies the same masking to a record on demand (as a
+filter of one's own handler, for instance).  The application itself never
+logs a password; this is a safety net.
 """
 
 from __future__ import annotations
@@ -25,6 +34,11 @@ import re
 from typing import Any
 
 MASK = "***"
+
+# cheap pre-check of the factory: a word that _VALUE_RE could match
+_CANDIDATE_RE = re.compile(r"passw|passphrase|pwd|secret|token", re.IGNORECASE)
+# argument types whose text is known without formatting them (str is searched)
+_PLAIN_TYPES = (int, float, bool, type(None))
 
 # keys / attribute names that denote a secret
 _KEY_RE = re.compile(r"(pass(word|wd|phrase)?|pwd|secret|token|authorization)", re.IGNORECASE)
@@ -45,19 +59,54 @@ def mask_text(text: str) -> str:
 
 
 def mask_value(value: Any) -> Any:
+    """`value` with its secret-like content masked, never raising: MASK when
+    masking it fails (a broken __eq__, a recursive container...)."""
+    try:
+        return _mask_value(value)
+    except Exception:
+        return MASK
+
+
+def _mask_value(value: Any) -> Any:
     if isinstance(value, str):
         return mask_text(value)
-    if isinstance(value, dict):
-        return {
-            k: (MASK if isinstance(k, str) and _KEY_RE.search(k) else mask_value(v))
-            for k, v in value.items()
-        }
-    if isinstance(value, list | tuple):
-        masked = [mask_value(v) for v in value]
-        if hasattr(value, "_fields"):  # namedtuple
-            return type(value)(*masked)
-        return type(value)(masked)
+    # only the exact built-in containers are rebuilt: a subclass (namedtuple,
+    # defaultdict, OrderedDict, a class of one's own) may not take its items
+    # back through its constructor
+    kind = type(value)
+    if kind is dict:
+        return _mask_dict(value)
+    if kind is list:
+        return [_mask_value(v) for v in value]
+    if kind is tuple:
+        return tuple(_mask_value(v) for v in value)
+    if isinstance(value, dict | list | tuple):
+        return _mask_subclass(value)
     return value
+
+
+def _mask_dict(value: dict[Any, Any]) -> dict[Any, Any]:
+    return {
+        k: (MASK if isinstance(k, str) and _KEY_RE.search(k) else _mask_value(v))
+        for k, v in value.items()
+    }
+
+
+def _mask_subclass(value: dict[Any, Any] | list[Any] | tuple[Any, ...]) -> Any:
+    """A container subclass: kept as is (type and all) when nothing in it is
+    secret-like, else replaced by the masked text of its content."""
+    if isinstance(value, dict):
+        plain: Any = dict(value)
+        masked: Any = _mask_dict(plain)
+    elif isinstance(value, tuple) and hasattr(value, "_fields"):  # namedtuple
+        plain = dict(zip(value._fields, value, strict=False))
+        masked = _mask_dict(plain)
+    else:
+        plain = list(value)
+        masked = [_mask_value(v) for v in plain]
+    if masked == plain:
+        return value
+    return f"{type(value).__name__}({masked!r})"
 
 
 def _mask_extras(record: logging.LogRecord) -> None:
@@ -93,12 +142,16 @@ class PasswordMaskFilter(logging.Filter):
         return True
 
     @staticmethod
-    def mask_message(record: logging.LogRecord) -> None:
-        """Masks the template and the arguments (not the extras)."""
+    def mask_message(record: logging.LogRecord, *, check: bool = False) -> None:
+        """Masks the template and the arguments (not the extras).  With
+        `check`, the formatted message is built and masked only when it may
+        hold a secret or fail (_needs_formatting())."""
         if not isinstance(record.msg, str):
             record.msg = mask_value(record.msg)
         if record.args:
             record.args = mask_value(record.args)
+        if check and not _needs_formatting(record):
+            return
         try:
             message = record.getMessage()
         except Exception:
@@ -113,6 +166,74 @@ class PasswordMaskFilter(logging.Filter):
             masked = mask_text(message)
             if masked != message:
                 record.msg = _template_for(masked, record.args)
+
+
+def _needs_formatting(record: logging.LogRecord) -> bool:
+    """Whether mask_message() must build the formatted message of a record
+    created by the factory: when it may hold a secret (a secret-like word in
+    the template or in a str argument, or an argument whose text is unknown
+    without formatting it: anything but str, numbers, bool and None), or
+    when formatting it may fail (_formats_cleanly()): a broken template
+    sends its raw arguments to logging.Handler.handleError, so they are
+    dropped here.  A record with none of these words cannot form a secret
+    once joined: it is left to its handler, which formats it once."""
+    if not isinstance(record.msg, str) or _CANDIDATE_RE.search(record.msg):
+        return True
+    args = record.args
+    if not args:
+        return False
+    if not isinstance(args, tuple | dict):
+        return True
+    values = args.values() if isinstance(args, dict) else args
+    for arg in values:
+        if isinstance(arg, str):
+            if _CANDIDATE_RE.search(arg):
+                return True
+        elif not isinstance(arg, _PLAIN_TYPES):
+            return True
+    return not _formats_cleanly(record.msg, args)
+
+
+# one %-conversion: (mapping key), flags, width, precision, length, type
+_CONVERSION_RE = re.compile(
+    r"%(?:\(([^)]*)\))?[#0\- +]*(\*|\d+)?(?:\.(\*|\d+))?[hlL]?([diouxXeEfFgGcrsa%])"
+)
+_NUMERIC_CONVERSIONS = frozenset("diouxXeEfFgG")
+
+
+def _formats_cleanly(template: str, args: tuple[Any, ...] | dict[Any, Any]) -> bool:
+    """Whether `template % args` surely succeeds, judged from the template
+    alone and the types of the arguments (str, numbers, bool, None): every
+    '%' starts a valid conversion, a numeric one gets a number, a tuple
+    gives exactly one value per conversion, a mapping every key named.
+    False when unsure ('*' width, %c, a mapping with positional
+    conversions): the record is then formatted by the factory."""
+    conversions = list(_CONVERSION_RE.finditer(template))
+    if template.count("%") != sum(m.group(0).count("%") for m in conversions):
+        return False
+    wanted: list[Any] = []
+    for m in conversions:
+        key, width, precision, kind = m.groups()
+        if kind == "%":
+            continue
+        if kind == "c" or width == "*" or precision == "*":
+            return False
+        if isinstance(args, dict):
+            if key is None or key not in args:
+                return False
+            wanted.append((kind, args[key]))
+        else:
+            if key is not None:
+                return False
+            wanted.append((kind, None))
+    if isinstance(args, tuple):
+        if len(wanted) != len(args):
+            return False
+        wanted = [(kind, value) for (kind, _), value in zip(wanted, args, strict=True)]
+    return all(
+        kind not in _NUMERIC_CONVERSIONS or (isinstance(value, int | float))
+        for kind, value in wanted
+    )
 
 
 def _template_for(message: str, args: Any) -> str:
@@ -142,7 +263,7 @@ def install_log_masking() -> None:
     def factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
         record = previous(*args, **kwargs)
         # no extra yet: makeRecord sets them after the factory (see below)
-        _FILTER.mask_message(record)
+        _FILTER.mask_message(record, check=True)
         return record
 
     logging.setLogRecordFactory(factory)

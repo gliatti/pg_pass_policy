@@ -572,6 +572,41 @@ def test_extension_not_installed_page(client, monkeypatch, super_conn, caplog):
     assert "pg_pass_policy is not installed (GET /)" in caplog.text
 
 
+def test_database_without_the_extension(super_conn, test_url, caplog):
+    """A real database where pg_pass_policy is not installed: the first
+    query of a page fails with 42P01 (a view) or 3F000 (a function), both
+    give the dedicated "not installed" page (503)."""
+    from fastapi.testclient import TestClient
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+    from app.main import create_app
+    from tests.conftest import TEST_PASSWORD, TEST_USER, make_settings
+
+    dbname = "web_t_noext"
+    super_conn.execute(f"DROP DATABASE IF EXISTS {dbname} WITH (FORCE)")
+    super_conn.execute(f"CREATE DATABASE {dbname}")
+    try:
+        url = make_conninfo(**{**conninfo_to_dict(test_url), "dbname": dbname})
+        app = create_app(make_settings(database_url=url))
+        with TestClient(app) as client:
+            client.auth = (TEST_USER, TEST_PASSWORD)
+            # dashboard: pass_policy.v_role_status, 42P01
+            response = client.get("/")
+            assert response.status_code == 503, response.text
+            assert "pg_pass_policy is not installed in this database</h1>" in response.text
+            assert "pg_pass_policy is not installed (GET /) [SQLSTATE 55000]" in caplog.text
+            assert 'relation "pass_policy.v_role_status" does not exist' in caplog.text
+            # maintenance: pass_policy.worker_status(), 3F000
+            response = client.get("/maintenance")
+            assert response.status_code == 503, response.text
+            assert "pg_pass_policy is not installed in this database</h1>" in response.text
+            assert 'schema "pass_policy" does not exist' in response.text.replace("&#34;", '"')
+            assert "[SQLSTATE 3F000]" in caplog.text
+            assert client.get("/healthz").status_code == 200
+    finally:
+        super_conn.execute(f"DROP DATABASE IF EXISTS {dbname} WITH (FORCE)")
+
+
 def test_extension_not_preloaded_page(client, monkeypatch, raising_55000, caplog):
     """The first query on the views raising the server's 55000 gives the
     dedicated page, with the HINT read from the server's error."""

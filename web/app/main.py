@@ -97,28 +97,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         log.error("database unavailable: %s", exc)
         return _error_response(request, 503, "Database unavailable")
 
+    # one handler for every PostgreSQL error, logged once with its SQLSTATE:
+    # an unavailable extension (extension_unavailable(): a 55000 of the
+    # first query reaching the shared memory when the library is not
+    # preloaded, a 3F000 / 55000 when it is not installed in the database)
+    # gets its dedicated page, anything else the generic 500 page
     @app.exception_handler(psycopg.Error)
     async def db_error(request: Request, exc: psycopg.Error) -> Any:
+        missing = extension_unavailable(exc)
+        cause = f" (from: {exc.__cause__})" if exc.__cause__ is not None else ""
+        if missing is not None:
+            label, _ = UNAVAILABLE_PAGES[missing.reason]
+            log.error(
+                "pg_pass_policy is not %s (%s %s) [SQLSTATE %s]: %s%s",
+                label,
+                request.method,
+                request.url.path,
+                exc.sqlstate,
+                exc,
+                cause,
+            )
+            return _unavailable_response(request, missing)
         # the full text (table names, libpq connection details...) goes to the
         # server log only, never to the browser
-        log.error("database error on %s %s: %s", request.method, request.url.path, exc)
-        return _error_response(request, 500, "Database error, see the server log")
-
-    # 55000 only: raised by the first query of the request that reaches the
-    # shared memory (v_role_status through failed_attempts(), an action...)
-    # when the library is not preloaded, or by a function of the extension
-    # when it is not installed in the database; any other 55000 is a plain
-    # error
-    @app.exception_handler(psycopg.errors.ObjectNotInPrerequisiteState)
-    async def prerequisite_error(request: Request, exc: psycopg.Error) -> Any:
-        missing = extension_unavailable(exc)
-        if missing is None:
-            return await db_error(request, exc)
-        state = "preloaded" if missing.reason == "not_preloaded" else "installed"
         log.error(
-            "pg_pass_policy is not %s (%s %s): %s", state, request.method, request.url.path, exc
+            "database error on %s %s [SQLSTATE %s]: %s%s",
+            request.method,
+            request.url.path,
+            exc.sqlstate,
+            exc,
+            cause,
         )
-        return _unavailable_response(request, missing)
+        return _error_response(request, 500, "Database error, see the server log")
 
     return app
 
@@ -138,10 +148,10 @@ def validation_detail(exc: RequestValidationError) -> str:
 ALERTS_TARGET = "#alerts"
 
 
-# page of each ExtensionUnavailable.reason
-UNAVAILABLE_TEMPLATES = {
-    "not_preloaded": "not_preloaded.html",
-    "not_installed": "not_installed.html",
+# each ExtensionUnavailable.reason: (state named in the log, page template)
+UNAVAILABLE_PAGES: dict[str, tuple[str, str]] = {
+    "not_preloaded": ("preloaded", "not_preloaded.html"),
+    "not_installed": ("installed", "not_installed.html"),
 }
 
 
@@ -154,7 +164,7 @@ def _unavailable_response(request: Request, missing: ExtensionUnavailable) -> An
         return _error_response(request, 503, detail)
     return render(
         request,
-        UNAVAILABLE_TEMPLATES[missing.reason],
+        UNAVAILABLE_PAGES[missing.reason][1],
         {"message": missing.message, "hint": missing.hint},
         status_code=503,
     )

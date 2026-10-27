@@ -65,6 +65,9 @@ class FakeConn:
     def commit(self):
         self.events.append("commit")
 
+    def rollback(self):
+        self.events.append("check rollback")
+
 
 class FakePool:
     def __init__(self, events):
@@ -171,7 +174,7 @@ def test_other_55000_is_a_generic_500(app, monkeypatch, caplog):
     assert response.status_code == 500
     assert "Database error, see the server log" in response.text
     assert "some other state" not in response.text
-    assert "database error on GET /roles: some other state" in caplog.text
+    assert "database error on GET /roles [SQLSTATE 55000]: some other state" in caplog.text
 
 
 # --- 2: only the extension's errors are shown inline -----------------------------------
@@ -190,9 +193,6 @@ def test_other_55000_is_a_generic_500(app, monkeypatch, caplog):
         psycopg.errors.ObjectInUse('pg_pass_policy: profile "p" is assigned to 2 role(s)'),
         # the prefix alone is enough, whatever the SQLSTATE but an internal one
         psycopg.errors.FeatureNotSupported("pg_pass_policy: not supported here"),
-        psycopg.errors.ObjectNotInPrerequisiteState(
-            "PPP-004: pg_pass_policy schema is not trusted"
-        ),
     ],
 )
 def test_extension_errors_are_inline(exc):
@@ -233,7 +233,8 @@ def test_unexpected_action_error_is_logged_and_a_500(app, monkeypatch, caplog):
     assert response.headers["HX-Retarget"] == "#alerts"
     assert "Database error, see the server log" in response.text
     assert "role_state" not in response.text
-    assert 'database error on POST /roles/r1/lock: relation "pass_policy.role_state"' in caplog.text
+    expected = 'on POST /roles/r1/lock [SQLSTATE 42P01]: relation "pass_policy.role_state"'
+    assert f"database error {expected}" in caplog.text
     assert "request rollback" in app.state.pool.events
     assert "commit" not in app.state.pool.events
 

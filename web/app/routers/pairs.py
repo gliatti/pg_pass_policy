@@ -15,9 +15,9 @@ router = APIRouter(prefix="/pairs")
 log = get_logger("pairs")
 
 REREAD_WARNING = reread_warning("The pair was switched", "the pair list")
-NO_ROW_ERROR = (
-    "Pair {}: switch applied but no row returned, the new password is unknown:"
-    " reload the page and check the pair (switch it again if needed)."
+NO_ROW_WARNING = (
+    "Pair {}: the switch was applied but returned no row, so its new password"
+    " cannot be shown; the pair list below shows its current state."
 )
 
 
@@ -28,10 +28,11 @@ def _content(
     *,
     error: str | None = None,
     notice: str | None = None,
+    warning: str | None = None,
     switched: dict[str, Any] | None = None,
     form: dict[str, str] | None = None,
 ) -> Any:
-    warning = None
+    unavailable = False
     if switched is None:
         pairs = db.list_pairs(conn)
     else:
@@ -40,9 +41,11 @@ def _content(
         read, warning = db.reread_after_commit(
             conn, db.list_pairs, log, f"pair {switched['pair']} switched", REREAD_WARNING
         )
+        unavailable = read is None
         pairs = read or []
     context = {
         "pairs": pairs,
+        "pairs_unavailable": unavailable,
         "warning": warning,
         "notice": notice,
         "switched": switched,
@@ -96,9 +99,11 @@ def pair_switch(
     if error is not None:
         return _content(request, conn, "pairs/_content.html", error=error)
     if result is None:
-        # committed, but switch_rotation_pair() returned no row: nothing to
-        # show, said as such rather than a TypeError (500) after the commit
+        # committed, but switch_rotation_pair() returned no row: no password
+        # to show, said as such (200: the action did happen, it must not be
+        # retried blindly) rather than a TypeError (500) after the commit;
+        # no password to protect, so the list is read the normal way
         log.error("pair %s: switch applied but no row returned", pair)
-        return _content(request, conn, "pairs/_content.html", error=NO_ROW_ERROR.format(pair))
+        return _content(request, conn, "pairs/_content.html", warning=NO_ROW_WARNING.format(pair))
     # the password is in this response only (no-store); never logged nor stored
     return _content(request, conn, "pairs/_content.html", switched={"pair": pair, **result})

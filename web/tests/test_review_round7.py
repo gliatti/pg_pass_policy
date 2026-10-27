@@ -121,7 +121,7 @@ def test_maintenance_without_preload_is_the_dedicated_page(app, caplog):  # noqa
 # --- 3: switch_rotation_pair() returning no row --------------------------------------------
 
 
-def test_switch_without_a_row_is_an_explicit_error(app, monkeypatch, caplog):  # noqa: F811
+def test_switch_without_a_row_is_a_warning(app, monkeypatch, caplog):  # noqa: F811
     """FakeConn's fetchone() returns None: no TypeError (500) after the commit."""
     caplog.set_level(logging.ERROR)
     monkeypatch.setattr(db, "list_pairs", lambda conn: [])
@@ -129,8 +129,9 @@ def test_switch_without_a_row_is_an_explicit_error(app, monkeypatch, caplog):  #
     response = client.post(
         "/pairs/p1/switch", headers={"X-CSRF-Token": token, "HX-Request": "true"}
     )
-    assert response.status_code == 422, response.text
-    assert "Pair p1: switch applied but no row returned" in response.text
+    assert response.status_code == 200, response.text
+    assert "Pair p1: the switch was applied but returned no row" in response.text
+    assert "again" not in response.text
     assert 'class="secret"' not in response.text
     assert "pair p1: switch applied but no row returned" in caplog.text
     assert "commit" in app.state.pool.events
@@ -161,9 +162,9 @@ def test_masking_runs_once_per_record(monkeypatch):
     calls = []
     real = logfilter._FILTER.mask_message
 
-    def spy(record):
+    def spy(record, **kwargs):
         calls.append(record)
-        return real(record)
+        return real(record, **kwargs)
 
     monkeypatch.setattr(logfilter._FILTER, "mask_message", spy)
     for name in (None, "uvicorn", "uvicorn.access", "uvicorn.error", "pgpp_web", "pgpp_web.x"):

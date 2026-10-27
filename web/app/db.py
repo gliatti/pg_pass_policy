@@ -141,7 +141,15 @@ def get_conn(request: Request) -> Iterator[Connection]:
     pool: ConnectionPool = request.app.state.pool
     with pool.connection() as conn:
         set_actor(conn, request.app.state.settings, getattr(request.state, "user", None))
-        yield conn
+        try:
+            yield conn
+        except psycopg.Error as exc:
+            # a pass_policy.* relation missing: the extension may not be
+            # installed in this database (missing_extension_error())
+            missing = missing_extension_error(conn, exc)
+            if missing is None:
+                raise
+            raise missing from exc
 
 
 # the dependency to declare in the endpoints: `conn: Connection = db.CONN`
@@ -153,12 +161,12 @@ T = TypeVar("T")
 @dataclass(frozen=True)
 class ExtensionUnavailable:
     """Why pg_pass_policy cannot serve a request, as found by
-    extension_unavailable() in a 55000 error (a value, never raised):
+    extension_unavailable() (a value, never raised):
 
     - "not_preloaded": the library is not in shared_preload_libraries, every
-      view and every function backed by the shared memory fails;
+      view and every function backed by the shared memory fails (55000);
     - "not_installed": the extension is not installed in the database the
-      back-office connects to.
+      back-office connects to (schema pass_policy missing).
 
     main.py shows it as a dedicated page (503) with the server's message and
     HINT."""
@@ -169,15 +177,33 @@ class ExtensionUnavailable:
 
 
 NOT_INSTALLED_MESSAGE = "pg_pass_policy is not installed in this database"
+EXTENSION_SCHEMA = "pass_policy"
+_MISSING_SCHEMA_MESSAGE = f'schema "{EXTENSION_SCHEMA}" does not exist'
+_EXTENSION_RELATION = re.compile(rf'\brelation "{EXTENSION_SCHEMA}\.[^"]*" does not exist')
 
 
 def extension_unavailable(exc: BaseException) -> ExtensionUnavailable | None:
-    """The ExtensionUnavailable matching a 55000 error raised because the
-    library is not preloaded (message or HINT naming shared_preload_libraries,
-    or the shared memory reported as not initialized) or because the
-    extension is not installed in the database ("pg_pass_policy is not
-    installed in this database"), None for anything else (another 55000,
-    such as PPP-004 "schema is not trusted", included)."""
+    """The ExtensionUnavailable matching an error raised because:
+
+    - the library is not preloaded: a 55000 whose message or HINT names
+      shared_preload_libraries, or reports the shared memory as not
+      initialized;
+    - the extension is not installed in the database: a 3F000
+      (InvalidSchemaName, 'schema "pass_policy" does not exist', the error
+      of any pass_policy.* function call without the extension), or the
+      55000 "pg_pass_policy is not installed in this database" (raised by
+      the server itself, and by get_conn() for a 42P01 on a pass_policy.*
+      relation once it has checked that the extension is absent, see
+      missing_extension_error()).
+
+    None for anything else: another 55000 (PPP-004 "schema is not trusted"
+    included), a 42P01 on a pass_policy.* relation alone (the extension may
+    be installed and out of step with the back-office: get_conn() decides)."""
+    if isinstance(exc, psycopg.errors.InvalidSchemaName):
+        message = error_message(exc)
+        if message.startswith(_MISSING_SCHEMA_MESSAGE):
+            return ExtensionUnavailable("not_installed", message, exc.diag.message_hint)
+        return None
     if not isinstance(exc, psycopg.errors.ObjectNotInPrerequisiteState):
         return None
     message = error_message(exc)
@@ -188,6 +214,34 @@ def extension_unavailable(exc: BaseException) -> ExtensionUnavailable | None:
     if message.startswith(NOT_INSTALLED_MESSAGE):
         return ExtensionUnavailable("not_installed", message, hint)
     return None
+
+
+def missing_extension_error(conn: Connection, exc: BaseException) -> psycopg.Error | None:
+    """For an error that may come from a missing extension (42P01 on a
+    pass_policy.* relation), the 55000 "not installed in this database" to raise
+    instead when the extension is indeed absent from the database, None
+    otherwise (another error, the extension installed: a back-office out of
+    step with it, the generic 500 page; the check itself failing).
+
+    The first query of most pages reads a view (pass_policy.v_role_status):
+    without the extension it fails with 42P01, which a missing view of an
+    installed extension would raise too, hence the check of pg_extension.
+    The failed transaction is rolled back first (the request is over)."""
+    if not isinstance(exc, psycopg.errors.UndefinedTable):
+        return None
+    if not _EXTENSION_RELATION.search(error_message(exc)):
+        return None
+    try:
+        conn.rollback()
+        row = conn.execute(
+            "SELECT count(*) AS n FROM pg_catalog.pg_extension WHERE extname = 'pg_pass_policy'"
+        ).fetchone()
+    except psycopg.Error as check:
+        log.error("could not check whether pg_pass_policy is installed: %s", check)
+        return None
+    if row is None or row["n"]:
+        return None
+    return psycopg.errors.ObjectNotInPrerequisiteState(NOT_INSTALLED_MESSAGE)
 
 
 # SQLSTATEs shown in the action fragments (422): the ones the extension
@@ -224,23 +278,21 @@ def is_extension_error(exc: psycopg.Error) -> bool:
     "PPP-0xx: ...") with any other SQLSTATE but an internal one (classes XX
     and 42, see INTERNAL_SQLSTATE_CLASSES): "pg_pass_policy: unexpected
     extension state" (XX000) is a bug, not a refusal, and goes to the
-    generic 500 page (logged here, then by main.py)."""
-    if extension_unavailable(exc) is not None:
-        return False
+    generic 500 page (logged once, by main.py, with its SQLSTATE).
+
+    A 55000 (object_not_in_prerequisite_state) is never a refusal, whatever
+    its message: library not preloaded, extension not installed, PPP-004
+    "schema is not trusted"... are states of the server to fix, shown as
+    the dedicated 503 page or the generic 500 page."""
     sqlstate = exc.sqlstate or ""
+    if sqlstate == "55000" or extension_unavailable(exc) is not None:
+        return False
     if sqlstate in EXTENSION_SQLSTATES or sqlstate.startswith(USER_INPUT_SQLSTATE_CLASSES):
         return True
     message = error_message(exc)
     if not (message.startswith("pg_pass_policy:") or _PPP_CODE.match(message)):
         return False
-    if sqlstate.startswith(INTERNAL_SQLSTATE_CLASSES):
-        log.warning(
-            "internal error of the extension (SQLSTATE %s), not shown as a refusal: %s",
-            sqlstate,
-            message,
-        )
-        return False
-    return True
+    return not sqlstate.startswith(INTERNAL_SQLSTATE_CLASSES)
 
 
 def run_action(

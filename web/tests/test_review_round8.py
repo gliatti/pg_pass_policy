@@ -139,10 +139,10 @@ def test_broken_template_record_has_no_args():
     ],
 )
 def test_internal_errors_of_the_extension_propagate(exc, caplog):
-    caplog.set_level(logging.WARNING)
+    caplog.set_level(logging.DEBUG)
     assert not db.is_extension_error(exc)
-    assert "internal error of the extension" in caplog.text
-    assert exc.sqlstate in caplog.text
+    # logged once, by main.py's handler, not here
+    assert caplog.records == []
 
 
 @pytest.mark.parametrize(

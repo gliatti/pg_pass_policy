@@ -224,7 +224,20 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
   contient une valeur sensible, il remplace le gabarit et les arguments
   restent en place, en même nombre : le formateur d'accès d'uvicorn, qui en
   attend cinq, produit toujours sa ligne (`GET /audit?role=token:` par
-  exemple). L'application elle-même
+  exemple). Pour ne pas formater chaque ligne deux fois, la fabrique ne
+  construit le message que s'il peut contenir un secret (un de ces mots dans
+  le gabarit ou dans un argument texte, ou un argument d'un autre type que
+  texte, nombre, booléen ou `None`) ou si son formatage peut échouer : les
+  autres lignes ne sont formatées qu'une fois, par leur handler. Les
+  conteneurs exacts (`dict`, `list`, `tuple`) sont reconstruits masqués ;
+  une sous-classe (`namedtuple`, `defaultdict`, `OrderedDict`) est gardée
+  telle quelle si rien n'y est sensible, remplacée sinon par le texte masqué
+  de son contenu, et le masquage ne lève jamais d'exception (`***` en
+  dernier recours). Limite connue : un enregistrement reconstruit par
+  `logging.makeLogRecord()` échappe au masquage (la fabrique reçoit un
+  enregistrement vide, ses attributs sont posés ensuite), de même que les
+  `extra` d'une sous-classe de `Logger` qui redéfinit `makeRecord` sans
+  l'appeler. L'application elle-même
   ne journalise jamais de mot de passe ; le filtre est un filet de sécurité.
 - **Authentification** : bcrypt pour HTTP basic (comparaison à coût constant,
   même pour un utilisateur inconnu : il est comparé à une empreinte factice du
@@ -242,12 +255,14 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
   contrainte `CHECK` d'un profil) et message préfixé `pg_pass_policy:` ou
   `PPP-0xx`, sauf avec un SQLSTATE interne (classes `XX` et `42` hors
   `42501`, `42704`, `42710`) : `XX000` ou `42703` signalent un défaut de
-  l'extension ou un décalage de version, journalisés en avertissement puis
-  traités comme ci-après (page 500). Cela vaut aussi pour « could not
+  l'extension ou un décalage de version, traités comme ci-après (page 500,
+  une seule ligne `ERROR` avec le SQLSTATE). Un `55000` n'est jamais un
+  refus, quel que soit son message : `PPP-004` (schéma non fiable) donne
+  lui aussi la page 500. Cela vaut aussi pour « could not
   generate a password compliant with profile » (`XX000`), visible dans le
   seul journal du serveur. Toute autre erreur PostgreSQL (vue ou fonction absente, pool,
   connexion perdue), y compris pendant une action, est journalisée en `ERROR`
-  et donne une page 500 générique : le texte complet (noms de tables, détails
+  (une seule ligne, avec son SQLSTATE) et donne une page 500 générique : le texte complet (noms de tables, détails
   de connexion libpq) ne va qu'au journal du serveur. Une erreur générique survenue pendant un échange HTMX (422 de
   validation, 404, 500, 503) est renvoyée avec `HX-Retarget: #alerts` et
   `HX-Reswap: innerHTML` : l'alerte s'affiche dans la zone d'alertes de la page
@@ -263,7 +278,8 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
   Un refus de suppression de profil envoyé sans HTMX donne une page d'erreur
   complète, pas un fragment isolé. Si `switch_rotation_pair()` ne renvoie
   aucune ligne, la bascule est validée mais le mot de passe est inconnu :
-  l'application le dit (422, erreur journalisée) au lieu d'une erreur 500.
+  l'application répond 200 avec un avertissement (erreur journalisée) et la
+  liste des paires relue normalement, sans inviter à recommencer la bascule.
 - **Bibliothèque non préchargée** : sans `pg_pass_policy` dans
   `shared_preload_libraries`, les vues (`v_role_status` appelle
   `failed_attempts()`) et les actions échouent toutes avec le SQLSTATE `55000`.
@@ -272,10 +288,16 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
   preloaded » (503) avec le message et le `HINT` du serveur, ou, pendant un
   échange HTMX, une alerte dans la zone d'alertes. Seul ce cas est reconnu
   (message ou `HINT` citant `shared_preload_libraries`, mémoire partagée non
-  initialisée), ainsi que l'extension non installée dans la base
-  (« pg_pass_policy is not installed in this database », `55000`), qui
-  donne sa propre page « not installed » (503, même message et `HINT` du
-  serveur) : tout autre `55000` donne la page 500 générique.
+  initialisée), ainsi que l'extension non installée dans la base, qui
+  donne sa propre page « not installed » (503, avec le message du serveur) :
+  tout autre `55000` donne la page 500 générique. Sans l'extension, la
+  première requête échoue en `3F000` (« schema "pass_policy" does not
+  exist », appel d'une fonction `pass_policy.*`), reconnu directement, ou en
+  `42P01` (vue `pass_policy.*` absente) : ce dernier cas pouvant aussi venir
+  d'une extension installée mais décalée, l'application vérifie alors
+  `pg_extension` avant d'afficher la page dédiée (sinon page 500). Le
+  `55000` « pg_pass_policy is not installed in this database » du serveur
+  donne la même page.
 - **Noms dans les URL** : un nom de rôle ou de paire peut contenir `/` ; il est
   encodé (`%2F`), le serveur le décode avant le routage et les routes
   `/{role:path}/action` le reconstituent. Les routes des profils gardent un
@@ -371,7 +393,8 @@ accepte, rôle renommé),
 l'audit (filtres, pagination), les
 paires de rotation, la maintenance, le refus CSRF, les pages « extension non
 préchargée » (erreur `55000` levée par le serveur avec son `HINT`) et
-« extension non installée », le tableau de bord avec des droits partiels
+« extension non installée » (dont une vraie base créée sans l'extension :
+`42P01` sur le tableau de bord, `3F000` sur `/maintenance`), le tableau de bord avec des droits partiels
 sur `worker_status()` et la
 page 500 journalisée d'une erreur inattendue pendant une action.
 

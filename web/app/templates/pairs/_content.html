@@ -20,7 +20,7 @@
     </td>
   </tr>
   {% else %}
-  <tr><td colspan="9" class="muted">{{ "Pair list unavailable." if warning else "No rotation pair yet." }}</td></tr>
+  <tr><td colspan="9" class="muted">{{ "Pair list unavailable." if pairs_unavailable else "No rotation pair yet." }}</td></tr>
   {% endfor %}
   </tbody>
 </table>
