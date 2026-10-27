@@ -52,7 +52,36 @@ typedef struct pppRoleEntry
 	TimestampTz locked_until;			/* 0 = non verrouillé, DT_NOEND = manuel */
 	bool		lock_pending_audit;		/* posé par le hook, effacé par le worker */
 	int32		pending_failures;		/* échecs non encore journalisés */
+
+	/* maintained by the worker */
+	bool		lock_from_state;		/* locked_until re-injected from role_state */
+	bool		role_missing;			/* not in pg_authid at the last cleanup */
+	bool		reload_profile_seen;	/* scratch marks of ppp_sync_reload() */
+	bool		reload_lock_seen;
 } pppRoleEntry;
+
+/*
+ * Entry creation when the hash is full (SPEC 6.3):
+ * - PPP_ENTER_COUNT: plain failure counting (authentication hook), limited
+ *   to ppp_count_entry_limit() entries; only evicts worthless entries
+ *   (zero counter, elapsed window or non-existent role);
+ * - PPP_ENTER_PRIORITY: lock, re-injection from role_state or profile; may
+ *   use the reserve and evict any entry without lock nor profile.
+ */
+typedef enum pppEnterMode
+{
+	PPP_ENTER_COUNT,
+	PPP_ENTER_PRIORITY
+} pppEnterMode;
+
+/* entry evicted by ppp_enter_role(), to be logged once the lock is released */
+typedef struct pppEviction
+{
+	bool		evicted;
+	char		rolename[NAMEDATALEN];
+	int32		lost_failed_count;		/* counter still inside its window */
+	int32		lost_pending_failures;	/* failures lost before being audited */
+} pppEviction;
 
 typedef struct pppSharedState
 {
@@ -92,6 +121,11 @@ extern void ppp_policy_init(void);		/* installe check_password_hook */
 /* ---- lockout.c --------------------------------------------------------- */
 extern void ppp_lockout_init(void);		/* installe ClientAuthentication_hook */
 extern void ppp_lockout_shmem_init(void); /* appelé depuis shmem_startup_hook */
+/* caller holds ppp_shared->lock exclusively; NULL when no room is left */
+extern pppRoleEntry *ppp_enter_role(const char *rolename, pppEnterMode mode,
+									TimestampTz now, pppEviction *ev);
+extern void ppp_log_eviction(const pppEviction *ev);
+extern int	ppp_count_entry_limit(void);
 
 /* ---- worker.c ---------------------------------------------------------- */
 extern void ppp_worker_register(void);	/* appelé depuis _PG_init */

@@ -194,7 +194,7 @@ Tous préfixés `pg_pass_policy.`. Contexte `postmaster` = redémarrage ;
 | `enabled` | bool | `on` | SIGHUP | `off` : les hooks ne font rien et le worker ne modifie rien |
 | `database` | string | `postgres` | postmaster | base où l'extension est installée et où le worker se connecte |
 | `worker_interval` | int (s) | `60` | SIGHUP | `0` : pas de tour périodique (appeler `run_maintenance()` à la main) |
-| `max_tracked_roles` | int | `1024` | postmaster | taille du hash de verrouillage en mémoire partagée (16 à 1 048 576) |
+| `max_tracked_roles` | int | `1024` | postmaster | taille du hash de verrouillage en mémoire partagée (16 à 1 048 576) ; ~10 % sont réservés aux verrous et profils, et `lock_role()` échoue (ERROR) si toutes les entrées sont des verrous ou des profils |
 | `manage_valid_until` | bool | `on` | SIGHUP | le worker écrit `pg_authid.rolvaliduntil` |
 | `log_events` | bool | `on` | SIGHUP | une ligne `LOG: pg_pass_policy: …` par événement |
 | `notify_channel` | string | `pg_pass_policy` | SIGHUP | canal `NOTIFY` (charge utile JSON `event`/`role`/`at`/`details`) |

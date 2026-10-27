@@ -286,7 +286,7 @@ static void ppp_client_auth_hook(Port *port, int status);
 
 1. chaîner d'abord au hook précédent (sauf si on va refuser) ;
 2. si `!ppp_enabled` ou rôle exempt → sortir ;
-3. `LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE)` ; chercher `port->user_name` dans `ppp_role_hash` ; si absent **et** `status != STATUS_OK` → créer avec les paramètres par défaut (`ppp_shared->default_*`) ; si le hash est plein → `ereport(LOG)` et sortir sans bloquer ;
+3. `LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE)` ; chercher `port->user_name` dans `ppp_role_hash` ; si absent **et** `status == STATUS_ERROR` → créer avec les paramètres par défaut (`ppp_shared->default_*`) en mode « comptage » (`ppp_enter_role(…, PPP_ENTER_COUNT, …)`, voir « Hash plein » ci-dessous) ; faute de place → `ereport(LOG)` et continuer sans compter (un verrou existant reste appliqué : il a toujours une entrée) ;
 4. si `locked_until > now` (ou `DT_NOEND`) → `ereport(FATAL, (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION), errmsg("role \"%s\" is locked by pg_pass_policy"), errdetail("locked until %s")))` — **même si status == STATUS_OK** ;
 5. si `status == STATUS_OK` → `failed_count = 0` ;
 6. sinon (`STATUS_ERROR`, `STATUS_EOF` compte comme échec uniquement si `port->user_name` est renseigné) : si `now - first_failure_at > failure_window` → repartir à 0 ; incrémenter ; si `failed_count >= max_failures` et `max_failures > 0` → `locked_until = now + lock_duration` (ou `DT_NOEND`), `lock_pending_audit = true`, `ereport(LOG, "pg_pass_policy: role \"%s\" locked after %d failed attempts")` ;
@@ -300,6 +300,38 @@ déjà journalisé le verrou (`!lock_pending_audit`), sinon il est conservé
 comptés normalement, un nouveau verrou pouvant être posé avant le passage du
 worker.
 
+**Hash plein (fail-closed).** Le hook crée une entrée pour n'importe quel nom
+envoyé par un client non authentifié, rôle existant ou non. Pour qu'un tel
+client ne puisse pas empêcher l'application d'un verrou :
+
+- les entrées de simple comptage créées par le hook ne peuvent pas porter le
+  hash au-delà de `ppp_count_entry_limit()` = `max_tracked_roles` − max(⌊10 %⌋, 1)
+  entrées (15 sur 16, 922 sur 1024) ; la limite porte sur le nombre total
+  d'entrées (approximation simple et prudente) ; le reste est réservé aux
+  verrous (`shmem_lock_role` au COMMIT, réinjection depuis `role_state`) et aux
+  profils (`PPP_ENTER_PRIORITY`) ;
+- quand la limite est atteinte, `ppp_enter_role()` évince l'entrée la moins
+  récemment en échec (`last_failure_at`) de la classe la moins coûteuse
+  autorisée. Jamais évincées : verrou actif, `lock_pending_audit`,
+  `from_profile`. Classes : (1) sans valeur — `pending_failures = 0` et
+  compteur nul, fenêtre écoulée ou rôle inexistant (`role_missing`, posé par
+  le worker) ; (2) compteur encore dans sa fenêtre ; (3) échecs pas encore
+  journalisés (`pending_failures > 0`). Le hook n'évince que la classe 1 :
+  évincer un compteur vivant permettrait de remettre à zéro le compteur du
+  rôle attaqué en essayant d'autres noms. Les insertions prioritaires évincent
+  jusqu'à la classe 3 (LOG du nombre d'échecs perdus) ;
+- `XACT_EVENT_PRE_COMMIT` vérifie qu'il reste de la place (places libres +
+  entrées évincables, hors rôles visés) pour chaque `PPP_OP_LOCK` de la
+  transaction et lève sinon `ERROR 53400` « cannot lock role "x":
+  pg_pass_policy shared memory is full » : `lock_role()` échoue, `role_state`
+  et l'audit sont annulés. Pas d'ERROR dans `XACT_EVENT_COMMIT` : la
+  transaction y est déjà validée (une ERROR y devient PANIC) ; le WARNING y
+  reste pour la course résiduelle (une autre insertion prioritaire entre
+  PRE_COMMIT et COMMIT ; le hook ne peut pas y prendre part, il ne dépasse
+  jamais sa limite) ;
+- l'éviction parcourt tout le hash (coût linéaire en `max_tracked_roles`),
+  seulement une fois le hash plein.
+
 Le worker, à chaque tour, parcourt le hash : écrit les lignes d'audit
 `auth_failed` / `role_locked` en attente (`lock_pending_audit`) et copie
 `locked_until` vers `role_state` dans une transaction dédiée, puis
@@ -307,7 +339,10 @@ Le worker, à chaque tour, parcourt le hash : écrit les lignes d'audit
 décrémenté, `lock_pending_audit` effacé si `locked_until` n'a pas changé) ;
 dans une seconde transaction il efface les verrous expirés déjà journalisés
 (en gardant les échecs comptés après l'expiration), purge les entrées
-inactives depuis > 24 h, et recharge les paramètres des profils
+inactives depuis > 24 h, vérifie dans `pg_roles` l'existence des rôles des
+autres entrées inactives (pose `role_missing` et purge une entrée de rôle
+inexistant dès que sa `failure_window` est écoulée, 24 h si la fenêtre est
+≤ 0), puis réinjecte les verrous de `role_state` **avant** de recharger les paramètres des profils
 (`max_failures`, `failure_window`, `lock_duration`, bornés à 2^31 − 1 s ≈ 68
 ans avant conversion en `int4`) pour chaque rôle de `role_profile` + les
 valeurs du profil `default` dans `ppp_shared->default_*`.
@@ -317,11 +352,12 @@ verrous manuels/actifs depuis `role_state` lors de son premier tour.
 
 ### 6.4 Worker (`worker.c`)
 
-- enregistré dans `_PG_init` via `RegisterBackgroundWorker` (`BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION`, `BgWorkerStart_RecoveryFinished`, `bgw_restart_time = 10`) ;
+- enregistré dans `_PG_init` via `RegisterBackgroundWorker` (`BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION`, `BgWorkerStart_ConsistentState` pour tourner aussi sur un hot standby, `bgw_restart_time = 10`) ;
 - `ppp_worker_main` : `BackgroundWorkerInitializeConnection(ppp_database, NULL, 0)` puis `search_path = pg_catalog, pg_temp` (le worker est superutilisateur : toutes ses requêtes sont qualifiées, `pg_catalog.jsonb_build_object` compris), boucle `WaitLatch` avec `ppp_worker_interval` ; sur `reload_requested` ou SIGHUP → tour immédiat ;
 - la base `pg_pass_policy.database` doit exister au démarrage : sinon `BackgroundWorkerInitializeConnection` lève le FATAL standard « database "x" does not exist » et le postmaster relance le worker toutes les 10 s (comportement standard des bgworkers, identique à pg_cron) ; le GUC étant `postmaster`, corriger puis redémarrer ;
 - chaque tour : `StartTransactionCommand` → si l'extension n'est pas installée (`get_extension_oid("pg_pass_policy", true) == InvalidOid`) → attendre ; sinon `SPI_execute("SELECT * FROM pass_policy.run_maintenance()")`, puis synchronisation shmem (§6.3) ; `CommitTransactionCommand` ;
-- ne tourne pas sur un standby (`RecoveryInProgress()` → attendre) ;
+- sur un hot standby (`RecoveryInProgress()`), tour en **lecture seule** (`ppp_worker_cycle_standby`) : ni `run_maintenance()` ni l'étape d'audit en attente (elles écrivent) ; les échecs et verrous comptés localement par le hook sont acquittés avec un `LOG` (ils ne peuvent pas être écrits dans `audit_log`) ; puis nettoyage + rechargement **forcé à chaque tour** (`shmem_reload()` du primaire ne peut pas atteindre le worker du standby) : SELECT uniquement, dans une transaction que PostgreSQL force en lecture seule pendant la récupération. Intervalle : `worker_interval`, 60 s s'il vaut 0 (le standby doit sonder, rien ne le réveille). Un verrou réinjecté depuis `role_state` (`lock_from_state`) qui n'y figure plus est levé (unlock ou expiration sur le primaire) ; les verrous posés localement par le hook ne sont pas levés par le rechargement : ils expirent selon `lock_duration`, ou un superutilisateur appelle `pass_policy.shmem_unlock_role()` sur le standby (fonctionne en lecture seule). Après promotion, le tour suivant est un tour normal avec rechargement complet ;
+- sans `hot_standby`, aucune connexion n'est acceptée pendant la récupération : le worker démarre à la fin de celle-ci ;
 - `pg_pass_policy.worker_interval = 0` → le worker dort indéfiniment (réveil sur SIGHUP).
 
 ### 6.5 Compatibilité (`compat.h`)
@@ -406,7 +442,7 @@ basic ou en-tête reverse-proxy (`REMOTE_USER`), rôle PG dédié membre de
 - (finition) Un client dont le mot de passe est expiré (`rolvaliduntil` dépassé, posé par le worker ou `expire_password`) reçoit seulement « password authentication failed for user … » ; la cause (« User "x" has an expired password ») n'apparaît que dans le log serveur. Même chose pour un verrou : le client reçoit le FATAL « role "x" is locked by pg_pass_policy ».
 - (revue) Le worker acquitte la shmem (`pending_failures`, `lock_pending_audit`) **après** le COMMIT de la transaction « pending audit », distincte de celle du nettoyage/rechargement : une erreur (rechargement, COMMIT) ne perd plus d'audit `auth_failed`/`role_locked` ni de verrou à copier dans `role_state`.
 - (revue) `extract(epoch FROM …)` des durées de profil est borné à 2^31 − 1 s (`LEAST(COALESCE(…, -1), 2147483647)::int4`, COALESCE avant LEAST pour garder −1 = manuel) : un `lock_duration` de 100 ans (ou `infinity`) ne casse plus le rechargement.
-- (revue) `shmem_reload()`, `shmem_lock_role()`, `shmem_unlock_role()` et `shmem_reset_failures()` n'agissent qu'au COMMIT de la transaction appelante (`RegisterXactCallback` / `RegisterSubXactCallback`, inscrits une fois par backend ; liste en `TopTransactionContext`, `ROLLBACK TO SAVEPOINT` retire les demandes de la sous-transaction) : le signal au worker part quand les lignes sont visibles (sinon il rechargeait l'état antérieur et consommait la demande), et `BEGIN; lock_role(); ROLLBACK` ne laisse plus de verrou fantôme en shmem. `PREPARE TRANSACTION` est refusé (`0A000`) s'il reste des écritures shmem en attente ; une demande de rechargement y est simplement abandonnée. Hash plein : WARNING au COMMIT (plus d'ERROR). Le worker bénéficie du même mécanisme (`_shmem('unlock')` de `run_maintenance()` appliqué au `CommitTransactionCommand`). La remise à zéro des verrous shmem absents de `role_state` lors du rechargement (auto-réparation) n'est **pas** faite : elle entrerait en course avec un `lock_role` validé après la prise de l'instantané du worker.
+- (revue) `shmem_reload()`, `shmem_lock_role()`, `shmem_unlock_role()` et `shmem_reset_failures()` n'agissent qu'au COMMIT de la transaction appelante (`RegisterXactCallback` / `RegisterSubXactCallback`, inscrits une fois par backend ; liste en `TopTransactionContext`, `ROLLBACK TO SAVEPOINT` retire les demandes de la sous-transaction) : le signal au worker part quand les lignes sont visibles (sinon il rechargeait l'état antérieur et consommait la demande), et `BEGIN; lock_role(); ROLLBACK` ne laisse plus de verrou fantôme en shmem. `PREPARE TRANSACTION` est refusé (`0A000`) s'il reste des écritures shmem en attente ; une demande de rechargement y est simplement abandonnée. Hash plein : WARNING au COMMIT (plus d'ERROR) ; *remplacé* par la vérification en `XACT_EVENT_PRE_COMMIT` (voir « fail-open n° 1 » ci-dessous), le WARNING ne restant que pour la course résiduelle. Le worker bénéficie du même mécanisme (`_shmem('unlock')` de `run_maintenance()` appliqué au `CommitTransactionCommand`). La remise à zéro des verrous shmem absents de `role_state` lors du rechargement (auto-réparation) n'est **pas** faite : elle entrerait en course avec un `lock_role` validé après la prise de l'instantané du worker.
 - (revue) Hook d'authentification, verrou expiré : voir §6.3 (compteurs remis à zéro une seule fois, `locked_until` conservé tant que `lock_pending_audit`).
 - (revue) `_require_target_allowed()` : définition étendue du rôle privilégié (§4) ; `create_rotation_pair()` l'applique aussi à `group_role` (un admin non superutilisateur obtenait sinon un rôle LOGIN membre de `postgres` ou de `pg_execute_server_program`). Décision : `assign_profile`/`alter_profile` restent ouvertes (option A, §4) ; `pg_pass_policy.exempt_roles` protège les superutilisateurs.
 - (revue) `switch_rotation_pair()` inscrit la borne de l'ancien rôle dans `role_state` (`must_change`, `expires_at = grace_until = valid_until_synced = now() + grace_period`, `last_warned_at = now()`), comme `expire_password()`, et plus seulement par dérivation de `rotation_pair.previous_valid_until` : la disparition de la ligne de paire (groupe supprimé, DELETE) ne réactive plus l'ancien mot de passe à la synchronisation suivante. `run_maintenance()` étape a reporte `previous_valid_until` dans `role_state` avant de purger une paire (paires basculées avant cette correction). `v_role_status` affiche `grace` (et non `expired`) pour un rôle `must_change` dont `grace_until` est encore futur.
@@ -414,4 +450,6 @@ basic ou en-tête reverse-proxy (`REMOTE_USER`), rôle PG dédié membre de
 - (revue) `pg_pass_policy.database` inexistante : comportement standard conservé (FATAL + relance toutes les 10 s), documenté (§6.4, README).
 - (finition) `DROP EXTENSION pg_pass_policy` supprime tous les objets de l'extension mais **laisse** le schéma `pass_policy` (vide) : il est déclaré par la clé `schema` du fichier `.control`, créé par `CREATE EXTENSION` sans appartenir à l'extension (comportement standard de PostgreSQL). Les rôles `pass_policy_admin` et `pass_policy_viewer` (objets globaux) survivent aussi. Désinstallation complète : `DROP EXTENSION pg_pass_policy; DROP SCHEMA pass_policy; DROP ROLE pass_policy_admin, pass_policy_viewer;`. `CREATE EXTENSION` réutilise les rôles s'ils existent (test `99_teardown`).
 - (security-review) Le hook `check_password_hook` n'applique la politique (et n'exécute des SPI en superutilisateur) que si l'extension `pg_pass_policy` est installée dans la base courante, que son schéma est bien `pass_policy` et que ce schéma appartient à un superutilisateur (`ppp_extension_installed()`). Un schéma homonyme créé par le propriétaire d'une autre base n'est jamais exécuté (test dans `90_privileges`).
+- (security-review, fail-open n° 1) Hash shmem plein : un client non authentifié remplissait le hash avec des noms inexistants (une entrée par nom, purgée après 24 h) ; `lock_role()` ne posait alors qu'un WARNING au COMMIT, la réinjection depuis `role_state` était abandonnée (« could not be loaded ») et l'auto-verrouillage des nouveaux rôles cessait : `role_state`/`v_locked` disaient « verrouillé » mais l'authentification passait. Correction (§6.3, « Hash plein ») : réserve de ~10 % pour les verrous et profils, éviction LRU des entrées évincables (le hook n'évince que les entrées sans valeur), vérification de capacité en `XACT_EVENT_PRE_COMMIT` (ERROR 53400 visible de l'appelant, transaction annulée), worker qui marque (`role_missing`) et purge après `failure_window` les entrées de rôles inexistants, réinjection des verrous avant les profils. La limite de la réserve porte sur le nombre total d'entrées : simple, mais un hash rempli à 90 % de verrous et de profils ne laisse plus de place au comptage (LOG « cannot track »). Test : `test/shell/hashfull.sh`.
+- (security-review, fail-open n° 2) Hot standby : le worker (`BgWorkerStart_RecoveryFinished`) ne démarrait pas pendant la récupération et la boucle sautait de toute façon les tours (`!RecoveryInProgress()`) ; la shmem du standby n'était jamais remplie et un rôle verrouillé sur le primaire se connectait librement au réplica. Correction (§6.4) : `BgWorkerStart_ConsistentState` et tour en lecture seule (nettoyage + rechargement forcé à chaque tour). Choix du rechargement forcé plutôt que d'une détection de changement (`max(updated_at)`, compteur) : trois SELECT par intervalle, sans colonne ni état supplémentaire, et aucun risque de rater une modification ; la latence est d'au plus un `worker_interval` plus le retard de réplication. Sur un standby (et seulement là), un verrou réinjecté qui a disparu de `role_state` est levé : aucune transaction locale ne peut y valider un `lock_role()` concurrent. Les échecs comptés sur le standby ne sont pas audités (LOG seulement). Test : `test/shell/standby.sh` (pg_basebackup -R, second port, environ 20 s).
 - (security-review) `record_password_change()` n'est appelable que depuis le hook (`_in_password_hook()`), y compris pour un superutilisateur : un appel direct par un admin non superutilisateur repoussait l'expiration d'un compte superutilisateur sans passer par `_require_target_allowed()`.

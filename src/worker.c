@@ -14,10 +14,18 @@
  *		failure (or an error in a later step) never loses an audit row or
  *		a persisted lock.
  *	 3. shared memory synchronisation (own transaction):
- *		a. expired locks cleared, inactive entries purged;
- *		b. when requested (shmem_reload() or first cycle): lockout
- *		   parameters reloaded from the profiles, persisted locks re-injected
- *		   from role_state.
+ *		a. expired locks cleared, inactive entries purged, entries of
+ *		   non-existent roles flagged (and purged after their failure
+ *		   window);
+ *		b. when requested (shmem_reload() or first cycle): persisted locks
+ *		   re-injected from role_state, lockout parameters reloaded from the
+ *		   profiles.
+ *
+ * On a hot standby (RecoveryInProgress()), a read-only cycle runs instead
+ * (ppp_worker_cycle_standby): steps 1 and 2 write and are skipped, step 3
+ * only issues SELECTs and runs at every cycle with a forced reload, since
+ * nothing can signal the standby's worker when role_state or the profiles
+ * change on the primary.  See SPEC 6.4.
  *
  * The worker connects as superuser: every SQL it runs is schema-qualified
  * and search_path is pinned to pg_catalog, pg_temp.
@@ -38,6 +46,7 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "catalog/pg_type.h"
+#include "utils/array.h"
 #include "commands/extension.h"
 #include "executor/spi.h"
 #include "fmgr.h"
@@ -119,7 +128,8 @@ ppp_worker_register(void)
 
 	memset(&worker, 0, sizeof(worker));
 	worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
-	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+	/* also started on a hot standby: locks must be enforced there too */
+	worker.bgw_start_time = BgWorkerStart_ConsistentState;
 	worker.bgw_restart_time = 10;
 	snprintf(worker.bgw_library_name, BGW_MAXLEN, "%s", PPP_LIBRARY_NAME);
 	snprintf(worker.bgw_function_name, BGW_MAXLEN, "ppp_worker_main");
@@ -382,6 +392,20 @@ ppp_free_pending(void)
  * Step 3a: expired locks and inactive entries (shared memory only)
  * ------------------------------------------------------------------------
  */
+/*
+ * Can an entry be purged (or its role checked for existence)?  Same rule as
+ * the eviction of ppp_enter_role(): no profile parameters, no lock, nothing
+ * left to audit.  Caller holds ppp_shared->lock.
+ */
+static inline bool
+ppp_entry_inactive(const pppRoleEntry *entry)
+{
+	return !entry->from_profile &&
+		entry->locked_until == 0 &&
+		!entry->lock_pending_audit &&
+		entry->pending_failures <= 0;
+}
+
 static void
 ppp_sync_cleanup(void)
 {
@@ -391,6 +415,15 @@ ppp_sync_cleanup(void)
 	TimestampTz purge_before = TimestampTzPlusMilliseconds(now,
 														   -(int64) PPP_PURGE_AFTER_SECS * 1000);
 	int			purged = 0;
+	int			purged_missing = 0;
+	int			maxnames = ppp_max_tracked_roles > 0 ? ppp_max_tracked_roles : 1;
+	char	  (*names)[NAMEDATALEN];
+	Datum	   *datums;
+	int			nnames = 0;
+	bool	   *exists;
+	int			i;
+
+	names = palloc(sizeof(*names) * maxnames);
 
 	LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
 	hash_seq_init(&seq, ppp_role_hash);
@@ -411,27 +444,99 @@ ppp_sync_cleanup(void)
 				entry->first_failure_at = 0;
 			}
 			entry->locked_until = 0;
+			entry->lock_from_state = false;
 		}
+
+		if (!ppp_entry_inactive(entry))
+			continue;
 
 		/*
 		 * Purge inactive entries.  Entries carrying profile parameters are
 		 * kept (they are rebuilt on reload anyway).  Removing the current
 		 * element during a hash_seq_search scan is allowed.
 		 */
-		if (!entry->from_profile &&
-			entry->locked_until == 0 &&
-			!entry->lock_pending_audit &&
-			entry->pending_failures <= 0 &&
-			entry->last_failure_at < purge_before)
+		if (entry->last_failure_at < purge_before)
 		{
 			hash_search(ppp_role_hash, &entry->key, HASH_REMOVE, NULL);
 			purged++;
+			continue;
+		}
+
+		/* the others are checked against pg_authid below */
+		if (nnames < maxnames)
+			strlcpy(names[nnames++], entry->key.rolename, NAMEDATALEN);
+	}
+	LWLockRelease(ppp_shared->lock);
+
+	if (nnames == 0)
+		goto done;
+
+	/*
+	 * The authentication hook creates an entry for any user name a client
+	 * sends, existing or not (it has no catalog access).  Flag the entries
+	 * of non-existent roles: the hook evicts them first when the hash is
+	 * full (ppp_enter_role), and they are purged once their failure window
+	 * has elapsed instead of after 24 h.  Read-only: also runs on a standby.
+	 */
+	datums = palloc(sizeof(Datum) * nnames);
+	for (i = 0; i < nnames; i++)
+		datums[i] = CStringGetTextDatum(names[i]);
+	{
+		ArrayType  *arr = construct_array(datums, nnames, TEXTOID, -1, false,
+										  TYPALIGN_INT);
+		Oid			argtypes[1] = {TEXTARRAYOID};
+		Datum		values[1];
+		int			ret;
+
+		values[0] = PointerGetDatum(arr);
+		ret = SPI_execute_with_args("SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r "
+									"WHERE r.rolname = u.n::pg_catalog.name) "
+									"FROM pg_catalog.unnest($1) WITH ORDINALITY AS u(n, i) "
+									"ORDER BY u.i",
+									1, argtypes, values, NULL, true, 0);
+		if (ret != SPI_OK_SELECT || SPI_processed != (uint64) nnames)
+			elog(ERROR, "checking role existence returned SPI code %d", ret);
+	}
+	exists = palloc(sizeof(bool) * nnames);
+	for (i = 0; i < nnames; i++)
+	{
+		bool		isnull;
+		Datum		d = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc,
+									  1, &isnull);
+
+		exists[i] = isnull ? true : DatumGetBool(d);
+	}
+
+	LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
+	for (i = 0; i < nnames; i++)
+	{
+		pppRoleKey	key;
+		int64		window_secs;
+
+		memset(&key, 0, sizeof(key));
+		strlcpy(key.rolename, names[i], NAMEDATALEN);
+		entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key, HASH_FIND, NULL);
+		if (entry == NULL)
+			continue;
+		entry->role_missing = !exists[i];
+		if (exists[i] || !ppp_entry_inactive(entry))
+			continue;
+
+		window_secs = entry->failure_window_secs > 0 ?
+			entry->failure_window_secs : PPP_PURGE_AFTER_SECS;
+		if (entry->last_failure_at <
+			TimestampTzPlusMilliseconds(now, -window_secs * 1000))
+		{
+			hash_search(ppp_role_hash, &entry->key, HASH_REMOVE, NULL);
+			purged_missing++;
 		}
 	}
 	LWLockRelease(ppp_shared->lock);
 
-	if (purged > 0)
-		elog(DEBUG1, PPP_LOG_PREFIX "purged %d inactive shared memory entries", purged);
+done:
+	if (purged > 0 || purged_missing > 0)
+		elog(DEBUG1, PPP_LOG_PREFIX "purged %d inactive shared memory entries and %d entries of non-existent roles",
+			 purged, purged_missing);
 }
 
 /* ------------------------------------------------------------------------
@@ -445,6 +550,18 @@ ppp_getint(HeapTuple tup, TupleDesc desc, int col, int32 dflt)
 	Datum		d = SPI_getbinval(tup, desc, col, &isnull);
 
 	return isnull ? dflt : DatumGetInt32(d);
+}
+
+/* add an eviction made by ppp_enter_role() to the totals of a reload */
+static void
+ppp_count_eviction(const pppEviction *ev, int *n_evicted, int *lost_failed,
+				   int *lost_pending)
+{
+	if (!ev->evicted)
+		return;
+	(*n_evicted)++;
+	*lost_failed += ev->lost_failed_count;
+	*lost_pending += ev->lost_pending_failures;
 }
 
 static void
@@ -463,6 +580,12 @@ ppp_sync_reload(void)
 	HASH_SEQ_STATUS seq;
 	pppRoleEntry *entry;
 	int			not_tracked = 0;
+	int			n_evicted = 0;
+	int			lost_failed = 0;
+	int			lost_pending = 0;
+	int			n_lifted = 0;
+	TimestampTz now;
+	bool		in_recovery;
 
 	/*
 	 * Durations are clamped to INT_MAX seconds (about 68 years) before the
@@ -545,7 +668,20 @@ ppp_sync_reload(void)
 		}
 	}
 
-	/* apply everything under the lock; nothing below can fail */
+	/*
+	 * Apply everything under the lock; nothing below can fail.
+	 *
+	 * Persisted locks are injected before the profile entries, and both use
+	 * PPP_ENTER_PRIORITY: when the hash is full they evict plain counting
+	 * entries (ppp_enter_role) rather than being dropped, and a profile
+	 * entry can never take the room of a lock.  The from_profile flag of
+	 * the previous reload is only cleared at the end (reload_profile_seen),
+	 * so that an entry whose profile is still assigned cannot be evicted
+	 * by the insertions of this very reload.
+	 */
+	now = GetCurrentTimestamp();
+	in_recovery = RecoveryInProgress();
+
 	LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
 
 	if (have_default)
@@ -555,85 +691,85 @@ ppp_sync_reload(void)
 		ppp_shared->default_lock_duration_secs = def_lock;
 	}
 
-	/* every entry falls back to the defaults ... */
 	hash_seq_init(&seq, ppp_role_hash);
 	while ((entry = (pppRoleEntry *) hash_seq_search(&seq)) != NULL)
 	{
-		entry->max_failures = ppp_shared->default_max_failures;
-		entry->failure_window_secs = ppp_shared->default_failure_window_secs;
-		entry->lock_duration_secs = ppp_shared->default_lock_duration_secs;
-		entry->from_profile = false;
+		entry->reload_profile_seen = false;
+		entry->reload_lock_seen = false;
 	}
 
-	/* ... unless it has an assigned profile */
-	for (i = 0; i < nprofiles; i++)
-	{
-		pppRoleKey	key;
-		bool		found;
-
-		if (profiles[i].rolename[0] == '\0')
-			continue;
-		memset(&key, 0, sizeof(key));
-		strlcpy(key.rolename, profiles[i].rolename, NAMEDATALEN);
-
-		entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key, HASH_FIND, NULL);
-		if (entry == NULL)
-		{
-			if (hash_get_num_entries(ppp_role_hash) >= ppp_max_tracked_roles ||
-				(entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key,
-													  HASH_ENTER_NULL, &found)) == NULL)
-			{
-				not_tracked++;
-				continue;
-			}
-			entry->failed_count = 0;
-			entry->first_failure_at = 0;
-			entry->last_failure_at = 0;
-			entry->locked_until = 0;
-			entry->lock_pending_audit = false;
-			entry->pending_failures = 0;
-		}
-		entry->max_failures = profiles[i].max_failures;
-		entry->failure_window_secs = profiles[i].failure_window_secs;
-		entry->lock_duration_secs = profiles[i].lock_duration_secs;
-		entry->from_profile = true;
-	}
-
-	/* persisted locks (after a restart, or set through SQL) */
+	/* persisted locks (after a restart, set through SQL, or replicated) */
 	for (i = 0; i < nlocks; i++)
 	{
-		pppRoleKey	key;
-		bool		found;
+		pppEviction ev;
 
 		if (locks[i].rolename[0] == '\0' || locks[i].locked_until == 0)
 			continue;
-		memset(&key, 0, sizeof(key));
-		strlcpy(key.rolename, locks[i].rolename, NAMEDATALEN);
 
-		entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key, HASH_FIND, NULL);
+		entry = ppp_enter_role(locks[i].rolename, PPP_ENTER_PRIORITY, now, &ev);
+		ppp_count_eviction(&ev, &n_evicted, &lost_failed, &lost_pending);
 		if (entry == NULL)
 		{
-			if (hash_get_num_entries(ppp_role_hash) >= ppp_max_tracked_roles ||
-				(entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key,
-													  HASH_ENTER_NULL, &found)) == NULL)
-			{
-				not_tracked++;
-				continue;
-			}
-			entry->max_failures = ppp_shared->default_max_failures;
-			entry->failure_window_secs = ppp_shared->default_failure_window_secs;
-			entry->lock_duration_secs = ppp_shared->default_lock_duration_secs;
-			entry->from_profile = false;
-			entry->failed_count = 0;
-			entry->first_failure_at = 0;
-			entry->last_failure_at = 0;
-			entry->lock_pending_audit = false;
-			entry->pending_failures = 0;
+			not_tracked++;
+			continue;
 		}
 		if (entry->locked_until != locks[i].locked_until)
 		{
 			entry->locked_until = locks[i].locked_until;
 			entry->lock_pending_audit = false;
+		}
+		entry->lock_from_state = true;
+		entry->reload_lock_seen = true;
+	}
+
+	/* roles with an assigned profile */
+	for (i = 0; i < nprofiles; i++)
+	{
+		pppEviction ev;
+
+		if (profiles[i].rolename[0] == '\0')
+			continue;
+
+		entry = ppp_enter_role(profiles[i].rolename, PPP_ENTER_PRIORITY, now, &ev);
+		ppp_count_eviction(&ev, &n_evicted, &lost_failed, &lost_pending);
+		if (entry == NULL)
+		{
+			not_tracked++;
+			continue;
+		}
+		entry->max_failures = profiles[i].max_failures;
+		entry->failure_window_secs = profiles[i].failure_window_secs;
+		entry->lock_duration_secs = profiles[i].lock_duration_secs;
+		entry->from_profile = true;
+		entry->reload_profile_seen = true;
+	}
+
+	hash_seq_init(&seq, ppp_role_hash);
+	while ((entry = (pppRoleEntry *) hash_seq_search(&seq)) != NULL)
+	{
+		/* every other entry falls back to the defaults */
+		if (!entry->reload_profile_seen)
+		{
+			entry->max_failures = ppp_shared->default_max_failures;
+			entry->failure_window_secs = ppp_shared->default_failure_window_secs;
+			entry->lock_duration_secs = ppp_shared->default_lock_duration_secs;
+			entry->from_profile = false;
+		}
+
+		/*
+		 * On a standby, a lock re-injected from role_state that is no
+		 * longer there has been lifted on the primary (unlock_role(),
+		 * expiry): nobody else can clear it here.  Locks set locally (by
+		 * the authentication hook, or shmem_lock_role()) are left alone.
+		 * Not done on a primary: it would race with a lock_role()
+		 * committed after our snapshot was taken (SPEC 11).
+		 */
+		if (in_recovery && entry->lock_from_state && !entry->reload_lock_seen)
+		{
+			entry->locked_until = 0;
+			entry->lock_pending_audit = false;
+			entry->lock_from_state = false;
+			n_lifted++;
 		}
 	}
 
@@ -645,7 +781,19 @@ ppp_sync_reload(void)
 		ereport(LOG,
 				(errmsg(PPP_LOG_PREFIX "%d roles could not be loaded in shared memory: too many tracked roles",
 						not_tracked),
+				 errdetail("Every entry holds a lock or profile parameters."),
 				 errhint("Increase pg_pass_policy.max_tracked_roles.")));
+	if (lost_failed > 0 || lost_pending > 0)
+		ereport(LOG,
+				(errmsg(PPP_LOG_PREFIX "shared memory full: %d entries evicted to load locks and profiles (%d counted failures, %d failures not yet audited lost)",
+						n_evicted, lost_failed, lost_pending),
+				 errhint("Increase pg_pass_policy.max_tracked_roles.")));
+	else if (n_evicted > 0)
+		elog(DEBUG1, PPP_LOG_PREFIX "shared memory full: %d inactive entries evicted to load locks and profiles",
+			 n_evicted);
+	if (n_lifted > 0)
+		elog(DEBUG1, PPP_LOG_PREFIX "%d locks lifted on the primary removed from shared memory",
+			 n_lifted);
 
 	elog(DEBUG1, PPP_LOG_PREFIX "reloaded lockout parameters: " UINT64_FORMAT " role profiles, " UINT64_FORMAT " locks",
 		 nprofiles, nlocks);
@@ -706,12 +854,84 @@ ppp_worker_cycle(bool run_full)
 }
 
 /*
+ * A standby cannot write audit_log or role_state: the failures and locks
+ * counted there by the authentication hook are logged and acknowledged,
+ * otherwise their entries could never be evicted nor their expired locks
+ * cleared (ppp_sync_cleanup only clears audited locks).  The server log
+ * already holds the details (authentication failures, "role locked after"
+ * messages of the hook).
+ */
+static void
+ppp_standby_ack_pending(void)
+{
+	HASH_SEQ_STATUS seq;
+	pppRoleEntry *entry;
+	int			failures = 0;
+	int			locks = 0;
+
+	LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
+	hash_seq_init(&seq, ppp_role_hash);
+	while ((entry = (pppRoleEntry *) hash_seq_search(&seq)) != NULL)
+	{
+		if (entry->pending_failures > 0)
+		{
+			failures += entry->pending_failures;
+			entry->pending_failures = 0;
+		}
+		if (entry->lock_pending_audit)
+		{
+			locks++;
+			entry->lock_pending_audit = false;
+		}
+	}
+	LWLockRelease(ppp_shared->lock);
+
+	if (failures > 0 || locks > 0)
+		ereport(LOG,
+				(errmsg(PPP_LOG_PREFIX "%d authentication failures and %d locks counted on this standby are not written to the audit log (server is in recovery)",
+						failures, locks)));
+}
+
+/*
+ * Read-only cycle of a hot standby.
+ *
+ * run_maintenance() and the pending audit step write and cannot run.  The
+ * shared memory hash must still be filled from the replicated role_state
+ * and profiles, otherwise a role locked on the primary could log in on the
+ * standby.  shmem_reload() cannot reach this worker (it runs on the
+ * primary), so the reload is forced at every cycle: three SELECTs per
+ * pg_pass_policy.worker_interval, simpler and more robust than detecting
+ * changes.  The transactions are read-only (StartTransaction forces
+ * XactReadOnly during recovery); ppp_sync_cleanup and ppp_sync_reload only
+ * issue SELECTs, without pg_notify nor any function that writes.
+ */
+static void
+ppp_worker_cycle_standby(void)
+{
+	pgstat_report_activity(STATE_RUNNING, "pg_pass_policy standby synchronisation");
+
+	(void) pg_atomic_exchange_u32(&ppp_shared->reload_requested, 0);
+	ppp_reload_pending = true;
+
+	ppp_standby_ack_pending();
+
+	(void) ppp_run_in_xact("standby synchronisation", ppp_step_sync);
+
+	LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
+	ppp_shared->worker_last_run = GetCurrentTimestamp();
+	LWLockRelease(ppp_shared->lock);
+
+	pgstat_report_activity(STATE_IDLE, NULL);
+}
+
+/*
  * Worker entry point.
  */
 PGDLLEXPORT void
 ppp_worker_main(Datum main_arg)
 {
 	bool		run_now = true;
+	bool		was_in_recovery = false;
 
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGTERM, die);
@@ -761,23 +981,38 @@ ppp_worker_main(Datum main_arg)
 		if (pg_atomic_read_u32(&ppp_shared->reload_requested) != 0)
 			run_now = true;
 
-		if (run_now && !RecoveryInProgress())
+		if (run_now)
 		{
 			MemoryContext oldcxt = MemoryContextSwitchTo(ppp_worker_cxt);
 
-			ppp_worker_cycle(ppp_worker_interval > 0);
+			if (RecoveryInProgress())
+			{
+				ppp_worker_cycle_standby();
+				was_in_recovery = true;
+			}
+			else
+			{
+				/* just promoted: reload everything once */
+				if (was_in_recovery)
+				{
+					ppp_reload_pending = true;
+					was_in_recovery = false;
+				}
+				ppp_worker_cycle(ppp_worker_interval > 0);
+			}
 			MemoryContextSwitchTo(oldcxt);
 			MemoryContextReset(ppp_worker_cxt);
 		}
 		run_now = false;
 
 		/*
-		 * interval = 0: sleep until signalled.  On a standby, poll every
-		 * minute for promotion.
+		 * interval = 0: sleep until signalled.  On a standby nothing signals
+		 * the changes replicated from the primary: always poll, every
+		 * worker_interval (60 s when it is 0), which also detects promotion.
 		 */
 		events = WL_LATCH_SET | WL_EXIT_ON_PM_DEATH;
 		if (RecoveryInProgress())
-			timeout = 60 * 1000L;
+			timeout = (ppp_worker_interval > 0 ? ppp_worker_interval : 60) * 1000L;
 		else if (ppp_worker_interval > 0)
 			timeout = ppp_worker_interval * 1000L;
 		else
