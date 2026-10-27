@@ -594,7 +594,11 @@ ppp_auth_method_checks_secret(const Port *port)
  *   PostgreSQL refuses it even with the right password, so counting would
  *   lock an expired role whose owner keeps typing the right password (and
  *   the connection is refused anyway).  The refusal of a locked role still
- *   applies.
+ *   applies;
+ * - until the worker has loaded the persisted locks after the shared memory
+ *   initialisation (ppp_shared->locks_loaded), the methods that check a
+ *   secret are refused with FATAL 57P03 "lock state not loaded yet",
+ *   whatever the status (SPEC 6.3, "Démarrage").
  */
 static void
 ppp_client_auth_hook(Port *port, int status)
@@ -603,6 +607,8 @@ ppp_client_auth_hook(Port *port, int status)
 	TimestampTz now;
 	TimestampTz locked_until = 0;
 	bool		refuse = false;
+	bool		not_loaded = false;
+	bool		log_not_loaded = false;
 	bool		just_locked = false;
 	bool		hash_full = false;
 	bool		role_missing = false;
@@ -728,6 +734,27 @@ ppp_client_auth_hook(Port *port, int status)
 		}
 	}
 
+	/*
+	 * Fail-closed start-up window: until the worker has re-injected the
+	 * persisted locks, a role locked in role_state (manual "infinity" lock
+	 * of a compromised account included) is not known here.  Refuse the
+	 * methods that check a secret whatever the status, so that the answer
+	 * does not tell a right password from a wrong one; the exempt roles
+	 * (above) are the documented way in for the administrator.
+	 */
+	if (!refuse && !ppp_shared->locks_loaded &&
+		ppp_auth_method_checks_secret(port))
+	{
+		not_loaded = true;
+		if (ppp_shared->not_loaded_logged_at == 0 ||
+			TimestampDifferenceExceeds(ppp_shared->not_loaded_logged_at,
+									   now, 1000))
+		{
+			ppp_shared->not_loaded_logged_at = now;
+			log_not_loaded = true;
+		}
+	}
+
 	LWLockRelease(ppp_shared->lock);
 
 	ppp_log_eviction(&ev);
@@ -765,6 +792,19 @@ ppp_client_auth_hook(Port *port, int status)
 					 errmsg("role \"%s\" is locked by pg_pass_policy", rolename),
 					 errdetail("The role is locked until %s.",
 							   timestamptz_to_str(locked_until))));
+	}
+
+	if (not_loaded)
+	{
+		if (log_not_loaded)
+			ereport(LOG,
+					(errmsg(PPP_LOG_PREFIX "refusing connections until the background worker has loaded the lock state"),
+					 errdetail("Roles authenticating with a password or a secret are refused until the persisted locks are re-injected from role_state (at most one message per second)."),
+					 errhint("Check that the pg_pass_policy background worker is running (pass_policy.worker_status()); roles listed in pg_pass_policy.exempt_roles can still connect.")));
+		ereport(FATAL,
+				(errcode(ERRCODE_CANNOT_CONNECT_NOW),
+				 errmsg(PPP_LOG_PREFIX "lock state not loaded yet, retry"),
+				 errdetail("The server has just started and the pg_pass_policy background worker has not loaded the persisted locks yet.")));
 	}
 }
 

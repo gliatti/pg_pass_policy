@@ -129,6 +129,14 @@ else
 	fail "pas de worker sur le standby"
 fi
 
+# Fenêtre fail-closed du démarrage (SPEC §6.3) : le cycle standby recharge à
+# chaque tour et pose last_reload ; avant, les rôles non exemptés reçoivent
+# 57P03 « lock state not loaded yet ».
+if wait_for_sb "SELECT last_reload IS NOT NULL FROM pass_policy.worker_status()"; then
+	ok "standby : premier rechargement fait (last_reload posé)"
+else
+	fail "standby : aucun rechargement (last_reload NULL)"
+fi
 out=$(sb_as regress_sb "$GOOD" "SELECT current_user") || true
 check_eq "standby : connexion initiale acceptée" "regress_sb" "$out"
 

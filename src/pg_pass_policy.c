@@ -132,6 +132,9 @@ ppp_shmem_startup(void)
 		ppp_shared->worker_pid = 0;
 		ppp_shared->worker_last_run = 0;
 		ppp_shared->worker_last_reload = 0;
+		/* fail-closed until the worker has re-injected the persisted locks */
+		ppp_shared->locks_loaded = false;
+		ppp_shared->not_loaded_logged_at = 0;
 	}
 
 	/* the role hash table belongs to lockout.c */
@@ -368,8 +371,9 @@ ppp_extension_state(Oid *nspowner)
  * ppp_extension_installed
  *
  * True only when the extension is installed and trusted (see
- * ppp_extension_state()).  Kept for the background worker, which waits
- * while it is false.
+ * ppp_extension_state()).  The background worker uses ppp_extension_state()
+ * itself: an absent extension closes the start-up window of the
+ * authentication hook, an untrusted one does not.
  */
 bool
 ppp_extension_installed(void)

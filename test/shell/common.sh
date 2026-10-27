@@ -153,6 +153,16 @@ ppp_start() {
 	done
 	log "instance temporaire : $PPP_TMP (port $PPP_PORT, $("$PPP_BINDIR/postgres" --version))"
 	psql_admin "CREATE EXTENSION pg_pass_policy" >/dev/null
+	# Fenêtre fail-closed du démarrage (SPEC §6.3) : tant que le worker n'a pas
+	# chargé l'état des verrous, les rôles non exemptés authentifiés par mot de
+	# passe reçoivent 57P03. On attend un premier rechargement (demandé
+	# explicitement : avec un worker_interval long, le premier tour a pu passer
+	# avant CREATE EXTENSION).
+	psql_admin "SELECT pass_policy.shmem_reload()" >/dev/null
+	wait_for 30 "SELECT last_reload IS NOT NULL FROM pass_policy.worker_status()" || {
+		echo "le worker n'a pas chargé l'état des verrous" >&2
+		return 1
+	}
 }
 
 psql_admin() {

@@ -509,6 +509,69 @@ n=$(grep -c 'lock of role "regress_race" changed while its automatic lock was be
 log "info : $n tour(s) du worker annulé(s) par la vérification de lock_seq"
 psql_admin "SELECT pass_policy.unlock_role('regress_race')" >/dev/null
 
+# --- démarrage : fenêtre fail-closed (SPEC §6.3 « Démarrage », revue finale 6) --
+# Après un démarrage, le hash est vide tant que le worker n'a pas réinjecté
+# les verrous de role_state. Un rôle verrouillé à la main (verrou « infinity »
+# d'un compte compromis) ne doit jamais entrer pendant cette fenêtre : refus
+# « locked » si le verrou est déjà réinjecté, 57P03 sinon. worker_interval = 0
+# vérifie au passage que le worker fait quand même un premier rechargement.
+restart_server() {
+	"$PPP_BINDIR/pg_ctl" -D "$PPP_TMP/data" -l "$PPP_TMP/server.log" -o "-p $PPP_PORT" -w -t 60 restart >/dev/null
+}
+psql_admin "SELECT pass_policy.lock_role('regress_lock', NULL, 'compromised')" >/dev/null
+psql_admin "ALTER SYSTEM SET pg_pass_policy.worker_interval = 0" >/dev/null
+restart_server
+out=$(psql_as regress_lock "$GOOD" "SELECT current_user") || true
+check_not_contains "démarrage : connexion immédiate du rôle verrouillé jamais acceptée" "^regress_lock$" "$out"
+check_contains "démarrage : refus immédiat (locked ou lock state not loaded)" "is locked by pg_pass_policy|lock state not loaded yet" "$out"
+if wait_for 30 "SELECT last_reload IS NOT NULL FROM pass_policy.worker_status()"; then
+	ok "worker_interval = 0 : premier rechargement fait au démarrage"
+else
+	fail "worker_interval = 0 : aucun rechargement au démarrage"
+fi
+out=$(psql_as regress_lock "$GOOD" "SELECT current_user") || true
+check_contains "démarrage : après le premier tour, refus « locked »" "is locked by pg_pass_policy" "$out"
+out=$(psql_as regress_exempt "$GOOD" "SELECT current_user") || true
+check_eq "démarrage : le rôle exempté se connecte" "regress_exempt" "$out"
+
+# Fenêtre tenue ouverte de façon déterministe : role_state renommée, le
+# rechargement du worker échoue (WARNING) et la fenêtre reste fermée.
+psql_admin "ALTER SYSTEM RESET pg_pass_policy.worker_interval" >/dev/null
+psql_admin "ALTER TABLE pass_policy.role_state RENAME TO role_state_hidden" >/dev/null
+log0=$(wc -l <"$PPP_TMP/server.log")
+restart_server
+out=$(psql_as regress_lock "$GOOD" "SELECT current_user") || true
+check_contains "fenêtre : bon mot de passe refusé (57P03 lock state not loaded yet)" "FATAL: +pg_pass_policy: lock state not loaded yet, retry" "$out"
+out=$(psql_as regress_lock "$BAD" "SELECT current_user") || true
+check_contains "fenêtre : mauvais mot de passe, même réponse (pas d'oracle)" "FATAL: +pg_pass_policy: lock state not loaded yet, retry" "$out"
+psql_admin "CREATE ROLE regress_window LOGIN PASSWORD '$GOOD'" >/dev/null
+for i in 1 2 3 4 5; do psql_as regress_window "$GOOD" >/dev/null || true; done
+out=$(psql_as regress_window "$GOOD" "SELECT current_user") || true
+check_contains "fenêtre : rôle non verrouillé et non exempté refusé aussi" "lock state not loaded yet" "$out"
+out=$(psql_as regress_exempt "$GOOD" "SELECT current_user") || true
+check_eq "fenêtre : le rôle exempté se connecte" "regress_exempt" "$out"
+out=$(psql_admin "SELECT last_reload IS NULL FROM pass_policy.worker_status()")
+check_eq "fenêtre : aucun rechargement réussi (role_state introuvable)" "t" "$out"
+n=$(tail -n "+$((log0 + 1))" "$PPP_TMP/server.log" | grep -c 'refusing connections until the background worker has loaded the lock state' || true)
+if [ "$n" -ge 1 ] && [ "$n" -lt 8 ]; then
+	ok "fenêtre : LOG limité ($n ligne(s) pour 8 refus)"
+else
+	fail "fenêtre : LOG attendu entre 1 et 7 fois, obtenu $n"
+fi
+psql_admin "ALTER TABLE pass_policy.role_state_hidden RENAME TO role_state" >/dev/null
+if wait_for 30 "SELECT last_reload IS NOT NULL FROM pass_policy.worker_status()"; then
+	ok "fenêtre : le worker recharge au tour suivant"
+else
+	fail "fenêtre : pas de rechargement après le retour de role_state"
+fi
+out=$(psql_as regress_lock "$GOOD" "SELECT current_user") || true
+check_contains "fenêtre fermée : refus « locked »" "is locked by pg_pass_policy" "$out"
+out=$(psql_as regress_window "$GOOD" "SELECT current_user") || true
+check_eq "fenêtre fermée : rôle non verrouillé accepté" "regress_window" "$out"
+psql_admin "SELECT pass_policy.unlock_role('regress_lock')" >/dev/null
+out=$(psql_as regress_lock "$GOOD" "SELECT current_user") || true
+check_eq "fenêtre fermée : unlock_role, connexion acceptée" "regress_lock" "$out"
+
 # --- bibliothèque retirée de shared_preload_libraries : lock_role échoue -----
 # Sans préchargement, shmem_lock_role() ne peut pas écrire en mémoire partagée
 # (le chargement de la bibliothèque échoue) : lock_role() et unlock_role()

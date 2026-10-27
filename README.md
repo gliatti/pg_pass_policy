@@ -55,6 +55,11 @@ Puis, connecté en superutilisateur **à la base désignée** :
 CREATE EXTENSION pg_pass_policy;
 ```
 
+Recommandé : `pg_pass_policy.exempt_roles = 'postgres'` (ou votre compte
+d'administration), pour ne jamais être bloqué par un profil trop strict ni
+par la courte fenêtre de démarrage pendant laquelle les autres rôles sont
+refusés (voir « Verrouillage et déverrouillage »).
+
 `CREATE EXTENSION` crée le schéma `pass_policy`, les tables, les fonctions, les
 vues, le profil `default`, charge le dictionnaire de mots de passe courants et
 crée les deux rôles `NOLOGIN` suivants s'ils n'existent pas :
@@ -160,6 +165,25 @@ n'importe quel rôle par son nom. Les connexions refusées par une ligne
 `reject` de `pg_hba.conf` (ou faute de ligne) ne sont pas comptées non plus.
 Le refus d'un rôle verrouillé, lui, s'applique quelle que soit la méthode.
 
+**Au démarrage du serveur**, la mémoire partagée est vide : les verrous
+enregistrés dans `role_state` (dont les verrous manuels sans fin) n'y sont
+réinjectés que par le premier tour du worker, qui commence par là. Pour
+qu'aucun rôle verrouillé ne se glisse dans cette fenêtre, les connexions par
+mot de passe ou secret (`password`, `md5`, `scram-sha-256`, `ldap`, `pam`,
+`radius`, `bsd`) des rôles non exemptés sont refusées tant que l'état n'est
+pas chargé, bon ou mauvais mot de passe :
+`FATAL: pg_pass_policy: lock state not loaded yet, retry` (SQLSTATE `57P03`,
+comme « the database system is starting up » : il suffit de réessayer). La
+fenêtre dure normalement une fraction de seconde. Si le worker ne peut pas
+charger l'état (base `pg_pass_policy.database` inexistante, table illisible),
+elle reste fermée et le log l'indique (au plus une ligne par seconde) ;
+`pass_policy.worker_status()` montre alors `last_reload` à NULL. Les rôles de
+`pg_pass_policy.exempt_roles` et les connexions sans secret (`peer`, `cert`…)
+passent toujours : gardez un compte d'administration exempté (typiquement
+`exempt_roles = 'postgres'`) ou un accès local `peer` pour intervenir. Avec
+`enabled = off`, rien n'est bloqué ; avec `worker_interval = 0`, le worker
+fait quand même ce premier chargement au démarrage.
+
 ```sql
 SELECT pass_policy.lock_role('app_user');                              -- manuel, sans fin : renvoie infinity
 SELECT pass_policy.lock_role('app_user', interval '1 hour', 'incident');  -- renvoie la fin du verrou
@@ -230,7 +254,7 @@ Tous préfixés `pg_pass_policy.`. Contexte `postmaster` = redémarrage ;
 |---|---|---|---|---|
 | `enabled` | bool | `on` | SIGHUP | `off` : les hooks ne font rien et le worker est suspendu (ni maintenance, ni audit, ni `role_state`, ni rechargement de la mémoire partagée) ; les échecs et verrous déjà comptés restent en attente en mémoire partagée et sont journalisés au retour à `on` |
 | `database` | string | `postgres` | postmaster | base où l'extension est installée et où le worker se connecte |
-| `worker_interval` | int (s) | `60` | SIGHUP | `0` : pas de tour périodique (appeler `run_maintenance()` à la main) |
+| `worker_interval` | int (s) | `60` | SIGHUP | `0` : pas de tour périodique (appeler `run_maintenance()` à la main) ; le worker charge quand même les verrous au démarrage |
 | `max_tracked_roles` | int | `1024` | postmaster | taille du hash de verrouillage en mémoire partagée (16 à 1 048 576). Doit dépasser le nombre de rôles LOGIN qui ont un profil ou un verrou : ces entrées ne sont jamais évincées ; si le hash n'en contient plus d'autres, les échecs ne sont plus comptés (LOG « cannot track ») et `lock_role()` échoue (ERROR 53400, transaction annulée). Les entrées des noms de rôles inexistants et les compteurs inactifs sont évincés en premier. Recommandation : une valeur largement supérieure au nombre de rôles, avec une marge (voir « Énumération des rôles ») |
 | `manage_valid_until` | bool | `on` | SIGHUP | le worker écrit `pg_authid.rolvaliduntil` |
 | `log_events` | bool | `on` | SIGHUP | une ligne `LOG: pg_pass_policy: …` par événement |

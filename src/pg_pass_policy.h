@@ -197,6 +197,18 @@ typedef struct pppSharedState
 	TimestampTz worker_last_reload;
 
 	/*
+	 * Fail-closed start-up window (SPEC 6.3, "Démarrage"): false from
+	 * shared memory initialisation until the worker has re-injected the
+	 * persisted locks (ppp_sync_reload), or found that the extension is not
+	 * installed in pg_pass_policy.database (nothing to re-inject).  Until
+	 * then the authentication hook refuses the non-exempt roles that
+	 * authenticate with a secret (57P03).  not_loaded_logged_at limits its
+	 * LOG to one per second across all backends.
+	 */
+	bool		locks_loaded;
+	TimestampTz not_loaded_logged_at;
+
+	/*
 	 * Last time an eviction scan in PPP_ENTER_COUNT mode found nothing to
 	 * evict: the authentication hook skips the scan for one second after
 	 * that, so that a flood of failed connections against a hash full of

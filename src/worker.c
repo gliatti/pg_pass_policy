@@ -6,6 +6,10 @@
  *		pg_pass_policy tables.
  *
  * Each cycle, in pg_pass_policy.database:
+ *	 0. first cycle after start-up, promotion or enabled turned on again
+ *		only: step 3 with a forced reload, before anything else, so that the
+ *		persisted locks are re-injected before run_maintenance() (which may
+ *		wait for pg_cron's pass) and the pending audit (ppp_sync_first);
  *	 1. SELECT * FROM pass_policy.run_maintenance()  (own transaction;
  *		skipped when pg_pass_policy.worker_interval = 0)
  *	 2. pending audit (own transaction): audit rows for pending failures /
@@ -17,7 +21,7 @@
  *		a. expired locks cleared, inactive entries purged, entries of
  *		   non-existent roles (flagged by the authentication hook) purged
  *		   after their failure window;
- *		b. when requested (shmem_reload() or first cycle): persisted locks
+ *		b. when requested (shmem_reload(), or step 0): persisted locks
  *		   re-injected from role_state (locks mirrored there but no longer
  *		   in it are lifted), lockout parameters reloaded from the profiles.
  *
@@ -137,6 +141,18 @@ static MemoryContext ppp_worker_cxt = NULL;
 static bool ppp_reload_pending = false;
 
 /*
+ * The next primary cycle must synchronise the shared memory (clean-up and
+ * forced reload) BEFORE run_maintenance() and the pending audit step: set at
+ * start-up, after promotion and when pg_pass_policy.enabled is turned on
+ * again.  Until the persisted locks are re-injected from role_state, a
+ * locked role is not known to the authentication hook; run_maintenance() may
+ * take long (full pass, wait for the advisory lock held by pg_cron), and the
+ * session of a role that gets in meanwhile survives the reload.  Cleared once
+ * that reload has succeeded (SPEC 6.4).
+ */
+static bool ppp_sync_first = true;
+
+/*
  * Copies of the shared memory entries written to the tables by the current
  * cycle (allocated in ppp_worker_cxt so that they survive SPI_finish and the
  * end of the transaction).  They are acknowledged in shared memory by
@@ -195,15 +211,34 @@ ppp_run_in_xact(const char *what, void (*step) (void))
 
 	PG_TRY();
 	{
+		pppExtensionState ext_state;
+
 		if (SPI_connect() != SPI_OK_CONNECT)
 			elog(ERROR, "SPI_connect failed");
 		PushActiveSnapshot(GetTransactionSnapshot());
 
-		if (ppp_extension_installed())
+		ext_state = ppp_extension_state(NULL);
+		if (ext_state == PPP_EXT_TRUSTED)
 			step();
 		else
+		{
 			elog(DEBUG1, PPP_LOG_PREFIX "extension not installed in database \"%s\", nothing to do",
 				 ppp_database);
+
+			/*
+			 * No extension, no persisted lock to re-inject: the start-up
+			 * window of the authentication hook can be closed (otherwise
+			 * every non-exempt role would be refused until CREATE
+			 * EXTENSION).  An installed but untrusted extension keeps it
+			 * open: role_state exists but cannot be read safely.
+			 */
+			if (ext_state == PPP_EXT_ABSENT && !ppp_shared->locks_loaded)
+			{
+				LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
+				ppp_shared->locks_loaded = true;
+				LWLockRelease(ppp_shared->lock);
+			}
+		}
 
 		SPI_finish();
 		PopActiveSnapshot();
@@ -911,6 +946,8 @@ ppp_sync_reload(void)
 	}
 
 	ppp_shared->worker_last_reload = GetCurrentTimestamp();
+	/* closes the fail-closed start-up window of the hook */
+	ppp_shared->locks_loaded = true;
 
 	LWLockRelease(ppp_shared->lock);
 
@@ -955,6 +992,25 @@ static void
 ppp_worker_cycle(bool run_full)
 {
 	pgstat_report_activity(STATE_RUNNING, "pg_pass_policy maintenance");
+
+	/*
+	 * First cycle, after promotion or after enabled is turned on again:
+	 * re-inject the persisted locks before anything else (see
+	 * ppp_sync_first).  The request is consumed here: run_maintenance()
+	 * makes a new one, served by the synchronisation step at the end of this
+	 * cycle.  On failure (error, extension not installed yet),
+	 * ppp_reload_pending stays set and the next cycle starts over.
+	 */
+	if (ppp_sync_first)
+	{
+		(void) pg_atomic_exchange_u32(&ppp_shared->reload_requested, 0);
+		ppp_reload_pending = true;
+		(void) ppp_run_in_xact("shared memory synchronisation", ppp_step_sync);
+		if (!ppp_reload_pending)
+			ppp_sync_first = false;
+
+		CHECK_FOR_INTERRUPTS();
+	}
 
 	if (run_full)
 		(void) ppp_run_in_xact("maintenance", ppp_step_maintenance);
@@ -1056,6 +1112,7 @@ ppp_worker_suspended(void)
 				(errmsg(PPP_LOG_PREFIX "worker resumed: pg_pass_policy.enabled is on")));
 		suspended = false;
 		ppp_reload_pending = true;
+		ppp_sync_first = true;
 	}
 	return false;
 }
@@ -1132,6 +1189,7 @@ ppp_worker_main(Datum main_arg)
 				if (was_in_recovery)
 				{
 					ppp_reload_pending = true;
+					ppp_sync_first = true;
 					was_in_recovery = false;
 				}
 				ppp_worker_cycle(ppp_worker_interval > 0);
