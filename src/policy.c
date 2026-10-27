@@ -125,7 +125,8 @@ ppp_spi_begin(pppSpiState *st)
 {
 	GetUserIdAndSecContext(&st->save_userid, &st->save_sec_context);
 	SetUserIdAndSecContext(BOOTSTRAP_SUPERUSERID,
-						   st->save_sec_context | SECURITY_LOCAL_USERID_CHANGE);
+						   st->save_sec_context | SECURITY_LOCAL_USERID_CHANGE |
+						   SECURITY_RESTRICTED_OPERATION);
 	st->save_nestlevel = NewGUCNestLevel();
 	(void) set_config_option("search_path", "pg_catalog, pg_temp",
 							 PGC_USERSET, PGC_S_SESSION,
@@ -991,6 +992,10 @@ ppp_check_password_hook(const char *username, const char *shadow_pass,
 						bool validuntil_null)
 {
 	bool		save_in_hook = ppp_in_hook;
+	Oid			save_userid;
+	int			save_sec_context;
+
+	GetUserIdAndSecContext(&save_userid, &save_sec_context);
 
 	/* steps 1 to 8 */
 	ppp_in_hook = true;
@@ -1000,7 +1005,9 @@ ppp_check_password_hook(const char *username, const char *shadow_pass,
 	}
 	PG_FINALLY();
 	{
+		/* also restore the identity changed by ppp_spi_begin() on error */
 		ppp_in_hook = save_in_hook;
+		SetUserIdAndSecContext(save_userid, save_sec_context);
 	}
 	PG_END_TRY();
 
