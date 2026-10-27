@@ -799,16 +799,20 @@ ppp_describe(const char *code, const pppProfile *p, char **msg, char **detail,
  * applicable when the password was force-expired (must_change), nor to a
  * role that does not exist yet (CREATE ROLE).
  *
- * The lookup is by OID only: a role_state row carrying the same name but
- * another OID can only belong to a dropped role (stale until the next
- * run_maintenance()), whose date must not apply to a re-created role.
+ * The role_state lookup is by OID only: a role_state row carrying the same
+ * name but another OID can only belong to a dropped role (stale until the
+ * next run_maintenance()), whose date must not apply to a re-created role.
+ * A role created by CREATE ROLE ... PASSWORD has no role_state row until
+ * the next run_maintenance(), only a password_history row with role_oid IS
+ * NULL: the date of the most recent such row (by name) is used too, so that
+ * min_age does not depend on whether the maintenance already ran.
  * Runs inside the SPI session of the caller.
  */
 static bool
-ppp_min_age_violated(Oid roleid, const pppProfile *p)
+ppp_min_age_violated(const char *username, Oid roleid, const pppProfile *p)
 {
-	Oid			argtypes[2] = {OIDOID, INTERVALOID};
-	Datum		values[2];
+	Oid			argtypes[3] = {OIDOID, INTERVALOID, TEXTOID};
+	Datum		values[3];
 	int			ret;
 	bool		violated = false;
 
@@ -817,13 +821,16 @@ ppp_min_age_violated(Oid roleid, const pppProfile *p)
 
 	values[0] = ObjectIdGetDatum(roleid);
 	values[1] = p->min_age;
+	values[2] = CStringGetTextDatum(username);
 
-	ret = SPI_execute_with_args("SELECT (pg_catalog.now() - password_changed_at) < $2 "
-								"FROM " PPP_SCHEMA ".role_state "
-								"WHERE role_oid = $1 "
-								"AND password_changed_at IS NOT NULL "
-								"AND NOT must_change",
-								2, argtypes, values, NULL, true, 1);
+	/* greatest() ignores NULLs; a NULL result means "not violated" */
+	ret = SPI_execute_with_args("SELECT NOT coalesce(s.must_change, false) "
+								"AND (pg_catalog.now() - GREATEST(s.password_changed_at, h.changed_at)) < $2 "
+								"FROM (SELECT pg_catalog.max(h1.changed_at) AS changed_at "
+								"FROM " PPP_SCHEMA ".password_history h1 "
+								"WHERE h1.role_oid IS NULL AND h1.role_name = $3) h "
+								"LEFT JOIN " PPP_SCHEMA ".role_state s ON s.role_oid = $1",
+								3, argtypes, values, NULL, true, 1);
 	if (ret != SPI_OK_SELECT)
 		elog(ERROR, "pg_pass_policy: role_state lookup failed: %s",
 			 SPI_result_code_string(ret));
@@ -873,18 +880,20 @@ ppp_matches_verifier(const char *username, const char *password,
  * (not older than history_days).  The most recent history row normally is
  * the current password: "history_count" passwords, current one included.
  *
- * Existing role: lookup by OID only (rows of a dropped role of the same
- * name, not yet purged by run_maintenance(), must not be resurrected for a
- * re-created role).  Role not created yet (CREATE ROLE ... PASSWORD): only
- * the rows not yet mapped to an OID (role_oid IS NULL), by name.
+ * Existing role: rows of its OID, plus the rows not yet mapped to an OID
+ * (role_oid IS NULL) under its name, written by CREATE ROLE ... PASSWORD and
+ * mapped only by the next run_maintenance().  Rows of a dropped role of the
+ * same name (another OID, not yet purged) are never used: they must not be
+ * resurrected for a re-created role.  Role not created yet (CREATE ROLE ...
+ * PASSWORD): only the rows with role_oid IS NULL, by name.
  * Runs inside the SPI session of the caller.
  */
 static bool
 ppp_password_reused(const char *username, Oid roleid, const char *password,
 					const pppProfile *p)
 {
-	Oid			argtypes[3] = {INT4OID, INT4OID, InvalidOid};
-	Datum		values[3];
+	Oid			argtypes[4] = {INT4OID, INT4OID, TEXTOID, OIDOID};
+	Datum		values[4];
 	int			ret;
 	bool		reused = false;
 	uint64		i;
@@ -919,20 +928,18 @@ ppp_password_reused(const char *username, Oid roleid, const char *password,
 
 	values[0] = Int32GetDatum(p->history_days);
 	values[1] = Int32GetDatum(p->history_count);
+	values[2] = CStringGetTextDatum(username);
 	if (OidIsValid(roleid))
 	{
-		argtypes[2] = OIDOID;
-		values[2] = ObjectIdGetDatum(roleid);
+		values[3] = ObjectIdGetDatum(roleid);
 		ret = SPI_execute_with_args("SELECT verifier FROM " PPP_SCHEMA ".password_history "
-									"WHERE role_oid = $3 "
+									"WHERE (role_oid = $4 OR (role_oid IS NULL AND role_name = $3)) "
 									"AND ($1 <= 0 OR changed_at > pg_catalog.now() - pg_catalog.make_interval(days => $1)) "
 									"ORDER BY changed_at DESC, id DESC LIMIT $2",
-									3, argtypes, values, NULL, true, 0);
+									4, argtypes, values, NULL, true, 0);
 	}
 	else
 	{
-		argtypes[2] = TEXTOID;
-		values[2] = CStringGetTextDatum(username);
 		ret = SPI_execute_with_args("SELECT verifier FROM " PPP_SCHEMA ".password_history "
 									"WHERE role_oid IS NULL AND role_name = $3 "
 									"AND ($1 <= 0 OR changed_at > pg_catalog.now() - pg_catalog.make_interval(days => $1)) "
@@ -974,7 +981,7 @@ ppp_evaluate_plain(const char *username, Oid roleid, const char *password,
 
 	if (!skip_complexity && !ppp_validate(username, password, p, &code))
 		return code;
-	if (check_history && !caller_is_super && ppp_min_age_violated(roleid, p))
+	if (check_history && !caller_is_super && ppp_min_age_violated(username, roleid, p))
 		return "PPP-030";
 	if (check_history && ppp_password_reused(username, roleid, password, p))
 		return "PPP-031";
@@ -1112,14 +1119,101 @@ ppp_record_change(const char *username, const char *verifier)
 
 
 /* ------------------------------------------------------------------------
+ * Extension state (SPEC 6.2 step 2)
+ * ------------------------------------------------------------------------
+ */
+
+/*
+ * Where is the extension?  Catalog lookups only, no SPI: called BEFORE the
+ * elevated SPI session is opened, which is only needed (and only allowed)
+ * when the extension is installed and trusted.
+ *
+ * PPP_EXT_UNTRUSTED raises PPP-004.  PPP_EXT_ABSENT raises an ERROR when
+ * absent_is_error (SQL functions of this file), otherwise it is returned
+ * and handled by the caller (password hook: ppp_extension_absent()).
+ * Returns PPP_EXT_TRUSTED or PPP_EXT_ABSENT.
+ */
+static pppExtensionState
+ppp_require_extension(bool absent_is_error)
+{
+	Oid			nspowner;
+	pppExtensionState state = ppp_extension_state(&nspowner);
+
+	switch (state)
+	{
+		case PPP_EXT_TRUSTED:
+			break;
+		case PPP_EXT_UNTRUSTED:
+			ppp_untrusted_error(nspowner);
+			break;
+		case PPP_EXT_ABSENT:
+			if (absent_is_error)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("pg_pass_policy is not installed in this database"),
+						 errhidestmt(true),
+						 errhidecontext(true)));
+			break;
+		default:
+			elog(ERROR, "pg_pass_policy: unexpected extension state %d",
+				 (int) state);
+			break;
+	}
+	return state;
+}
+
+
+/* ------------------------------------------------------------------------
  * check_password_hook
  * ------------------------------------------------------------------------
  */
 
 /*
- * Steps 2 to 8 of SPEC 6.2, run inside the single SPI session opened by the
- * hook.  caller_is_super is superuser() of the caller, read before that
- * session switched to the bootstrap superuser.
+ * Password change while the extension is not installed in the current
+ * database (SPEC 6.2 step 2): PPP-003 outside pg_pass_policy.database when
+ * enforce_database is on, otherwise a WARNING once per session.  No SPI and
+ * no audit row: there is no pass_policy schema to write to.
+ */
+static void
+ppp_extension_absent(const char *username)
+{
+	char	   *dbname = get_database_name(MyDatabaseId);
+	bool		in_ppp_db = (dbname != NULL && ppp_database != NULL &&
+							 strcmp(dbname, ppp_database) == 0);
+
+	if (!in_ppp_db && ppp_enforce_database)
+	{
+		pppProfile	prof;
+
+		memset(&prof, 0, sizeof(prof));
+		prof.name = "?";
+		ppp_reject(username, "PPP-003", &prof, false);
+	}
+
+	if (!ppp_missing_schema_warned)
+	{
+		if (in_ppp_db)
+			ereport(WARNING,
+					(errmsg("pg_pass_policy: extension is not installed in database \"%s\", password policy not applied",
+							dbname),
+					 errhint("Run CREATE EXTENSION pg_pass_policy in this database."),
+					 errhidestmt(true),
+					 errhidecontext(true)));
+		else
+			ereport(WARNING,
+					(errmsg("pg_pass_policy: password policy not applied outside database \"%s\"",
+							ppp_database),
+					 errhidestmt(true),
+					 errhidecontext(true)));
+		ppp_missing_schema_warned = true;
+	}
+}
+
+/*
+ * Steps 3 to 8 of SPEC 6.2, run inside the single SPI session opened by the
+ * hook once the extension is known to be installed and trusted (step 2).
+ * caller_is_super is superuser() of the caller, read before that session
+ * switched to the bootstrap superuser.
  */
 static void
 ppp_apply_policy(const char *username, const char *shadow_pass,
@@ -1128,51 +1222,8 @@ ppp_apply_policy(const char *username, const char *shadow_pass,
 {
 	pppProfile	prof;
 	Oid			roleid;
-	Oid			nspowner;
 	char	   *verifier;
 	const char *code;
-
-	/* step 2: where is the extension? */
-	switch (ppp_extension_state(&nspowner))
-	{
-		case PPP_EXT_TRUSTED:
-			break;
-		case PPP_EXT_UNTRUSTED:
-			ppp_untrusted_error(nspowner);
-			break;
-		case PPP_EXT_ABSENT:
-			{
-				char	   *dbname = get_database_name(MyDatabaseId);
-				bool		in_ppp_db = (dbname != NULL && ppp_database != NULL &&
-										 strcmp(dbname, ppp_database) == 0);
-
-				if (!in_ppp_db && ppp_enforce_database)
-				{
-					memset(&prof, 0, sizeof(prof));
-					prof.name = "?";
-					ppp_reject(username, "PPP-003", &prof, false);
-				}
-
-				if (!ppp_missing_schema_warned)
-				{
-					if (in_ppp_db)
-						ereport(WARNING,
-								(errmsg("pg_pass_policy: extension is not installed in database \"%s\", password policy not applied",
-										dbname),
-								 errhint("Run CREATE EXTENSION pg_pass_policy in this database."),
-								 errhidestmt(true),
-								 errhidecontext(true)));
-					else
-						ereport(WARNING,
-								(errmsg("pg_pass_policy: password policy not applied outside database \"%s\"",
-										ppp_database),
-								 errhidestmt(true),
-								 errhidecontext(true)));
-					ppp_missing_schema_warned = true;
-				}
-				return;
-			}
-	}
 
 	ppp_load_effective_profile(username, &prof, cxt);
 	roleid = get_role_oid(username, true);
@@ -1184,7 +1235,7 @@ ppp_apply_policy(const char *username, const char *shadow_pass,
 			ppp_reject(username, "PPP-001", &prof, true);
 		if (password_type == PASSWORD_TYPE_MD5 && ppp_require_scram)
 			ppp_reject(username, "PPP-002", &prof, true);
-		if (!caller_is_super && ppp_min_age_violated(roleid, &prof))
+		if (!caller_is_super && ppp_min_age_violated(username, roleid, &prof))
 			ppp_reject(username, "PPP-030", &prof, true);
 		verifier = pstrdup(shadow_pass);
 	}
@@ -1227,14 +1278,20 @@ ppp_check_password_hook(const char *username, const char *shadow_pass,
 
 		GetUserIdAndSecContext(&save_userid, &save_sec_context);
 
-		/* steps 2 to 8, in one elevated SPI session */
 		ppp_in_hook = true;
 		PG_TRY();
 		{
-			ppp_spi_begin(&st);
-			ppp_apply_policy(username, shadow_pass, password_type,
-							 caller_is_super, cxt);
-			ppp_spi_end(&st);
+			/* step 2, without SPI; PPP-004 if untrusted */
+			if (ppp_require_extension(false) == PPP_EXT_TRUSTED)
+			{
+				/* steps 3 to 8, in one elevated SPI session */
+				ppp_spi_begin(&st);
+				ppp_apply_policy(username, shadow_pass, password_type,
+								 caller_is_super, cxt);
+				ppp_spi_end(&st);
+			}
+			else
+				ppp_extension_absent(username);
 		}
 		PG_CATCH();
 		{
@@ -1265,29 +1322,6 @@ ppp_policy_init(void)
  * SQL functions
  * ------------------------------------------------------------------------
  */
-
-/* ERROR unless the extension is installed here and trusted (PPP-004) */
-static void
-ppp_require_extension(void)
-{
-	Oid			nspowner;
-
-	switch (ppp_extension_state(&nspowner))
-	{
-		case PPP_EXT_TRUSTED:
-			break;
-		case PPP_EXT_UNTRUSTED:
-			ppp_untrusted_error(nspowner);
-			break;
-		case PPP_EXT_ABSENT:
-			ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("pg_pass_policy is not installed in this database"),
-					 errhidestmt(true),
-					 errhidecontext(true)));
-			break;
-	}
-}
 
 /*
  * Evaluate the password argument (#1) of check_password(); the copies of the
@@ -1388,8 +1422,9 @@ ppp_check_password(PG_FUNCTION_ARGS)
 		Oid			roleid;
 		bool		may_check_history;
 
+		/* catalog lookups only: checked before the elevation */
+		(void) ppp_require_extension(true);
 		ppp_spi_begin(&st);
-		ppp_require_extension();
 
 		/* everything that can fail without needing the secret comes first */
 		ppp_load_effective_profile(username, &prof, cxt);
@@ -1495,8 +1530,9 @@ ppp_generate_password(PG_FUNCTION_ARGS)
 		int			nclasses_forced;
 		int			tries;
 
+		/* catalog lookups only: checked before the elevation */
+		(void) ppp_require_extension(true);
 		ppp_spi_begin(&st);
-		ppp_require_extension();
 		ppp_load_named_profile(profname, &prof, cxt);
 
 		if (length < prof.min_length ||

@@ -571,40 +571,53 @@ SELECT ppp_test.try($$ALTER ROLE regress_target PASSWORD 'Untrusted-Schema#2026'
 (1 row)
 
 -- ---------------------------------------------------------------------
--- pg_pass_policy.exempt_roles : _is_exempt() (SQL) découpe la liste comme
--- SplitIdentifierString() (C) : noms non quotés en minuscules, "quotés" tels
--- quels, espaces ignorés. Le hook (C) et _is_exempt() doivent concorder :
--- un rôle exempté accepte un mot de passe faible.
+-- pg_pass_policy.exempt_roles : _is_exempt() appelle la fonction C des hooks
+-- (ppp_role_is_exempt(), règles de SplitIdentifierString()) : noms non quotés
+-- en minuscules, "quotés" tels quels ("" = un guillemet), espaces ignorés.
+-- Le GUC est SIGHUP : pg_reload_conf() est asynchrone et le backend ne relit
+-- la configuration qu'entre deux instructions ; l'attente (bornée à 5 s) est
+-- donc faite d'une instruction par tour (\gexec), sortie masquée.
 -- ---------------------------------------------------------------------
-SELECT pass_policy._split_identifiers(' a , b ') AS split_spaces,
-       pass_policy._split_identifiers('Postgres, "App User", "x""y"') AS split_mixed,
-       pass_policy._split_identifiers('a b') IS NULL AS split_invalid,
-       pass_policy._split_identifiers('') AS split_empty;
- split_spaces |         split_mixed          | split_invalid | split_empty 
---------------+------------------------------+---------------+-------------
- {a,b}        | {postgres,"App User","x\"y"} | t             | {}
-(1 row)
-
 CREATE ROLE "Regress_Exempt Q" LOGIN;
 CREATE ROLE regress_exempt_u LOGIN;
 CREATE ROLE "Regress_Exempt_U" LOGIN;
-ALTER SYSTEM SET pg_pass_policy.exempt_roles = 'Postgres, "Regress_Exempt Q" , REGRESS_EXEMPT_U';
+ALTER SYSTEM SET pg_pass_policy.exempt_roles = ' a , b ,Postgres, "App User", "x""y", "Regress_Exempt Q" , REGRESS_EXEMPT_U';
 SELECT pg_reload_conf();
  pg_reload_conf 
 ----------------
  t
 (1 row)
 
-SELECT pg_sleep(0.5);
- pg_sleep 
-----------
- 
+\set ECHO none
+SHOW pg_pass_policy.exempt_roles;
+                         pg_pass_policy.exempt_roles                         
+-----------------------------------------------------------------------------
+  a , b ,Postgres, "App User", "x""y", "Regress_Exempt Q" , REGRESS_EXEMPT_U
 (1 row)
 
-SHOW pg_pass_policy.exempt_roles;
-           pg_pass_policy.exempt_roles           
--------------------------------------------------
- Postgres, "Regress_Exempt Q" , REGRESS_EXEMPT_U
+SELECT c AS candidate, pass_policy._is_exempt(c) AS exempt
+  FROM unnest(ARRAY['a', 'b', ' a ', 'A', 'postgres', 'Postgres', 'App User', 'app user',
+                    '"App User"', 'x"y', 'x""y']) WITH ORDINALITY AS t(c, n)
+ ORDER BY n;
+ candidate  | exempt 
+------------+--------
+ a          | t
+ b          | t
+  a         | f
+ A          | f
+ postgres   | t
+ Postgres   | f
+ App User   | t
+ app user   | f
+ "App User" | f
+ x"y        | t
+ x""y       | f
+(11 rows)
+
+SELECT pass_policy._is_exempt(NULL) IS NULL AS strict_null;
+ strict_null 
+-------------
+ t
 (1 row)
 
 INSERT INTO ppp_test.secrets VALUES ('exempt_weak', 'exempt-weak');
@@ -618,13 +631,6 @@ SELECT r AS role_name, pass_policy._is_exempt(r) AS sql_exempt,
  regress_exempt_u | t          | t
  Regress_Exempt_U | f          | f
 (3 rows)
-
-SELECT pass_policy._is_exempt('Postgres') AS quoted_case_kept,
-       pass_policy._is_exempt('postgres') AS unquoted_lowered;
- quoted_case_kept | unquoted_lowered 
-------------------+------------------
- f                | t
-(1 row)
 
 -- Rôle exempté : rotate_password() ne pose pas de VALID UNTIL (run_maintenance()
 -- ne le resynchroniserait jamais), il relève seulement une borne passée
@@ -648,6 +654,39 @@ SELECT rolvaliduntil = 'infinity' AS exempt_rotate_unblocked FROM pg_roles WHERE
  t
 (1 row)
 
+-- Rôle exempté dont le mot de passe est changé par un ALTER ROLE direct (le
+-- hook ne l'enregistre pas) : run_maintenance() réconcilie l'historique puis
+-- relève le VALID UNTIL posé par expire_password() (mode unblock), sans
+-- jamais synchroniser (sync) ni signaler l'expiration d'un rôle exempté.
+CREATE TEMP TABLE ex_m0 AS SELECT * FROM pass_policy.run_maintenance();
+SELECT pass_policy.expire_password('regress_exempt_u');
+ expire_password 
+-----------------
+ 
+(1 row)
+
+SELECT rolvaliduntil <= now() AS exempt_blocked FROM pg_roles WHERE rolname = 'regress_exempt_u';
+ exempt_blocked 
+----------------
+ t
+(1 row)
+
+INSERT INTO ppp_test.secrets VALUES ('exempt_direct', 'exempt-direct-change');
+ALTER ROLE regress_exempt_u PASSWORD 'exempt-direct-change';
+SELECT action, details->>'reason' AS reason, details->>'mode' AS mode
+  FROM pass_policy.run_maintenance() WHERE role_name = 'regress_exempt_u' ORDER BY action;
+       action       |        reason        |  mode   
+--------------------+----------------------+---------
+ reconcile          | changed_outside_hook | 
+ valid_until_synced |                      | unblock
+(2 rows)
+
+SELECT rolvaliduntil = 'infinity' AS exempt_direct_unblocked FROM pg_roles WHERE rolname = 'regress_exempt_u';
+ exempt_direct_unblocked 
+-------------------------
+ t
+(1 row)
+
 ALTER SYSTEM RESET pg_pass_policy.exempt_roles;
 SELECT pg_reload_conf();
  pg_reload_conf 
@@ -655,12 +694,7 @@ SELECT pg_reload_conf();
  t
 (1 row)
 
-SELECT pg_sleep(0.5);
- pg_sleep 
-----------
- 
-(1 row)
-
+\set ECHO none
 SHOW pg_pass_policy.exempt_roles;
  pg_pass_policy.exempt_roles 
 -----------------------------

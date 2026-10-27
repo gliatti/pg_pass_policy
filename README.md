@@ -139,6 +139,11 @@ SELECT * FROM pass_policy.worker_status();    -- pid, last_run, last_reload, tra
 changement connue : rôle antérieur à l'extension, ou créé par `CREATE ROLE …
 PASSWORD`, tant que `run_maintenance()` n'a pas créé son état ; la
 réconciliation prend alors la date du jour comme date de changement).
+La dernière colonne, `role_oid`, sert à joindre `pass_policy.role_state` :
+après `ALTER ROLE … RENAME`, `role_state.role_name` garde l'ancien nom
+jusqu'au passage suivant de la maintenance ou au prochain `lock_role()`,
+`unlock_role()` ou `expire_password()` sur ce rôle (`v_locked` joint déjà par
+OID).
 
 ### Verrouillage et déverrouillage
 
@@ -148,8 +153,8 @@ rôle verrouillé est refusé **même avec le bon mot de passe** : le client re�
 `FATAL: role "x" is locked by pg_pass_policy`.
 
 ```sql
-SELECT pass_policy.lock_role('app_user');                              -- manuel, sans fin
-SELECT pass_policy.lock_role('app_user', interval '1 hour', 'incident');
+SELECT pass_policy.lock_role('app_user');                              -- manuel, sans fin : renvoie infinity
+SELECT pass_policy.lock_role('app_user', interval '1 hour', 'incident');  -- renvoie la fin du verrou
 SELECT pass_policy.unlock_role('app_user');                            -- remet aussi le compteur à zéro
 ```
 
@@ -202,7 +207,7 @@ Tous préfixés `pg_pass_policy.`. Contexte `postmaster` = redémarrage ;
 | `manage_valid_until` | bool | `on` | SIGHUP | le worker écrit `pg_authid.rolvaliduntil` |
 | `log_events` | bool | `on` | SIGHUP | une ligne `LOG: pg_pass_policy: …` par événement |
 | `notify_channel` | string | `pg_pass_policy` | SIGHUP | canal `NOTIFY` (charge utile JSON `event`/`role`/`at`/`details`) |
-| `exempt_roles` | liste | `''` | SIGHUP | rôles exemptés de la politique **et** du verrouillage, séparés par des virgules, règles des identifiants SQL : noms non cités mis en minuscules, noms entre guillemets conservés tels quels (`'postgres, "App User"'`). `rotate_password()` et `switch_rotation_pair()` ne posent pas de `VALID UNTIL` sur un rôle exempté (ils relèvent seulement une borne déjà passée) |
+| `exempt_roles` | liste | `''` | SIGHUP | rôles exemptés de la politique **et** du verrouillage, séparés par des virgules, règles des identifiants SQL : noms non cités mis en minuscules, noms entre guillemets conservés tels quels (`'postgres, "App User"'`). `rotate_password()`, `switch_rotation_pair()` et `run_maintenance()` ne posent pas de `VALID UNTIL` sur un rôle exempté : ils relèvent seulement une borne déjà passée (pour `run_maintenance()` : une borne posée par l'extension, `expire_password()` par exemple, une fois le mot de passe changé) |
 | `superuser_bypass` | bool | `off` | SIGHUP | `on` : les superutilisateurs échappent à la complexité (pas à l'historique) |
 | `require_scram` | bool | `on` | SIGHUP | refuse les mots de passe MD5 (`PPP-002`) |
 | `enforce_database` | bool | `on` | SIGHUP | hors de `database`, `ALTER ROLE … PASSWORD` est refusé (`PPP-003`) ; `off` : accepté sans contrôle avec un `WARNING` |

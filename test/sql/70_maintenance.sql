@@ -121,9 +121,20 @@ CREATE ROLE regress_alice LOGIN;
 ALTER ROLE regress_alice PASSWORD 'Alice-Rename#2024';
 INSERT INTO ppp_test.secrets VALUES ('alice', 'Alice-Rename#2024');
 SELECT pass_policy.assign_profile('regress_alice', 'p_never');
-SELECT pass_policy.lock_role('regress_alice', NULL, 'rename test');
+SELECT pass_policy.lock_role('regress_alice', NULL, 'rename test') = 'infinity' AS locked;
 ALTER ROLE regress_alice RENAME TO regress_bob;
 CREATE ROLE regress_alice LOGIN;
+-- Avant run_maintenance() : role_state.role_name porte encore l'ancien nom,
+-- v_locked joint role_state par OID (role_oid exposé par v_role_status) et
+-- affiche l'origine et le motif du verrou sous le nouveau nom
+SELECT s.role_name AS stale_name FROM pass_policy.role_state s
+ WHERE s.role_oid = 'regress_bob'::regrole::oid;
+-- (regress_alice n'est pas affiché : la mémoire partagée, indexée par nom,
+-- peut garder le verrou sous l'ancien nom jusqu'au rechargement du worker)
+SELECT role_name, locked_by, lock_reason FROM pass_policy.v_locked
+ WHERE role_name = 'regress_bob';
+SELECT role_oid = 'regress_bob'::regrole::oid AS status_oid_ok
+  FROM pass_policy.v_role_status WHERE role_name = 'regress_bob';
 CREATE TEMP TABLE m_rename AS SELECT * FROM pass_policy.run_maintenance();
 SELECT count(*) AS remapped FROM m_rename WHERE action = 'remap';
 SELECT s.role_name, s.locked_until = 'infinity' AS locked, s.role_oid = 'regress_bob'::regrole::oid AS oid_ok
@@ -138,6 +149,50 @@ SELECT h.role_name, count(*) AS history_rows,
  GROUP BY 1 ORDER BY 1;
 SELECT pass_policy.unlock_role('regress_bob');
 SELECT pass_policy.unassign_profile('regress_bob');
+
+-- lock_role(), unlock_role() et expire_password() rafraîchissent
+-- role_state.role_name (nom courant) sans attendre run_maintenance()
+CREATE ROLE regress_ren1 LOGIN;
+SELECT pass_policy.lock_role('regress_ren1', interval '1 hour') IS NOT NULL AS locked;
+ALTER ROLE regress_ren1 RENAME TO regress_ren2;
+SELECT pass_policy.unlock_role('regress_ren2');
+SELECT role_name AS after_unlock FROM pass_policy.role_state WHERE role_oid = 'regress_ren2'::regrole::oid;
+ALTER ROLE regress_ren2 RENAME TO regress_ren3;
+SELECT pass_policy.lock_role('regress_ren3', interval '1 hour') IS NOT NULL AS locked;
+SELECT role_name AS after_lock FROM pass_policy.role_state WHERE role_oid = 'regress_ren3'::regrole::oid;
+ALTER ROLE regress_ren3 RENAME TO regress_ren4;
+SELECT pass_policy.expire_password('regress_ren4');
+SELECT role_name AS after_expire FROM pass_policy.role_state WHERE role_oid = 'regress_ren4'::regrole::oid;
+SELECT pass_policy.unlock_role('regress_ren4');
+
+-- Déverrouillage automatique (étape f) d'un rôle renommé : le verrou en
+-- mémoire partagée (indexée par nom) et l'audit portent le nom courant.
+CREATE ROLE regress_carol LOGIN;
+SELECT pass_policy.lock_role('regress_carol', interval '3 seconds', 'rename auto unlock')
+       = now() + interval '3 seconds' AS lock_returned;
+ALTER ROLE regress_carol RENAME TO regress_dave;
+-- le worker (réveillé par shmem_reload()) réinjecte le verrou sous le nouveau
+-- nom ; attente bornée à 5 s, une instruction par tour
+SELECT pass_policy.shmem_reload();
+\set ECHO none
+\o /dev/null
+SELECT 'SELECT pg_sleep(0.1) WHERE NOT EXISTS (SELECT FROM pass_policy.failed_attempts() '
+       'WHERE role_name = ''regress_dave'' AND locked_until > now())'
+  FROM generate_series(1, 50) \gexec
+\o
+\set ECHO all
+SELECT count(*) AS dave_locked_in_shmem FROM pass_policy.failed_attempts()
+ WHERE role_name = 'regress_dave' AND locked_until > now();
+SELECT pg_sleep(3.5);
+CREATE TEMP TABLE m_unlock AS SELECT * FROM pass_policy.run_maintenance();
+SELECT action, role_name FROM m_unlock
+ WHERE action = 'role_unlocked' AND role_name IN ('regress_carol', 'regress_dave');
+SELECT role_name, details->>'by' AS by FROM pass_policy.audit_log
+ WHERE event_type = 'role_unlocked' AND role_name IN ('regress_carol', 'regress_dave');
+SELECT count(*) AS dave_lock_left FROM pass_policy.failed_attempts()
+ WHERE role_name = 'regress_dave' AND locked_until IS NOT NULL;
+SELECT role_name, locked_until IS NULL AS unlocked FROM pass_policy.role_state
+ WHERE role_oid = 'regress_dave'::regrole::oid;
 
 -- Réconciliation 1 : rôle dont le mot de passe a été posé avant CREATE EXTENSION
 -- (regress_legacy, créé dans 00_setup, statut unknown vérifié dans 00_setup).

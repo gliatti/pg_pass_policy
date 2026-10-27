@@ -110,6 +110,28 @@ SELECT ppp_test.try($$CREATE ROLE regress_born LOGIN PASSWORD 'Born-Pass#2024ab'
 SELECT ppp_test.try($$CREATE ROLE regress_born LOGIN PASSWORD 'Born-Pass#2024ab-2'$$) AS born_other_password;
 INSERT INTO ppp_test.secrets VALUES ('born2', 'Born-Pass#2024ab-2');
 
+-- CREATE ROLE … PASSWORD puis ALTER ROLE, sans run_maintenance() entre les
+-- deux (worker_interval = 0 : le worker ne rattache pas les OID) : pour un
+-- rôle existant, la ligne sans OID écrite par CREATE ROLE (cherchée par nom)
+-- est comparée avec celles de son OID (PPP-031)…
+INSERT INTO ppp_test.secrets VALUES ('fresh_a', 'Fresh-Pass#2024aa'), ('fresh_b', 'Fresh-Pass#2024bb'),
+                                    ('fresh2_a', 'Fresh2-Pass#2024a'), ('fresh2_b', 'Fresh2-Pass#2024b');
+CREATE ROLE regress_fresh LOGIN PASSWORD 'Fresh-Pass#2024aa';
+ALTER ROLE regress_fresh PASSWORD 'Fresh-Pass#2024bb';
+SELECT count(*) FILTER (WHERE role_oid IS NULL) AS unmapped_rows,
+       count(*) FILTER (WHERE role_oid = 'regress_fresh'::regrole::oid) AS oid_rows
+  FROM pass_policy.password_history WHERE role_name = 'regress_fresh';
+SELECT ppp_test.try($$ALTER ROLE regress_fresh PASSWORD 'Fresh-Pass#2024aa'$$) AS fresh_reuse_create_password;
+SELECT ppp_test.code(pass_policy.check_password('regress_fresh', 'Fresh-Pass#2024aa')) AS fresh_check;
+-- … et min_age compte depuis cette ligne tant que role_state n'existe pas
+-- (profil default : min_age = 1 day ; le rôle change lui-même son mot de passe)
+CREATE ROLE regress_fresh2 LOGIN PASSWORD 'Fresh2-Pass#2024a';
+SELECT count(*) AS fresh2_state_rows FROM pass_policy.role_state
+ WHERE role_oid = 'regress_fresh2'::regrole::oid;
+SET SESSION AUTHORIZATION regress_fresh2;
+SELECT ppp_test.try($$ALTER ROLE regress_fresh2 PASSWORD 'Fresh2-Pass#2024b'$$) AS fresh2_min_age;
+RESET SESSION AUTHORIZATION;
+
 -- Jamais de clair : aucun vérificateur ne contient un mot de passe de test
 SELECT bool_and(verifier LIKE 'SCRAM-SHA-256$%') AS all_scram,
        count(*) FILTER (WHERE verifier !~ '^SCRAM-SHA-256\$[0-9]+:[A-Za-z0-9+/=]+\$[A-Za-z0-9+/=]+:[A-Za-z0-9+/=]+$') AS malformed

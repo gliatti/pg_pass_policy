@@ -65,6 +65,7 @@ static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 void		_PG_init(void);
 
 PG_FUNCTION_INFO_V1(ppp_worker_status);
+PG_FUNCTION_INFO_V1(ppp_is_exempt);
 
 
 /*
@@ -240,7 +241,7 @@ ppp_assign_exempt_roles(const char *newval, void *extra)
  * The list follows the SQL identifier rules of SplitIdentifierString():
  * unquoted names are down-cased, double-quoted names keep their case.  The
  * comparison with the role name is then exact.  pass_policy._is_exempt()
- * implements the same rules in SQL.
+ * is a SQL wrapper of this very function (ppp_is_exempt()).
  *
  * Safe to call from the ClientAuthentication hook (no catalog access).
  */
@@ -289,6 +290,23 @@ ppp_role_is_exempt(const char *rolename)
 	list_free(elemlist);
 	pfree(rawstring);
 	return result;
+}
+
+/*
+ * pass_policy._is_exempt(role text) RETURNS bool (STRICT, STABLE)
+ *
+ * SQL access to ppp_role_is_exempt(), used by run_maintenance(),
+ * rotate_password() and switch_rotation_pair(): SQL and C hooks share one
+ * implementation of the parsing of pg_pass_policy.exempt_roles.
+ */
+Datum
+ppp_is_exempt(PG_FUNCTION_ARGS)
+{
+	char	   *rolename = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	bool		result = ppp_role_is_exempt(rolename);
+
+	pfree(rolename);
+	PG_RETURN_BOOL(result);
 }
 
 /*

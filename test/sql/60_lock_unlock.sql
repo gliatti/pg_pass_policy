@@ -9,8 +9,9 @@ SET client_min_messages = warning;
 
 CREATE ROLE regress_lock LOGIN;
 
--- Verrou manuel (durée NULL) : locked_until = infinity, locked_by = manual
-SELECT pass_policy.lock_role('regress_lock', NULL, 'regression test');
+-- Verrou manuel (durée NULL) : locked_until = infinity, locked_by = manual ;
+-- lock_role() renvoie le locked_until posé
+SELECT pass_policy.lock_role('regress_lock', NULL, 'regression test') = 'infinity' AS returned_infinity;
 SELECT locked_until = 'infinity' AS infinite, locked_by, lock_reason
   FROM pass_policy.role_state WHERE role_name = 'regress_lock';
 SELECT role_name FROM pass_policy.v_locked WHERE role_name = 'regress_lock';
@@ -41,7 +42,8 @@ SELECT count(*) > 0 AS unlock_audited FROM pass_policy.audit_log
 SELECT ppp_test.try($$SELECT pass_policy.unlock_role('regress_lock')$$) AS unlock_again;
 
 -- Verrou temporaire (1 seconde), levé par run_maintenance après expiration
-SELECT pass_policy.lock_role('regress_lock', interval '1 second', 'short lock');
+SELECT pass_policy.lock_role('regress_lock', interval '1 second', 'short lock')
+       = now() + interval '1 second' AS returned_until;
 SELECT locked_until > now() AND locked_until <= now() + interval '2 seconds' AS bounded
   FROM pass_policy.role_state WHERE role_name = 'regress_lock';
 SELECT role_name FROM pass_policy.v_locked WHERE role_name = 'regress_lock';

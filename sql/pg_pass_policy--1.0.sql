@@ -469,102 +469,17 @@ $$;
 COMMENT ON FUNCTION _guc_on(text, bool) IS 'Internal: reads a boolean GUC, with a default when it is undefined';
 
 /*
- * Same rules as SplitIdentifierString(), used by ppp_role_is_exempt() in C:
- * names separated by commas, whitespace (space, tab, CR, LF, FF) around
- * them ignored, unquoted names down-cased (ASCII letters, as
- * downcase_truncate_identifier() does in a multi-byte encoding) and ending
- * at whitespace or a comma, "quoted" names kept as is with "" standing for
- * one double quote, names truncated to 63 bytes.  Returns NULL when the
- * syntax is invalid (the GUC check hook rejects such values anyway).
+ * Addition to SPEC §4: SQL access to ppp_role_is_exempt() (C), so that the
+ * SQL side and the C hooks share a single parsing of
+ * pg_pass_policy.exempt_roles (SplitIdentifierString() rules, list split
+ * once by the GUC assign hook).  STABLE: the GUC is SIGHUP and only changes
+ * between statements.
  */
-CREATE FUNCTION _split_identifiers(p_list text)
-RETURNS text[]
-LANGUAGE plpgsql IMMUTABLE
-SET search_path = pg_catalog, pg_temp
-AS $$
-DECLARE
-    v_ws     constant text := E' \t\n\r\f';
-    v_len    int := length(coalesce(p_list, ''));
-    v_pos    int := 1;
-    v_start  int;
-    v_name   text;
-    v_result text[] := '{}';
-BEGIN
-    -- leading whitespace; an empty (or blank) list is valid
-    WHILE v_pos <= v_len AND strpos(v_ws, substr(p_list, v_pos, 1)) > 0 LOOP
-        v_pos := v_pos + 1;
-    END LOOP;
-    IF v_pos > v_len THEN
-        RETURN v_result;
-    END IF;
-    LOOP
-        IF substr(p_list, v_pos, 1) = '"' THEN
-            -- quoted name: "" collapses to ", no down-casing
-            v_name := '';
-            v_pos := v_pos + 1;
-            LOOP
-                IF v_pos > v_len THEN
-                    RETURN NULL;                        -- mismatched quotes
-                END IF;
-                IF substr(p_list, v_pos, 1) = '"' THEN
-                    IF substr(p_list, v_pos + 1, 1) = '"' THEN
-                        v_name := v_name || '"';
-                        v_pos := v_pos + 2;
-                    ELSE
-                        v_pos := v_pos + 1;
-                        EXIT;
-                    END IF;
-                ELSE
-                    v_name := v_name || substr(p_list, v_pos, 1);
-                    v_pos := v_pos + 1;
-                END IF;
-            END LOOP;
-        ELSE
-            -- unquoted name: up to a comma or whitespace, ASCII down-cased
-            v_start := v_pos;
-            WHILE v_pos <= v_len AND substr(p_list, v_pos, 1) <> ','
-                  AND strpos(v_ws, substr(p_list, v_pos, 1)) = 0 LOOP
-                v_pos := v_pos + 1;
-            END LOOP;
-            IF v_pos = v_start THEN
-                RETURN NULL;                            -- empty unquoted name
-            END IF;
-            v_name := translate(substr(p_list, v_start, v_pos - v_start),
-                                'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz');
-        END IF;
-        -- trailing whitespace, then a comma or the end
-        WHILE v_pos <= v_len AND strpos(v_ws, substr(p_list, v_pos, 1)) > 0 LOOP
-            v_pos := v_pos + 1;
-        END LOOP;
-        -- truncate_identifier(): at most NAMEDATALEN - 1 bytes, whole characters
-        WHILE octet_length(v_name) > 63 LOOP
-            v_name := left(v_name, -1);
-        END LOOP;
-        v_result := v_result || v_name;
-        IF v_pos > v_len THEN
-            RETURN v_result;
-        END IF;
-        IF substr(p_list, v_pos, 1) <> ',' THEN
-            RETURN NULL;                                -- invalid syntax
-        END IF;
-        v_pos := v_pos + 1;
-        WHILE v_pos <= v_len AND strpos(v_ws, substr(p_list, v_pos, 1)) > 0 LOOP
-            v_pos := v_pos + 1;
-        END LOOP;
-    END LOOP;
-END
-$$;
-COMMENT ON FUNCTION _split_identifiers(text) IS 'Internal: splits a comma-separated identifier list like SplitIdentifierString() (NULL if invalid)';
-
 CREATE FUNCTION _is_exempt(p_role text)
 RETURNS bool
-LANGUAGE sql STABLE
-SET search_path = pg_catalog, pg_temp
-AS $$
-    SELECT coalesce(p_role = ANY (pass_policy._split_identifiers(
-               current_setting('pg_pass_policy.exempt_roles', true))), false)
-$$;
-COMMENT ON FUNCTION _is_exempt(text) IS 'Internal: true if the role is listed in pass_policy.exempt_roles (same parsing as the C hooks)';
+AS 'MODULE_PATHNAME', 'ppp_is_exempt'
+LANGUAGE C STABLE STRICT;
+COMMENT ON FUNCTION _is_exempt(text) IS 'Internal: true if the role is listed in pg_pass_policy.exempt_roles (same function as the C hooks)';
 
 -- Calls to the C shared-memory functions must never break maintenance or
 -- administration when the library/worker is unavailable: errors become WARNINGs.
@@ -893,17 +808,19 @@ END
 $$;
 COMMENT ON FUNCTION _ensure_recorded(name) IS 'Internal: records a password change if the C hook did not';
 
--- Creates the role_state row of an existing role if missing.
+-- Creates the role_state row of an existing role if missing, and refreshes
+-- its role_name (stale after ALTER ROLE ... RENAME until run_maintenance()).
 CREATE FUNCTION _ensure_state(p_oid oid)
 RETURNS void
 LANGUAGE sql
 SET search_path = pg_catalog, pg_temp
 AS $$
-    INSERT INTO pass_policy.role_state (role_oid, role_name)
+    INSERT INTO pass_policy.role_state AS s (role_oid, role_name)
     SELECT a.oid, a.rolname FROM pg_catalog.pg_authid a WHERE a.oid = p_oid
-    ON CONFLICT (role_oid) DO NOTHING
+    ON CONFLICT (role_oid) DO UPDATE SET role_name = EXCLUDED.role_name
+     WHERE s.role_name IS DISTINCT FROM EXCLUDED.role_name
 $$;
-COMMENT ON FUNCTION _ensure_state(oid) IS 'Internal: creates the role_state row of a role if missing';
+COMMENT ON FUNCTION _ensure_state(oid) IS 'Internal: creates the role_state row of a role if missing, refreshes its role_name';
 
 -- Validates a jsonb settings object and applies it to a profile.
 CREATE FUNCTION _apply_profile_settings(p_profile_id int, p_settings jsonb)
@@ -1189,9 +1106,10 @@ BEGIN
     PERFORM pass_policy._ensure_recorded(v_role);
 
     PERFORM pass_policy._refresh_role_state(v_oid);
-    -- an exempt role is skipped by run_maintenance() step d: a VALID UNTIL
-    -- written here would never be synchronised again, so only a past one is
-    -- lifted ('unblock'), as with manage_valid_until = off
+    -- run_maintenance() step d never synchronises an exempt role (it only
+    -- lifts a past VALID UNTIL, 'unblock'): a VALID UNTIL written here would
+    -- never be updated again, so only a past one is lifted, as with
+    -- manage_valid_until = off
     v_vu := pass_policy._apply_valid_until(v_oid,
               CASE WHEN pass_policy._guc_on('pg_pass_policy.manage_valid_until', true)
                         AND NOT pass_policy._is_exempt(v_role)
@@ -1218,6 +1136,7 @@ DECLARE
 BEGIN
     PERFORM pass_policy._require_admin();
     v_oid := pass_policy._require_target_allowed(v_role);
+    -- also refreshes role_state.role_name (current name, after a rename)
     PERFORM pass_policy._ensure_state(v_oid);
     UPDATE pass_policy.role_state s
        SET must_change = true, expires_at = v_now, grace_until = v_now,
@@ -1230,8 +1149,9 @@ END
 $$;
 COMMENT ON FUNCTION expire_password(name) IS 'Forces the expiry of a role password now (must_change, VALID UNTIL now())';
 
+-- Returns the locked_until written to role_state ('infinity' = manual lock).
 CREATE FUNCTION lock_role(role name, duration interval DEFAULT NULL, reason text DEFAULT NULL)
-RETURNS void
+RETURNS timestamptz
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
 AS $$
@@ -1247,6 +1167,7 @@ BEGIN
               USING ERRCODE = 'invalid_parameter_value';
     END IF;
     v_until := CASE WHEN $2 IS NULL THEN 'infinity'::timestamptz ELSE now() + $2 END;
+    -- also refreshes role_state.role_name (current name, after a rename)
     PERFORM pass_policy._ensure_state(v_oid);
     UPDATE pass_policy.role_state s
        SET locked_until = v_until, locked_by = 'manual', lock_reason = $3
@@ -1254,9 +1175,10 @@ BEGIN
     PERFORM pass_policy._shmem('lock', v_role::text, CASE WHEN $2 IS NULL THEN NULL ELSE v_until END);
     PERFORM pass_policy._audit('role_locked', v_role,
             jsonb_build_object('by', 'manual', 'until', v_until, 'reason', $3));
+    RETURN v_until;
 END
 $$;
-COMMENT ON FUNCTION lock_role(name, interval, text) IS 'Locks a role (NULL duration = until unlock_role)';
+COMMENT ON FUNCTION lock_role(name, interval, text) IS 'Locks a role (NULL duration = until unlock_role); returns locked_until (infinity = manual)';
 
 CREATE FUNCTION unlock_role(role name)
 RETURNS void
@@ -1269,8 +1191,9 @@ DECLARE
 BEGIN
     PERFORM pass_policy._require_admin();
     v_oid := pass_policy._require_target_allowed(v_role);
+    -- v_role is the current name (looked up in pg_authid): refreshed here too
     UPDATE pass_policy.role_state s
-       SET locked_until = NULL, locked_by = NULL, lock_reason = NULL
+       SET locked_until = NULL, locked_by = NULL, lock_reason = NULL, role_name = v_role
      WHERE s.role_oid = v_oid;
     PERFORM pass_policy._shmem('unlock', v_role::text);
     PERFORM pass_policy._shmem('reset', v_role::text);
@@ -1456,11 +1379,12 @@ COMMENT ON FUNCTION switch_rotation_pair(text, int) IS 'Rotates a pair: new pass
  *  b.  reconcile pg_authid.rolpassword with the history ;
  *  c.  recompute expires_at / grace_until ;
  *  d.  VALID UNTIL synchronisation (pass_policy.manage_valid_until); when
- *      it is off, only lifts a VALID UNTIL in the past that the extension
- *      wrote itself (expire_password, former sync) once the password has
- *      been changed ('unblock') ;
- *  e.  expiry_warning (max once a day) / password_expired (once) ;
- *  f.  automatic unlock of expired locks ;
+ *      it is off, and always for an exempt role, only lifts a VALID UNTIL
+ *      in the past that the extension wrote itself (expire_password, former
+ *      sync) once the password has been changed ('unblock') ;
+ *  e.  expiry_warning (max once a day) / password_expired (once), except
+ *      for exempt roles ;
+ *  f.  automatic unlock of expired locks (current role name) ;
  *  g.  'maintenance' audit row only if something was done ;
  *  h.  shmem_reload() is ALWAYS called: the worker decides whether anything
  *      changed (simpler and cheap; no extra bookkeeping in SQL).
@@ -1478,6 +1402,7 @@ DECLARE
     v_n        int;
     v_summary  jsonb := '{}';
     v_actions  int := 0;
+    v_exempt   oid[];
 BEGIN
     PERFORM pass_policy._require_admin();
     -- step b updates password_history.verifier with pg_authid.rolpassword:
@@ -1659,19 +1584,28 @@ BEGIN
     END IF;
 
     ---------------------------------------------------------------- d
-    -- manage_valid_until = off: only roles whose current VALID UNTIL was
-    -- written by the extension (= valid_until_synced) and whose password has
-    -- been changed since (must_change cleared) are considered, in 'unblock'
-    -- mode (rewrites only a VALID UNTIL already in the past).
+    -- Exempt login roles, evaluated once per pass (steps d and e).
+    v_exempt := ARRAY(SELECT a.oid FROM pg_catalog.pg_authid a
+                       WHERE a.rolcanlogin AND pass_policy._is_exempt(a.rolname));
+    -- 'sync' only when the extension manages VALID UNTIL for the role
+    -- (manage_valid_until = on, role not exempt).  Otherwise only roles whose
+    -- current VALID UNTIL was written by the extension (= valid_until_synced:
+    -- expire_password, former sync) and whose password has been changed
+    -- since (must_change cleared) are considered, in 'unblock' mode
+    -- (rewrites only a VALID UNTIL already in the past).  Exempt roles are
+    -- kept for 'unblock', as in rotate_password(): their password may be
+    -- changed by a plain ALTER ROLE, which the hook does not record.
     FOR r IN
-        SELECT s.role_oid, s.role_name AS rname
+        SELECT s.role_oid, a.rolname::text AS rname,
+               v_manage AND NOT x.exempt AS do_sync
           FROM pass_policy.role_state s
           JOIN pg_catalog.pg_authid a ON a.oid = s.role_oid
-         WHERE a.rolcanlogin AND NOT pass_policy._is_exempt(a.rolname)
-           AND (v_manage
+         CROSS JOIN LATERAL (SELECT a.oid = ANY (v_exempt) AS exempt) x
+         WHERE a.rolcanlogin
+           AND ((v_manage AND NOT x.exempt)
                 OR (NOT s.must_change AND a.rolvaliduntil IS NOT DISTINCT FROM s.valid_until_synced))
     LOOP
-        v_res := pass_policy._apply_valid_until(r.role_oid, CASE WHEN v_manage THEN 'sync' ELSE 'unblock' END);
+        v_res := pass_policy._apply_valid_until(r.role_oid, CASE WHEN r.do_sync THEN 'sync' ELSE 'unblock' END);
         IF v_res IS NOT NULL THEN
             PERFORM pass_policy._audit('valid_until_synced', r.rname, v_res);
             action := 'valid_until_synced'; role_name := r.rname; details := v_res;
@@ -1688,7 +1622,7 @@ BEGIN
           JOIN pass_policy._role_effective_profile e ON e.role_oid = s.role_oid
           JOIN pg_catalog.pg_authid a ON a.oid = s.role_oid
          WHERE s.expires_at IS NOT NULL AND a.rolcanlogin
-           AND NOT pass_policy._is_exempt(a.rolname)
+           AND NOT (a.oid = ANY (v_exempt))
     LOOP
         IF now() >= r.expires_at THEN
             IF r.last_warned_at IS NULL OR r.last_warned_at < r.expires_at THEN
@@ -1713,11 +1647,17 @@ BEGIN
     END LOOP;
 
     ---------------------------------------------------------------- f
+    -- The shared memory is keyed by the current role name: taken from
+    -- pg_authid (role_state.role_name is refreshed by step a0 too, but the
+    -- name used for the unlock and the audit must never be a stale one).
+    -- Rows of dropped roles were purged by step a.
     FOR r IN
         UPDATE pass_policy.role_state s
-           SET locked_until = NULL, locked_by = NULL, lock_reason = NULL
-         WHERE s.locked_until < now()
-        RETURNING s.role_name AS rname
+           SET locked_until = NULL, locked_by = NULL, lock_reason = NULL,
+               role_name = a.rolname
+          FROM pg_catalog.pg_authid a
+         WHERE a.oid = s.role_oid AND s.locked_until < now()
+        RETURNING a.rolname::text AS rname
     LOOP
         PERFORM pass_policy._shmem('unlock', r.rname);
         PERFORM pass_policy._audit('role_unlocked', r.rname, '{"by":"auto"}');
@@ -1757,8 +1697,9 @@ SELECT q.role_name, q.profile, q.password_changed_at, q.expires_at, q.grace_unti
            WHEN now() >= q.expires_at                          THEN 'grace'
            WHEN q.expires_at - now() < q.warn_before           THEN 'warning'
            ELSE 'ok'
-       END AS status
-  FROM (SELECT r.rolname::text AS role_name, e.name AS profile, e.max_age, e.warn_before,
+       END AS status,
+       q.role_oid
+  FROM (SELECT r.oid AS role_oid, r.rolname::text AS role_name, e.name AS profile, e.max_age, e.warn_before,
                s.password_changed_at, coalesce(s.must_change, false) AS must_change,
                CASE WHEN s.must_change THEN s.expires_at
                     ELSE s.password_changed_at + e.max_age END AS expires_at,
@@ -1771,16 +1712,18 @@ SELECT q.role_name, q.profile, q.password_changed_at, q.expires_at, q.grace_unti
           LEFT JOIN role_state s ON s.role_oid = r.oid
           LEFT JOIN failed_attempts() f ON f.role_name = r.rolname
          WHERE r.rolcanlogin) q;
-COMMENT ON VIEW v_role_status IS 'Password and lock status of every login role';
+COMMENT ON VIEW v_role_status IS 'Password and lock status of every login role (role_oid: join key for role_state)';
 
 CREATE VIEW v_expiring AS
 SELECT * FROM v_role_status WHERE status IN ('warning', 'grace', 'expired');
 COMMENT ON VIEW v_expiring IS 'Login roles whose password is about to expire, in grace period or expired';
 
+-- Joined by OID: role_state.role_name may still hold the former name after
+-- ALTER ROLE ... RENAME (until run_maintenance() or the next lock_role()).
 CREATE VIEW v_locked AS
 SELECT v.role_name, v.locked_until, s.locked_by, s.lock_reason, v.failed_count
   FROM v_role_status v
-  LEFT JOIN role_state s ON s.role_name = v.role_name
+  LEFT JOIN role_state s ON s.role_oid = v.role_oid
  WHERE v.status = 'locked';
 COMMENT ON VIEW v_locked IS 'Currently locked roles';
 
