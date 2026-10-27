@@ -10,7 +10,7 @@ from psycopg import Connection
 from starlette.datastructures import FormData
 
 from app import db
-from app.templating import redirect_to, render
+from app.templating import is_hx, redirect_to, render
 
 router = APIRouter(prefix="/profiles")
 
@@ -119,11 +119,7 @@ def _form_response(
     notice: str | None = None,
 ) -> Response:
     """The form fragment for htmx, the full page for a plain form post."""
-    template = (
-        "profiles/_form.html"
-        if request.headers.get("hx-request") == "true"
-        else "profiles/form.html"
-    )
+    template = "profiles/_form.html" if is_hx(request) else "profiles/form.html"
     context = {
         "profile": profile,
         "values": values,
@@ -241,5 +237,10 @@ def profile_update(request: Request, name: str, form: FormData = FORM, conn: Con
 def profile_delete(request: Request, name: str, conn: Connection = db.CONN):
     _, error = db.run_action(conn, db.drop_profile, name)
     if error is not None:
-        return render(request, "_alert.html", {"error": error}, 422)
+        if is_hx(request):
+            # swapped into the alert area of the profile list
+            return render(request, "_alert.html", {"error": error}, 422)
+        # a plain form post (no JavaScript): the full error page of main.py,
+        # not a bare fragment (nothing was changed: the action rolled back)
+        raise HTTPException(status_code=422, detail=error)
     return redirect_to(request, "profiles")

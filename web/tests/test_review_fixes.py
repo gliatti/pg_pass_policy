@@ -78,7 +78,7 @@ def test_active_nav_and_links_behind_root_path(prefixed_client):
     assert response.status_code == 404
     assert '<a href="/pgpp/roles" class="active">Roles</a>' in response.text
     assert '<a href="/pgpp/" class="active">' not in response.text
-    assert 'href="/pgpp/static/app.css"' in response.text
+    assert 'href="/pgpp/static/app.css?v=' in response.text
 
 
 # --- W4: non-ASCII CSRF token -----------------------------------------------------
@@ -196,15 +196,25 @@ class _FakeConn:
     def transaction(self):
         return _FakeTransaction(self)
 
+    message = "pg_pass_policy worker state unavailable"
+
     def execute(self, *args, **kwargs):
-        raise psycopg.errors.ObjectNotInPrerequisiteState(
-            "pg_pass_policy must be loaded via shared_preload_libraries"
-        )
+        raise psycopg.errors.ObjectNotInPrerequisiteState(self.message)
 
 
 def test_worker_status_error_returns_none_inside_a_savepoint():
     conn = _FakeConn()
     assert db.worker_status(conn) is None  # type: ignore[arg-type]
+    assert conn.savepoints == 1 and conn.rolled_back
+
+
+def test_worker_status_not_preloaded_propagates_after_the_savepoint():
+    """The library not preloaded is not "worker not running": the request
+    gets the dedicated page (tests/test_review_round7.py)."""
+    conn = _FakeConn()
+    conn.message = "pg_pass_policy must be loaded via shared_preload_libraries"
+    with pytest.raises(psycopg.errors.ObjectNotInPrerequisiteState):
+        db.worker_status(conn)  # type: ignore[arg-type]
     assert conn.savepoints == 1 and conn.rolled_back
 
 

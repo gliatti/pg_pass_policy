@@ -436,9 +436,15 @@ NOT_PRELOADED_HINT = "Add pg_pass_policy to shared_preload_libraries and restart
 
 @pytest.fixture
 def raising_55000(super_conn):
-    """Functions raising 55000 like the extension does without its shared
-    memory (worker_status()) or without being preloaded (v_role_status)."""
+    """Functions raising 55000: like the extension does without being
+    preloaded (web_t_no_shmem), or for another cause (web_t_other_55000)."""
     from psycopg import sql
+
+    super_conn.execute(
+        "CREATE FUNCTION public.web_t_other_55000() RETURNS SETOF record LANGUAGE plpgsql AS $$"
+        " BEGIN RAISE EXCEPTION 'pg_pass_policy worker state unavailable'"
+        "   USING ERRCODE = 'object_not_in_prerequisite_state'; END $$"
+    )
 
     super_conn.execute(
         sql.SQL(
@@ -451,15 +457,17 @@ def raising_55000(super_conn):
         yield
     finally:
         super_conn.execute("DROP FUNCTION IF EXISTS public.web_t_no_shmem()")
+        super_conn.execute("DROP FUNCTION IF EXISTS public.web_t_other_55000()")
 
 
 def test_worker_status_unavailable(client, monkeypatch, raising_55000):
-    """worker_status() raising 55000 (no shared memory): the pages render
-    the "not running" branch and the rest of the transaction still works."""
+    """worker_status() raising a 55000 of another cause than a missing
+    preload: the pages render the "not running" branch and the rest of the
+    transaction still works."""
     from app import db
 
     monkeypatch.setattr(
-        db, "WORKER_STATUS_SQL", "SELECT * FROM public.web_t_no_shmem() AS t(pid int)"
+        db, "WORKER_STATUS_SQL", "SELECT * FROM public.web_t_other_55000() AS t(pid int)"
     )
     response = client.get("/")
     assert response.status_code == 200, response.text
@@ -471,6 +479,21 @@ def test_worker_status_unavailable(client, monkeypatch, raising_55000):
     token = csrf_token(client, "/maintenance")
     response = client.post("/maintenance/run", headers={"X-CSRF-Token": token})
     assert response.status_code == 200 and "Maintenance completed" in response.text
+
+
+def test_worker_status_not_preloaded_is_the_dedicated_page(client, monkeypatch, raising_55000):
+    """worker_status() raising the "shared memory is not initialized" 55000:
+    /maintenance (whose first query it is) gets the 503 page, not the
+    "worker not running" branch."""
+    from app import db
+
+    monkeypatch.setattr(
+        db, "WORKER_STATUS_SQL", "SELECT * FROM public.web_t_no_shmem() AS t(pid int)"
+    )
+    response = client.get("/maintenance")
+    assert response.status_code == 503, response.text
+    assert "pg_pass_policy is not preloaded</h1>" in response.text
+    assert NOT_PRELOADED_HINT in response.text
 
 
 def test_worker_status_missing_function_is_an_error(client, monkeypatch, caplog):

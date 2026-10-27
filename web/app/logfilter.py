@@ -1,10 +1,12 @@
 """Logging protection: no password may ever reach a log line.
 
-Two layers:
-- a LogRecord factory that masks the arguments and the formatted message
-  as soon as a record is created (covers every logger and handler, including the ones
-  uvicorn configures);
-- a logging.Filter attached to handlers, which also masks `extra` attributes.
+One entry point: a LogRecord factory (install_log_masking()) masks the
+arguments and the formatted message as soon as a record is created.  It
+covers every logger and handler, including the ones uvicorn configures, and
+runs once per record.  The `extra` attributes are set on the record after
+the factory has returned (Logger.makeRecord): they are masked when the
+message is first formatted (MaskedLogRecord.getMessage(), called by every
+Formatter before it reads the record's attributes).
 The application itself never logs a password; this is a safety net.
 """
 
@@ -50,16 +52,26 @@ def mask_value(value: Any) -> Any:
     return value
 
 
+def _mask_extras(record: logging.LogRecord) -> None:
+    for key in list(record.__dict__):
+        if key not in _STANDARD_ATTRS and _KEY_RE.search(key):
+            setattr(record, key, MASK)
+
+
 class PasswordMaskFilter(logging.Filter):
     """Masks any password-like content in a LogRecord (message, args, extras).
 
     The arguments are masked one by one (their types are kept: uvicorn's
-    access formatter unpacks them), then the formatted message is checked:
-    a secret only visible once the template and its arguments are joined
-    ("password=%s" % ("Hunter2",)) replaces the record's message by its
-    masked form, arguments dropped.  The template itself is never masked
-    alone: "password=%s" would become "password=***" with its argument left
-    over, and the line would be lost to a formatting TypeError."""
+    access formatter unpacks its five arguments), then the formatted message
+    is checked: a secret only visible once the template and its arguments
+    are joined ("password=%s" % ("Hunter2",), or "token:" in a path followed
+    by the HTTP version) replaces the template by the masked message, its
+    '%' escaped and followed by one "%.0s" per argument.  The arguments stay
+    in place (same number, a formatter may unpack them) and each one
+    formats to nothing: getMessage() gives the masked message.  The template
+    itself is never masked alone: "password=%s" would become "password=***"
+    with its argument left over, and the line would be lost to a formatting
+    TypeError."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         if not isinstance(record.msg, str):
@@ -75,11 +87,30 @@ class PasswordMaskFilter(logging.Filter):
         else:
             masked = mask_text(message)
             if masked != message:
-                record.msg, record.args = masked, ()
-        for key in list(record.__dict__):
-            if key not in _STANDARD_ATTRS and _KEY_RE.search(key):
-                setattr(record, key, MASK)
+                record.msg = _template_for(masked, record.args)
+        _mask_extras(record)
         return True
+
+
+def _template_for(message: str, args: Any) -> str:
+    """A template giving `message` once formatted with `args`, whatever they are."""
+    if not args:
+        # getMessage() does not format a record without arguments
+        return message
+    template = message.replace("%", "%%")
+    if isinstance(args, tuple):
+        # "%.0s": any value, formatted with a zero precision (empty string)
+        template += "%.0s" * len(args)
+    # a mapping (logging's single-dict form) or no argument: nothing consumed
+    return template
+
+
+class MaskedLogRecord(logging.LogRecord):
+    """A LogRecord masking its `extra` attributes before being formatted."""
+
+    def getMessage(self) -> str:
+        _mask_extras(self)
+        return super().getMessage()
 
 
 _FILTER = PasswordMaskFilter()
@@ -87,29 +118,22 @@ _installed = False
 
 
 def install_log_masking() -> None:
-    """Install the masking record factory (once) and the filter on known handlers."""
+    """Install the masking record factory, once."""
     global _installed
-    if not _installed:
-        previous = logging.getLogRecordFactory()
+    if _installed:
+        return
+    previous = logging.getLogRecordFactory()
 
-        def factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
-            record = previous(*args, **kwargs)
-            _FILTER.filter(record)
-            return record
+    def factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
+        record = previous(*args, **kwargs)
+        if type(record) is logging.LogRecord:
+            record.__class__ = MaskedLogRecord
+        _FILTER.filter(record)
+        return record
 
-        logging.setLogRecordFactory(factory)
-        _installed = True
-    for name in (None, "uvicorn", "uvicorn.access", "uvicorn.error", "pgpp_web"):
-        logger = logging.getLogger(name)
-        if _FILTER not in logger.filters:
-            logger.addFilter(_FILTER)
-        for handler in logger.handlers:
-            if _FILTER not in handler.filters:
-                handler.addFilter(_FILTER)
+    logging.setLogRecordFactory(factory)
+    _installed = True
 
 
 def get_logger(name: str) -> logging.Logger:
-    logger = logging.getLogger(f"pgpp_web.{name}")
-    if _FILTER not in logger.filters:
-        logger.addFilter(_FILTER)
-    return logger
+    return logging.getLogger(f"pgpp_web.{name}")

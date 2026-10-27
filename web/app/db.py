@@ -289,21 +289,24 @@ WORKER_STATUS_SQL = (
 
 
 def worker_status(conn: Connection) -> dict[str, Any] | None:
-    """The worker state, or None when the worker is not running.
+    """The worker state, or None when it cannot be read.
 
-    worker_status() raises ObjectNotInPrerequisiteState (55000) when the
-    shared memory is missing: the dashboard shows "worker not running"
-    instead of failing, the savepoint keeps the request transaction usable
-    for the queries that follow.  When the library is not preloaded at all,
-    the dashboard never gets here: v_role_status (failed_attempts()) raises
-    first and the request gets the "extension not preloaded" page (see
-    ExtensionNotPreloaded).  Any other error (missing function, privilege,
-    lost connection...) propagates: the generic 500 page.
+    A 55000 (ObjectNotInPrerequisiteState) of another cause than a missing
+    preload gives None: the dashboard shows "worker not running" instead of
+    failing, the savepoint keeps the request transaction usable for the
+    queries that follow.  The library not being preloaded (not_preloaded():
+    "must be loaded via shared_preload_libraries", "shared memory is not
+    initialized") propagates: the request gets the "extension not
+    preloaded" page (main.py), including /maintenance, whose first query is
+    this one.  Any other error (missing function, privilege, lost
+    connection...) propagates too: the generic 500 page.
     """
     try:
         with conn.transaction():
             return conn.execute(WORKER_STATUS_SQL).fetchone()
     except psycopg.errors.ObjectNotInPrerequisiteState as exc:
+        if not_preloaded(exc) is not None:
+            raise
         log.warning("worker status unavailable: %s", error_message(exc))
         return None
 

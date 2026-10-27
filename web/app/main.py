@@ -22,7 +22,7 @@ from app.db import ExtensionNotPreloaded, make_pool, not_preloaded
 from app.logfilter import get_logger, install_log_masking
 from app.routers import audit, dashboard, maintenance, pairs, profiles, roles
 from app.security import SecurityHeadersMiddleware
-from app.templating import STATIC_DIR, render
+from app.templating import STATIC_DIR, is_hx, render
 
 log = get_logger("main")
 
@@ -33,7 +33,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        install_log_masking()  # uvicorn's handlers exist by now
         pool = make_pool(settings)
         pool.open(wait=False)
         app.state.pool = pool
@@ -139,7 +138,7 @@ ALERTS_TARGET = "#alerts"
 def _not_preloaded_response(request: Request, missing: ExtensionNotPreloaded) -> Any:
     """The "extension not preloaded" page (503), with the server's HINT; an
     alert in the page's alert area for htmx."""
-    if request.headers.get("hx-request") == "true" or not getattr(request.state, "user", None):
+    if is_hx(request) or not getattr(request.state, "user", None):
         detail = missing.message + (f" (hint: {missing.hint})" if missing.hint else "")
         return _error_response(request, 503, detail)
     return render(
@@ -153,7 +152,7 @@ def _not_preloaded_response(request: Request, missing: ExtensionNotPreloaded) ->
 def _error_response(
     request: Request, status_code: int, detail: str, headers: dict[str, str] | None = None
 ) -> Any:
-    if request.headers.get("hx-request") == "true":
+    if is_hx(request):
         # the fragment is a bare alert, not what the triggering element
         # expects (a role row, a form...): it goes to the page's alert area
         # so that the target stays in place

@@ -203,14 +203,22 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
   requête, `script-src 'self'`, `frame-ancestors 'none'`, `form-action 'self'`),
   `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`,
   `Referrer-Policy: no-referrer`, `Cache-Control: no-store` sur toutes les
-  pages. HTMX est durci via `<meta name="htmx-config">` (`allowEval: false`,
+  pages. Les fichiers de `/static` sont mis en cache une heure ; leur URL porte
+  une empreinte courte de leur contenu (`?v=<hash>`, calculée au démarrage) :
+  après une mise à jour, le navigateur charge la nouvelle version sans
+  attendre l'expiration du cache. HTMX est durci via `<meta name="htmx-config">` (`allowEval: false`,
   `allowScriptTags: false`, `selfRequestsOnly: true`).
-- **Journaux** : un filtre de logging (fabrique de `LogRecord` + `Filter` sur
-  les handlers) masque toute valeur associée à `password`, `passwd`, `pwd`,
+- **Journaux** : une fabrique de `LogRecord`, exécutée une seule fois par
+  enregistrement et valable pour tous les loggers et handlers, masque toute
+  valeur associée à `password`, `passwd`, `pwd`,
   `secret`, `token`, dans les arguments, le message une fois formaté
   (`"password=%s"` et son argument) et les attributs `extra`, quel que soit le
   logger (y compris ceux d'uvicorn). Le gabarit n'est jamais masqué seul : il
-  perdrait son `%s` et la ligne avec lui. L'application elle-même
+  perdrait son `%s` et la ligne avec lui. Quand seul le message assemblé
+  contient une valeur sensible, il remplace le gabarit et les arguments
+  restent en place, en même nombre : le formateur d'accès d'uvicorn, qui en
+  attend cinq, produit toujours sa ligne (`GET /audit?role=token:` par
+  exemple). L'application elle-même
   ne journalise jamais de mot de passe ; le filtre est un filet de sécurité.
 - **Authentification** : bcrypt pour HTTP basic (comparaison à coût constant,
   même pour un utilisateur inconnu : il est comparé à une empreinte factice du
@@ -234,10 +242,15 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
   `HX-Reswap: innerHTML` : l'alerte s'affiche dans la zone d'alertes de la page
   et l'élément visé (ligne de rôle, formulaire) reste en place. Un client non
   identifié (404 ou 405 du routeur, levées avant l'authentification, 401, 403)
-  reçoit une page d'erreur minimale, sans navigation ni lien. Seule l'erreur
-  `55000` de `worker_status()` (mémoire partagée absente) donne « worker not
-  running » sur le tableau de bord : une fonction absente, un droit manquant
-  ou une connexion perdue restent une erreur 500.
+  reçoit une page d'erreur minimale, sans navigation ni lien. Seule une erreur
+  `55000` de `worker_status()` autre que la bibliothèque non préchargée donne
+  « worker not running » : une fonction absente, un droit manquant ou une
+  connexion perdue restent une erreur 500, la bibliothèque non préchargée
+  donne la page dédiée (voir ci-dessous), y compris sur `/maintenance`.
+  Un refus de suppression de profil envoyé sans HTMX donne une page d'erreur
+  complète, pas un fragment isolé. Si `switch_rotation_pair()` ne renvoie
+  aucune ligne, la bascule est validée mais le mot de passe est inconnu :
+  l'application le dit (422, erreur journalisée) au lieu d'une erreur 500.
 - **Bibliothèque non préchargée** : sans `pg_pass_policy` dans
   `shared_preload_libraries`, les vues (`v_role_status` appelle
   `failed_attempts()`) et les actions échouent toutes avec le SQLSTATE `55000`.

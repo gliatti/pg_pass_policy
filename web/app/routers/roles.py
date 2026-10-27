@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import secrets
 from typing import Any
 
 from fastapi import APIRouter, Depends, Form, Query, Request
@@ -10,15 +9,12 @@ from psycopg import Connection
 
 from app import db
 from app.logfilter import get_logger
-from app.templating import NO_STORE, render
+from app.templating import render, reread_warning, reveal_response
 
 router = APIRouter(prefix="/roles")
 log = get_logger("roles")
 
-REREAD_WARNING = (
-    "The password was changed, but the role could not be read back: reload the page"
-    " to see its current state."
-)
+REREAD_WARNING = reread_warning("The password was changed", "the role")
 
 
 def _filters(
@@ -92,16 +88,12 @@ def _row_response(
     context = {
         "r": row,
         "role_name": role,
-        "error": error,
         "notice": notice,
         "warning": warning,
         "reread_failed": warning is not None,
         "password": password,
-        "uid": secrets.token_hex(4),
     }
-    headers = NO_STORE if password else None
-    status_code = 200 if error is None else 422
-    return render(request, "roles/_row.html", context, status_code=status_code, headers=headers)
+    return reveal_response(request, "roles/_row.html", context, password=password, error=error)
 
 
 # {role:path}: a role name may contain '/' (sent percent-encoded, decoded by

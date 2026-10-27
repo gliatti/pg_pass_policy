@@ -285,9 +285,19 @@ class _WorkerConn(_Conn):
 
 
 def test_worker_status_unavailable_returns_none():
-    exc = psycopg.errors.ObjectNotInPrerequisiteState("shared memory is not initialized")
+    exc = psycopg.errors.ObjectNotInPrerequisiteState("pg_pass_policy worker state unavailable")
     conn = _WorkerConn(exc)
     assert db.worker_status(conn) is None  # type: ignore[arg-type]
+    assert conn.events == ["savepoint", "rollback"]
+
+
+def test_worker_status_not_preloaded_propagates():
+    exc = psycopg.errors.ObjectNotInPrerequisiteState(
+        "pg_pass_policy shared memory is not initialized"
+    )
+    conn = _WorkerConn(exc)
+    with pytest.raises(psycopg.errors.ObjectNotInPrerequisiteState):
+        db.worker_status(conn)  # type: ignore[arg-type]
     assert conn.events == ["savepoint", "rollback"]
 
 

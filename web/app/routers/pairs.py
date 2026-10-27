@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import secrets
 from typing import Any
 
 from fastapi import APIRouter, Form, Request
@@ -10,14 +9,15 @@ from psycopg import Connection
 
 from app import db
 from app.logfilter import get_logger
-from app.templating import NO_STORE, render
+from app.templating import reread_warning, reveal_response
 
 router = APIRouter(prefix="/pairs")
 log = get_logger("pairs")
 
-REREAD_WARNING = (
-    "The pair was switched, but the pair list could not be read back: reload the page"
-    " to see the current state."
+REREAD_WARNING = reread_warning("The pair was switched", "the pair list")
+NO_ROW_ERROR = (
+    "Pair {}: switch applied but no row returned, the new password is unknown:"
+    " reload the page and check the pair (switch it again if needed)."
 )
 
 
@@ -44,19 +44,12 @@ def _content(
     context = {
         "pairs": pairs,
         "warning": warning,
-        "error": error,
         "notice": notice,
         "switched": switched,
         "form": form or {},
-        "uid": secrets.token_hex(4),
     }
-    return render(
-        request,
-        template,
-        context,
-        status_code=422 if error else 200,
-        headers=NO_STORE if switched else None,
-    )
+    password = switched["password"] if switched else None
+    return reveal_response(request, template, context, password=password, error=error)
 
 
 @router.get("", name="pairs")
@@ -102,5 +95,10 @@ def pair_switch(
     result, error = db.run_action(conn, db.switch_pair, pair, length)
     if error is not None:
         return _content(request, conn, "pairs/_content.html", error=error)
+    if result is None:
+        # committed, but switch_rotation_pair() returned no row: nothing to
+        # show, said as such rather than a TypeError (500) after the commit
+        log.error("pair %s: switch applied but no row returned", pair)
+        return _content(request, conn, "pairs/_content.html", error=NO_ROW_ERROR.format(pair))
     # the password is in this response only (no-store); never logged nor stored
     return _content(request, conn, "pairs/_content.html", switched={"pair": pair, **result})
