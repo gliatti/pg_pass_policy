@@ -447,7 +447,9 @@ AS $$
     SELECT coalesce((SELECT a.rolsuper OR a.rolreplication OR a.rolbypassrls
                             OR (starts_with(a.rolname, 'pg_') AND a.rolname <> 'pg_database_owner')
                             OR (a.rolcreaterole AND current_setting('server_version_num')::int < 160000)
-                       FROM pg_catalog.pg_authid a WHERE a.oid = p_oid), false)
+                       -- pg_roles, not pg_authid: readable by the viewer/admin
+                       -- roles the function is granted to
+                       FROM pg_catalog.pg_roles a WHERE a.oid = p_oid), false)
 $$;
 COMMENT ON FUNCTION _is_privileged(oid) IS 'Internal: true if a role is privileged in itself (SUPERUSER, REPLICATION, BYPASSRLS, pg_*, CREATEROLE on PG <= 15)';
 
