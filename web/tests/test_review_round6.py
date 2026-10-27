@@ -111,13 +111,13 @@ def _raise(exc):
 
 
 def test_not_preloaded_detection():
-    assert db.not_preloaded(NotPreloaded()) is not None
+    assert db.extension_unavailable(NotPreloaded()) is not None
     no_hint = NotPreloaded("pg_pass_policy must be loaded via shared_preload_libraries", None)
-    assert db.not_preloaded(no_hint).message.startswith("pg_pass_policy must be loaded")
+    assert db.extension_unavailable(no_hint).message.startswith("pg_pass_policy must be loaded")
     # another 55000 of the extension is not this state
     untrusted = NotPreloaded("PPP-004: pg_pass_policy schema is not trusted", None)
-    assert db.not_preloaded(untrusted) is None
-    assert db.not_preloaded(psycopg.errors.UndefinedTable("relation x")) is None
+    assert db.extension_unavailable(untrusted) is None
+    assert db.extension_unavailable(psycopg.errors.UndefinedTable("relation x")) is None
 
 
 def test_dashboard_without_preload_is_the_dedicated_page(app, monkeypatch, caplog):
@@ -188,8 +188,8 @@ def test_other_55000_is_a_generic_500(app, monkeypatch, caplog):
         psycopg.errors.RaiseException("pg_pass_policy: password generation failed"),
         psycopg.errors.InvalidPassword("PPP-010: password changed too recently"),
         psycopg.errors.ObjectInUse('pg_pass_policy: profile "p" is assigned to 2 role(s)'),
-        # the prefix alone is enough, whatever the SQLSTATE
-        psycopg.errors.InternalError_("pg_pass_policy: could not generate random values"),
+        # the prefix alone is enough, whatever the SQLSTATE but an internal one
+        psycopg.errors.FeatureNotSupported("pg_pass_policy: not supported here"),
         psycopg.errors.ObjectNotInPrerequisiteState(
             "PPP-004: pg_pass_policy schema is not trusted"
         ),
@@ -209,6 +209,8 @@ def test_extension_errors_are_inline(exc):
         psycopg.errors.UndefinedFunction("function pass_policy.lock_role() does not exist"),
         psycopg.OperationalError("server closed the connection unexpectedly"),
         psycopg.errors.InternalError_("cache lookup failed for relation 1234"),
+        # an internal error of the extension (XX000) is not a refusal
+        psycopg.errors.InternalError_("pg_pass_policy: could not generate random values"),
         NotPreloaded(),
     ],
 )

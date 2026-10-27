@@ -18,7 +18,7 @@ from app import __version__
 from app.auth import dummy_hash, require_user
 from app.config import Settings
 from app.csrf import verify_csrf
-from app.db import ExtensionNotPreloaded, make_pool, not_preloaded
+from app.db import ExtensionUnavailable, extension_unavailable, make_pool
 from app.logfilter import get_logger, install_log_masking
 from app.routers import audit, dashboard, maintenance, pairs, profiles, roles
 from app.security import SecurityHeadersMiddleware
@@ -106,16 +106,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # 55000 only: raised by the first query of the request that reaches the
     # shared memory (v_role_status through failed_attempts(), an action...)
-    # when the library is not preloaded; any other 55000 is a plain error
+    # when the library is not preloaded, or by a function of the extension
+    # when it is not installed in the database; any other 55000 is a plain
+    # error
     @app.exception_handler(psycopg.errors.ObjectNotInPrerequisiteState)
     async def prerequisite_error(request: Request, exc: psycopg.Error) -> Any:
-        missing = not_preloaded(exc)
+        missing = extension_unavailable(exc)
         if missing is None:
             return await db_error(request, exc)
+        state = "preloaded" if missing.reason == "not_preloaded" else "installed"
         log.error(
-            "pg_pass_policy is not preloaded (%s %s): %s", request.method, request.url.path, exc
+            "pg_pass_policy is not %s (%s %s): %s", state, request.method, request.url.path, exc
         )
-        return _not_preloaded_response(request, missing)
+        return _unavailable_response(request, missing)
 
     return app
 
@@ -135,15 +138,23 @@ def validation_detail(exc: RequestValidationError) -> str:
 ALERTS_TARGET = "#alerts"
 
 
-def _not_preloaded_response(request: Request, missing: ExtensionNotPreloaded) -> Any:
-    """The "extension not preloaded" page (503), with the server's HINT; an
-    alert in the page's alert area for htmx."""
+# page of each ExtensionUnavailable.reason
+UNAVAILABLE_TEMPLATES = {
+    "not_preloaded": "not_preloaded.html",
+    "not_installed": "not_installed.html",
+}
+
+
+def _unavailable_response(request: Request, missing: ExtensionUnavailable) -> Any:
+    """The "extension not preloaded" or "extension not installed" page (503),
+    with the server's message and HINT; an alert in the page's alert area
+    for htmx."""
     if is_hx(request) or not getattr(request.state, "user", None):
         detail = missing.message + (f" (hint: {missing.hint})" if missing.hint else "")
         return _error_response(request, 503, detail)
     return render(
         request,
-        "not_preloaded.html",
+        UNAVAILABLE_TEMPLATES[missing.reason],
         {"message": missing.message, "hint": missing.hint},
         status_code=503,
     )

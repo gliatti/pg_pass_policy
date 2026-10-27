@@ -1,12 +1,20 @@
 """Logging protection: no password may ever reach a log line.
 
-One entry point: a LogRecord factory (install_log_masking()) masks the
-arguments and the formatted message as soon as a record is created.  It
-covers every logger and handler, including the ones uvicorn configures, and
-runs once per record.  The `extra` attributes are set on the record after
-the factory has returned (Logger.makeRecord): they are masked when the
-message is first formatted (MaskedLogRecord.getMessage(), called by every
-Formatter before it reads the record's attributes).
+install_log_masking() installs two hooks, once, for every logger and
+handler (the ones uvicorn configures included):
+
+- a LogRecord factory masks the arguments and the formatted message as soon
+  as a record is created, once per record;
+- Logger.makeRecord, wrapped on the Logger class itself (so that loggers
+  created before the installation, the root logger and subclasses set with
+  logging.setLoggerClass are covered), masks the `extra` attributes, which
+  makeRecord sets on the record after the factory has returned.  They are
+  thus masked before any filter, handler or formatter sees the record,
+  whatever it reads (getMessage() or record.__dict__ directly).
+
+A Logger subclass that overrides makeRecord without calling it, or a record
+built by hand (logging.makeLogRecord), escapes the second hook:
+PasswordMaskFilter, put on a handler, covers that case.
 The application itself never logs a password; this is a safety net.
 """
 
@@ -53,9 +61,15 @@ def mask_value(value: Any) -> Any:
 
 
 def _mask_extras(record: logging.LogRecord) -> None:
-    for key in list(record.__dict__):
-        if key not in _STANDARD_ATTRS and _KEY_RE.search(key):
+    """Masks the non-standard attributes (`extra`): the whole value for a
+    secret-like name, the secret-like content of the others."""
+    for key, value in list(record.__dict__.items()):
+        if key in _STANDARD_ATTRS:
+            continue
+        if _KEY_RE.search(key):
             setattr(record, key, MASK)
+        else:
+            setattr(record, key, mask_value(value))
 
 
 class PasswordMaskFilter(logging.Filter):
@@ -74,6 +88,13 @@ class PasswordMaskFilter(logging.Filter):
     TypeError."""
 
     def filter(self, record: logging.LogRecord) -> bool:
+        self.mask_message(record)
+        _mask_extras(record)
+        return True
+
+    @staticmethod
+    def mask_message(record: logging.LogRecord) -> None:
+        """Masks the template and the arguments (not the extras)."""
         if not isinstance(record.msg, str):
             record.msg = mask_value(record.msg)
         if record.args:
@@ -81,15 +102,17 @@ class PasswordMaskFilter(logging.Filter):
         try:
             message = record.getMessage()
         except Exception:
-            # a broken template: logging reports it (handleError), with
-            # nothing left to leak
+            # A broken template (more placeholders than arguments...): the
+            # masked template is kept and the arguments dropped.  Left in
+            # place, they would be printed raw by logging.Handler.handleError
+            # ("Arguments: ..."), and only a key or a "password=" pattern is
+            # masked in them, not a bare password.
             record.msg = mask_value(record.msg)
+            record.args = ()
         else:
             masked = mask_text(message)
             if masked != message:
                 record.msg = _template_for(masked, record.args)
-        _mask_extras(record)
-        return True
 
 
 def _template_for(message: str, args: Any) -> str:
@@ -105,20 +128,12 @@ def _template_for(message: str, args: Any) -> str:
     return template
 
 
-class MaskedLogRecord(logging.LogRecord):
-    """A LogRecord masking its `extra` attributes before being formatted."""
-
-    def getMessage(self) -> str:
-        _mask_extras(self)
-        return super().getMessage()
-
-
 _FILTER = PasswordMaskFilter()
 _installed = False
 
 
 def install_log_masking() -> None:
-    """Install the masking record factory, once."""
+    """Install the masking record factory and makeRecord wrapper, once."""
     global _installed
     if _installed:
         return
@@ -126,12 +141,20 @@ def install_log_masking() -> None:
 
     def factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
         record = previous(*args, **kwargs)
-        if type(record) is logging.LogRecord:
-            record.__class__ = MaskedLogRecord
-        _FILTER.filter(record)
+        # no extra yet: makeRecord sets them after the factory (see below)
+        _FILTER.mask_message(record)
         return record
 
     logging.setLogRecordFactory(factory)
+
+    make_record = logging.Logger.makeRecord
+
+    def masking_make_record(self: logging.Logger, *args: Any, **kwargs: Any) -> logging.LogRecord:
+        record = make_record(self, *args, **kwargs)
+        _mask_extras(record)
+        return record
+
+    logging.Logger.makeRecord = masking_make_record  # type: ignore[method-assign]
     _installed = True
 
 

@@ -211,9 +211,15 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
 - **Journaux** : une fabrique de `LogRecord`, exécutée une seule fois par
   enregistrement et valable pour tous les loggers et handlers, masque toute
   valeur associée à `password`, `passwd`, `pwd`,
-  `secret`, `token`, dans les arguments, le message une fois formaté
-  (`"password=%s"` et son argument) et les attributs `extra`, quel que soit le
-  logger (y compris ceux d'uvicorn). Le gabarit n'est jamais masqué seul : il
+  `secret`, `token`, dans les arguments et le message une fois formaté
+  (`"password=%s"` et son argument), quel que soit le logger (y compris ceux
+  d'uvicorn). Les attributs `extra`, posés par `Logger.makeRecord` après la
+  fabrique, sont masqués par une surcharge de `makeRecord` installée sur la
+  classe `Logger` elle-même (loggers déjà créés et logger racine compris) :
+  un formateur qui lit directement `record.__dict__` (JSON par exemple) ne
+  voit que des valeurs masquées. Un gabarit cassé (plus de `%s` que
+  d'arguments) est gardé masqué, ses arguments supprimés : `logging` ne les
+  imprime donc pas bruts dans son rapport d'erreur. Le gabarit n'est jamais masqué seul : il
   perdrait son `%s` et la ligne avec lui. Quand seul le message assemblé
   contient une valeur sensible, il remplace le gabarit et les arguments
   restent en place, en même nombre : le formateur d'accès d'uvicorn, qui en
@@ -230,11 +236,16 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
   n'est accepté que depuis un pair de confiance. Aucune route de documentation
   OpenAPI n'est exposée.
 - **Erreurs** : seuls les refus de l'extension sont affichés tels quels dans
-  les fragments d'action (422) : message préfixé `pg_pass_policy:` ou
-  `PPP-0xx`, SQLSTATE qu'elle lève (`42501`, `42704`, `42710`, `55006`,
-  `53400`, `28P01`, `P0001`) et erreurs dues aux valeurs saisies (classes
-  `22`, intervalle illisible par exemple, et `23`, contrainte `CHECK` d'un
-  profil). Toute autre erreur PostgreSQL (vue ou fonction absente, pool,
+  les fragments d'action (422) : SQLSTATE qu'elle lève (`42501`, `42704`,
+  `42710`, `55006`, `53400`, `28P01`, `P0001`), erreurs dues aux valeurs
+  saisies (classes `22`, intervalle illisible par exemple, et `23`,
+  contrainte `CHECK` d'un profil) et message préfixé `pg_pass_policy:` ou
+  `PPP-0xx`, sauf avec un SQLSTATE interne (classes `XX` et `42` hors
+  `42501`, `42704`, `42710`) : `XX000` ou `42703` signalent un défaut de
+  l'extension ou un décalage de version, journalisés en avertissement puis
+  traités comme ci-après (page 500). Cela vaut aussi pour « could not
+  generate a password compliant with profile » (`XX000`), visible dans le
+  seul journal du serveur. Toute autre erreur PostgreSQL (vue ou fonction absente, pool,
   connexion perdue), y compris pendant une action, est journalisée en `ERROR`
   et donne une page 500 générique : le texte complet (noms de tables, détails
   de connexion libpq) ne va qu'au journal du serveur. Une erreur générique survenue pendant un échange HTMX (422 de
@@ -242,10 +253,12 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
   `HX-Reswap: innerHTML` : l'alerte s'affiche dans la zone d'alertes de la page
   et l'élément visé (ligne de rôle, formulaire) reste en place. Un client non
   identifié (404 ou 405 du routeur, levées avant l'authentification, 401, 403)
-  reçoit une page d'erreur minimale, sans navigation ni lien. Seule une erreur
-  `55000` de `worker_status()` autre que la bibliothèque non préchargée donne
-  « worker not running » : une fonction absente, un droit manquant ou une
-  connexion perdue restent une erreur 500, la bibliothèque non préchargée
+  reçoit une page d'erreur minimale, sans navigation ni lien. `worker_status()`
+  donne « worker not running », avec un avertissement au journal, pour une
+  erreur `55000` autre qu'une extension indisponible, un droit manquant
+  (`42501`) ou une fonction absente (`42883`) : le tableau de bord reste
+  lisible avec des droits partiels. Une connexion perdue ou toute autre
+  erreur reste une erreur 500, l'extension non préchargée ou non installée
   donne la page dédiée (voir ci-dessous), y compris sur `/maintenance`.
   Un refus de suppression de profil envoyé sans HTMX donne une page d'erreur
   complète, pas un fragment isolé. Si `switch_rotation_pair()` ne renvoie
@@ -259,7 +272,10 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
   preloaded » (503) avec le message et le `HINT` du serveur, ou, pendant un
   échange HTMX, une alerte dans la zone d'alertes. Seul ce cas est reconnu
   (message ou `HINT` citant `shared_preload_libraries`, mémoire partagée non
-  initialisée) : tout autre `55000` donne la page 500 générique.
+  initialisée), ainsi que l'extension non installée dans la base
+  (« pg_pass_policy is not installed in this database », `55000`), qui
+  donne sa propre page « not installed » (503, même message et `HINT` du
+  serveur) : tout autre `55000` donne la page 500 générique.
 - **Noms dans les URL** : un nom de rôle ou de paire peut contenir `/` ; il est
   encodé (`%2F`), le serveur le décode avant le routage et les routes
   `/{role:path}/action` le reconstituent. Les routes des profils gardent un
@@ -353,8 +369,10 @@ assignation, suppression, noms réservés, refus d'assignation sur un rôle
 privilégié, profil `assign` créé en SQL, formulaire d'assignation limité aux rôles que l'extension
 accepte, rôle renommé),
 l'audit (filtres, pagination), les
-paires de rotation, la maintenance, le refus CSRF, la page « extension non
-préchargée » (erreur `55000` levée par le serveur avec son `HINT`) et la
+paires de rotation, la maintenance, le refus CSRF, les pages « extension non
+préchargée » (erreur `55000` levée par le serveur avec son `HINT`) et
+« extension non installée », le tableau de bord avec des droits partiels
+sur `worker_status()` et la
 page 500 journalisée d'une erreur inattendue pendant une action.
 
 ## Arborescence

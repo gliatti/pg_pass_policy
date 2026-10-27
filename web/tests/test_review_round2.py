@@ -304,9 +304,7 @@ def test_worker_status_not_preloaded_propagates():
 @pytest.mark.parametrize(
     "exc",
     [
-        # 55000 only: a missing function or privilege is a deployment error
-        psycopg.errors.UndefinedFunction("function pass_policy.worker_status() does not exist"),
-        psycopg.errors.InsufficientPrivilege("permission denied for function worker_status"),
+        # a missing function or privilege gives None (see test_review_round8)
         psycopg.OperationalError("server closed the connection unexpectedly"),
         psycopg.errors.AdminShutdown("terminating connection due to administrator command"),
         psycopg.InterfaceError("the connection is closed"),

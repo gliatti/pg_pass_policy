@@ -10,8 +10,9 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 import psycopg
 from fastapi import Depends, Request
@@ -149,30 +150,43 @@ CONN: Any = Depends(get_conn, scope="function")
 T = TypeVar("T")
 
 
-class ExtensionNotPreloaded(Exception):
-    """pg_pass_policy is not in shared_preload_libraries: every view and
-    every function backed by the shared memory fails with SQLSTATE 55000.
-    Raised by the first query of a request that hits it, shown as a
-    dedicated page (main.py) with the server's HINT."""
+@dataclass(frozen=True)
+class ExtensionUnavailable:
+    """Why pg_pass_policy cannot serve a request, as found by
+    extension_unavailable() in a 55000 error (a value, never raised):
 
-    def __init__(self, message: str, hint: str | None) -> None:
-        super().__init__(message)
-        self.message = message
-        self.hint = hint
+    - "not_preloaded": the library is not in shared_preload_libraries, every
+      view and every function backed by the shared memory fails;
+    - "not_installed": the extension is not installed in the database the
+      back-office connects to.
+
+    main.py shows it as a dedicated page (503) with the server's message and
+    HINT."""
+
+    reason: Literal["not_preloaded", "not_installed"]
+    message: str
+    hint: str | None
 
 
-def not_preloaded(exc: BaseException) -> ExtensionNotPreloaded | None:
-    """The ExtensionNotPreloaded matching a 55000 error raised because the
+NOT_INSTALLED_MESSAGE = "pg_pass_policy is not installed in this database"
+
+
+def extension_unavailable(exc: BaseException) -> ExtensionUnavailable | None:
+    """The ExtensionUnavailable matching a 55000 error raised because the
     library is not preloaded (message or HINT naming shared_preload_libraries,
-    or the shared memory reported as not initialized), None for anything else
-    (another 55000, such as PPP-004 "schema is not trusted", included)."""
+    or the shared memory reported as not initialized) or because the
+    extension is not installed in the database ("pg_pass_policy is not
+    installed in this database"), None for anything else (another 55000,
+    such as PPP-004 "schema is not trusted", included)."""
     if not isinstance(exc, psycopg.errors.ObjectNotInPrerequisiteState):
         return None
     message = error_message(exc)
     hint = exc.diag.message_hint
     text = f"{message} {hint or ''}"
     if "shared_preload_libraries" in text or "shared memory is not initialized" in text:
-        return ExtensionNotPreloaded(message, hint)
+        return ExtensionUnavailable("not_preloaded", message, hint)
+    if message.startswith(NOT_INSTALLED_MESSAGE):
+        return ExtensionUnavailable("not_installed", message, hint)
     return None
 
 
@@ -195,21 +209,38 @@ EXTENSION_SQLSTATES = frozenset(
     }
 )
 USER_INPUT_SQLSTATE_CLASSES = ("22", "23")
+# classes of internal errors (XX000 elog(ERROR), XX001 data corrupted...;
+# 42703 undefined_column, 42883 undefined_function: an extension and a
+# back-office out of step): never a refusal, even with a message of the
+# extension, except the 42xxx of EXTENSION_SQLSTATES
+INTERNAL_SQLSTATE_CLASSES = ("XX", "42")
 _PPP_CODE = re.compile(r"PPP-\d{3}\b")
 
 
 def is_extension_error(exc: psycopg.Error) -> bool:
-    """Whether a PostgreSQL error is a refusal to show the user as is (see
-    EXTENSION_SQLSTATES): a message of the extension ("pg_pass_policy: ...",
-    "PPP-0xx: ..."), or one of its SQLSTATEs, or a data error caused by the
-    submitted values."""
-    if not_preloaded(exc) is not None:
+    """Whether a PostgreSQL error is a refusal to show the user as is: one
+    of EXTENSION_SQLSTATES, a data error caused by the submitted values
+    (classes 22, 23), or a message of the extension ("pg_pass_policy: ...",
+    "PPP-0xx: ...") with any other SQLSTATE but an internal one (classes XX
+    and 42, see INTERNAL_SQLSTATE_CLASSES): "pg_pass_policy: unexpected
+    extension state" (XX000) is a bug, not a refusal, and goes to the
+    generic 500 page (logged here, then by main.py)."""
+    if extension_unavailable(exc) is not None:
         return False
-    message = error_message(exc)
-    if message.startswith("pg_pass_policy:") or _PPP_CODE.match(message):
-        return True
     sqlstate = exc.sqlstate or ""
-    return sqlstate in EXTENSION_SQLSTATES or sqlstate.startswith(USER_INPUT_SQLSTATE_CLASSES)
+    if sqlstate in EXTENSION_SQLSTATES or sqlstate.startswith(USER_INPUT_SQLSTATE_CLASSES):
+        return True
+    message = error_message(exc)
+    if not (message.startswith("pg_pass_policy:") or _PPP_CODE.match(message)):
+        return False
+    if sqlstate.startswith(INTERNAL_SQLSTATE_CLASSES):
+        log.warning(
+            "internal error of the extension (SQLSTATE %s), not shown as a refusal: %s",
+            sqlstate,
+            message,
+        )
+        return False
+    return True
 
 
 def run_action(
@@ -220,7 +251,8 @@ def run_action(
     (is_extension_error(): the savepoint is rolled back, the connection
     stays usable for the response).  Any other PostgreSQL error propagates
     once the savepoint is rolled back: main.py logs it and shows the generic
-    500 page (ExtensionNotPreloaded: the dedicated page).
+    500 page, or the dedicated 503 page when extension_unavailable() finds
+    the extension not preloaded or not installed.
 
     The commit comes before anything is re-read or shown: the extension
     applies its shared-memory changes (lock, unlock, failure counter) at
@@ -291,23 +323,31 @@ WORKER_STATUS_SQL = (
 def worker_status(conn: Connection) -> dict[str, Any] | None:
     """The worker state, or None when it cannot be read.
 
-    A 55000 (ObjectNotInPrerequisiteState) of another cause than a missing
-    preload gives None: the dashboard shows "worker not running" instead of
-    failing, the savepoint keeps the request transaction usable for the
-    queries that follow.  The library not being preloaded (not_preloaded():
-    "must be loaded via shared_preload_libraries", "shared memory is not
-    initialized") propagates: the request gets the "extension not
-    preloaded" page (main.py), including /maintenance, whose first query is
-    this one.  Any other error (missing function, privilege, lost
-    connection...) propagates too: the generic 500 page.
+    None, with a warning in the log, for:
+
+    - a 55000 (ObjectNotInPrerequisiteState) of another cause than an
+      unavailable extension: the dashboard shows "worker not running";
+    - a missing privilege (42501, InsufficientPrivilege: EXECUTE revoked on
+      worker_status()) or a missing function (42883, UndefinedFunction: an
+      older extension): the dashboard stays readable with partial rights.
+
+    The savepoint keeps the request transaction usable for the queries that
+    follow.  An unavailable extension (extension_unavailable(): library not
+    preloaded, extension not installed) propagates: the request gets the
+    dedicated page (main.py), including /maintenance, whose first query is
+    this one.  Any other error (lost connection, undefined table...)
+    propagates too: the generic 500 page.
     """
     try:
         with conn.transaction():
             return conn.execute(WORKER_STATUS_SQL).fetchone()
     except psycopg.errors.ObjectNotInPrerequisiteState as exc:
-        if not_preloaded(exc) is not None:
+        if extension_unavailable(exc) is not None:
             raise
         log.warning("worker status unavailable: %s", error_message(exc))
+        return None
+    except (psycopg.errors.InsufficientPrivilege, psycopg.errors.UndefinedFunction) as exc:
+        log.warning("worker status unavailable (SQLSTATE %s): %s", exc.sqlstate, error_message(exc))
         return None
 
 

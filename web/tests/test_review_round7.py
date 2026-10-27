@@ -159,13 +159,13 @@ def test_static_urls_carry_a_content_version(app):  # noqa: F811
 def test_masking_runs_once_per_record(monkeypatch):
     create_app(make_settings())
     calls = []
-    real = logfilter._FILTER.filter
+    real = logfilter._FILTER.mask_message
 
     def spy(record):
         calls.append(record)
         return real(record)
 
-    monkeypatch.setattr(logfilter._FILTER, "filter", spy)
+    monkeypatch.setattr(logfilter._FILTER, "mask_message", spy)
     for name in (None, "uvicorn", "uvicorn.access", "uvicorn.error", "pgpp_web", "pgpp_web.x"):
         logger = logging.getLogger(name)
         assert not any(isinstance(f, PasswordMaskFilter) for f in logger.filters)

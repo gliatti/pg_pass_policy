@@ -496,15 +496,80 @@ def test_worker_status_not_preloaded_is_the_dedicated_page(client, monkeypatch, 
     assert NOT_PRELOADED_HINT in response.text
 
 
-def test_worker_status_missing_function_is_an_error(client, monkeypatch, caplog):
-    """Only 55000 means "worker not running": a missing function is a 500."""
+@pytest.fixture
+def denied_function(super_conn):
+    """A function the role of the back-office may not execute (42501)."""
+    super_conn.execute(
+        "CREATE FUNCTION public.web_t_denied() RETURNS SETOF record LANGUAGE sql"
+        " AS 'SELECT 1, now(), now(), 0'"
+    )
+    super_conn.execute("REVOKE EXECUTE ON FUNCTION public.web_t_denied() FROM PUBLIC")
+    try:
+        yield
+    finally:
+        super_conn.execute("DROP FUNCTION IF EXISTS public.web_t_denied()")
+
+
+@pytest.mark.parametrize(
+    "query, sqlstate",
+    [
+        ("SELECT * FROM pass_policy.no_such_function()", "42883"),
+        (
+            "SELECT * FROM public.web_t_denied()"
+            " AS t(pid int, last_run timestamptz, last_reload timestamptz, tracked_roles int)",
+            "42501",
+        ),
+    ],
+)
+def test_worker_status_with_partial_rights_keeps_the_dashboard(
+    client, monkeypatch, caplog, denied_function, query, sqlstate
+):
+    """A missing function or privilege on worker_status(): the dashboard is
+    still shown, the worker as not running, a warning in the log."""
     from app import db
 
-    monkeypatch.setattr(db, "WORKER_STATUS_SQL", "SELECT * FROM pass_policy.no_such_function()")
+    caplog.set_level(logging.WARNING)
+    monkeypatch.setattr(db, "WORKER_STATUS_SQL", query)
+    response = client.get("/")
+    assert response.status_code == 200, response.text
+    assert "The background worker is not running" in response.text
+    assert f"worker status unavailable (SQLSTATE {sqlstate})" in caplog.text
+
+
+def test_worker_status_other_errors_are_a_500(client, monkeypatch, caplog):
+    from app import db
+
+    monkeypatch.setattr(db, "WORKER_STATUS_SQL", "SELECT * FROM pass_policy.no_such_table")
     response = client.get("/")
     assert response.status_code == 500
-    assert "no_such_function" not in response.text
-    assert "no_such_function" in caplog.text
+    assert "no_such_table" not in response.text
+    assert "no_such_table" in caplog.text
+
+
+def test_extension_not_installed_page(client, monkeypatch, super_conn, caplog):
+    """The server's "not installed in this database" (55000) gives the
+    dedicated page."""
+    from app import db
+
+    super_conn.execute(
+        "CREATE FUNCTION public.web_t_not_installed() RETURNS SETOF record LANGUAGE plpgsql"
+        " AS $$ BEGIN RAISE EXCEPTION 'pg_pass_policy is not installed in this database'"
+        "   USING ERRCODE = 'object_not_in_prerequisite_state'; END $$"
+    )
+    try:
+        monkeypatch.setattr(
+            db,
+            "status_counts",
+            lambda conn: conn.execute(
+                "SELECT * FROM public.web_t_not_installed() AS t(n int)"
+            ).fetchall(),
+        )
+        response = client.get("/")
+    finally:
+        super_conn.execute("DROP FUNCTION IF EXISTS public.web_t_not_installed()")
+    assert response.status_code == 503, response.text
+    assert "pg_pass_policy is not installed in this database</h1>" in response.text
+    assert "pg_pass_policy is not installed (GET /)" in caplog.text
 
 
 def test_extension_not_preloaded_page(client, monkeypatch, raising_55000, caplog):

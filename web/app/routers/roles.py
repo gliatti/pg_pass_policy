@@ -90,7 +90,6 @@ def _row_response(
         "role_name": role,
         "notice": notice,
         "warning": warning,
-        "reread_failed": warning is not None,
         "password": password,
     }
     return reveal_response(request, "roles/_row.html", context, password=password, error=error)
