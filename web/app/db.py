@@ -20,6 +20,9 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
 from app.config import Settings
+from app.logfilter import get_logger
+
+log = get_logger("db")
 
 STATUSES = ("ok", "warning", "grace", "expired", "locked", "never_expires", "unknown")
 EVENT_TYPES = (
@@ -127,10 +130,25 @@ def status_counts(conn: Connection) -> dict[str, int]:
     return counts
 
 
+WORKER_STATUS_SQL = (
+    "SELECT pid, last_run, last_reload, tracked_roles FROM pass_policy.worker_status()"
+)
+
+
 def worker_status(conn: Connection) -> dict[str, Any] | None:
-    return conn.execute(
-        "SELECT pid, last_run, last_reload, tracked_roles FROM pass_policy.worker_status()"
-    ).fetchone()
+    """The worker state, or None when it cannot be read.
+
+    worker_status() raises an error when the library is not in
+    shared_preload_libraries (no shared memory): the pages then show "worker
+    not running" instead of failing.  The savepoint keeps the request
+    transaction usable for the queries that follow.
+    """
+    try:
+        with conn.transaction():
+            return conn.execute(WORKER_STATUS_SQL).fetchone()
+    except psycopg.Error as exc:
+        log.warning("worker status unavailable: %s", error_message(exc))
+        return None
 
 
 def recent_audit(conn: Connection, limit: int = 20) -> list[dict[str, Any]]:
@@ -362,16 +380,26 @@ def list_audit(
     offset: int = 0,
 ) -> tuple[list[dict[str, Any]], int]:
     where, params = _audit_where(role, event_type, since)
-    total = conn.execute(
-        f"SELECT count(*) AS n FROM pass_policy.audit_log WHERE {where}", params
-    ).fetchone()["n"]
+    # one scan: the total comes with each row (count(*) OVER () is computed
+    # before LIMIT/OFFSET)
     rows = conn.execute(
         "SELECT id, event_time, event_type, role_name, actor, database, client_addr,"
-        "       application_name, details"
+        "       application_name, details, count(*) OVER () AS total"
         f"  FROM pass_policy.audit_log WHERE {where}"
         " ORDER BY id DESC LIMIT %s OFFSET %s",
         [*params, limit, offset],
     ).fetchall()
+    if rows:
+        total = rows[0]["total"]
+        for row in rows:
+            del row["total"]
+    elif offset:
+        # page past the end: no row carries the total, count separately
+        total = conn.execute(
+            f"SELECT count(*) AS n FROM pass_policy.audit_log WHERE {where}", params
+        ).fetchone()["n"]
+    else:
+        total = 0
     return rows, total
 
 

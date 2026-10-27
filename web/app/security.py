@@ -10,6 +10,23 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 STATIC_PREFIX = "/static/"
 
 
+def route_path(scope: Scope) -> str:
+    """The request path without the --root-path prefix.
+
+    ASGI servers (uvicorn >= 0.26) put the root_path in front of scope["path"]:
+    the application compares its own paths (/healthz, /static/...) against
+    this value, never against request.url.path.  Same rule as Starlette's
+    router (starlette._utils.get_route_path, private).
+    """
+    path: str = scope.get("path", "")
+    root_path: str = scope.get("root_path", "")
+    if root_path and path.startswith(root_path):
+        rest = path[len(root_path) :]
+        if rest == "" or rest.startswith("/"):
+            return rest or "/"
+    return path
+
+
 def csp_for(nonce: str) -> str:
     return (
         "default-src 'self'; "
@@ -35,7 +52,7 @@ class SecurityHeadersMiddleware:
             return
         nonce = secrets.token_urlsafe(16)
         scope.setdefault("state", {})["csp_nonce"] = nonce
-        is_static = scope.get("path", "").startswith(STATIC_PREFIX)
+        is_static = route_path(scope).startswith(STATIC_PREFIX)
 
         async def send_with_headers(message: Message) -> None:
             if message["type"] == "http.response.start":

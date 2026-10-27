@@ -12,6 +12,7 @@ from fastapi import HTTPException, Request, status
 
 from app.config import Settings
 from app.logfilter import get_logger
+from app.security import route_path
 
 log = get_logger("auth")
 
@@ -114,7 +115,7 @@ def user_from_proxy(request: Request, settings: Settings) -> str:
 def require_user(request: Request) -> str:
     """FastAPI dependency: authenticate the request and expose the user name."""
     settings: Settings = request.app.state.settings
-    if request.url.path in PUBLIC_PATHS:
+    if route_path(request.scope) in PUBLIC_PATHS:
         request.state.user = None
         return ""
     if settings.auth == "basic":

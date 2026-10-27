@@ -6,10 +6,12 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import psycopg
-from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi import Depends, FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from psycopg_pool import PoolTimeout
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.sessions import SessionMiddleware
 
 from app import __version__
@@ -76,9 +78,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def healthz() -> str:
         return "ok"
 
-    @app.exception_handler(HTTPException)
-    async def http_exception(request: Request, exc: HTTPException) -> Any:
+    # Starlette's class: also catches the 404 / 405 raised by the router
+    # itself (fastapi.HTTPException is a subclass)
+    @app.exception_handler(StarletteHTTPException)
+    async def http_exception(request: Request, exc: StarletteHTTPException) -> Any:
         return _error_response(request, exc.status_code, str(exc.detail), exc.headers)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request: Request, exc: RequestValidationError) -> Any:
+        # an HTML page or fragment, never FastAPI's JSON body (htmx would
+        # swap it into the page as text)
+        return _error_response(request, 422, validation_detail(exc))
 
     @app.exception_handler(PoolTimeout)
     async def pool_timeout(request: Request, exc: PoolTimeout) -> Any:
@@ -93,6 +103,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return _error_response(request, 500, "Database error, see the server log")
 
     return app
+
+
+def validation_detail(exc: RequestValidationError) -> str:
+    """'Invalid request: length: Input should be ...' (field names and
+    messages only: the submitted values are not echoed back)."""
+    parts = []
+    for error in exc.errors():
+        loc = [str(x) for x in error.get("loc", ()) if x not in ("body", "query", "path")]
+        field = ".".join(loc) or "request"
+        parts.append(f"{field}: {error.get('msg', 'invalid value')}")
+    return "Invalid request: " + ("; ".join(parts) or "invalid value")
 
 
 def _error_response(
@@ -115,6 +136,3 @@ def _error_response(
         status_code=status_code,
         headers=headers,
     )
-
-
-__all__ = ["create_app", "HTMLResponse"]

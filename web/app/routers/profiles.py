@@ -63,11 +63,13 @@ def settings_from_form(form: Any) -> dict[str, Any]:
 
 
 def _page(request: Request, conn: Connection, **extra: Any) -> Response:
+    profiles = db.list_profiles(conn)
     context = {
-        "profiles": db.list_profiles(conn),
+        "profiles": profiles,
         "assignments": db.assignments(conn),
         "login_roles": db.login_roles(conn),
-        "profile_names": db.profile_names(conn),
+        # same order as profile_names(): derived, no second query
+        "profile_names": [p["name"] for p in profiles],
         **extra,
     }
     return render(request, "profiles/index.html", context)

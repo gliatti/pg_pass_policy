@@ -65,6 +65,7 @@ async def verify_csrf(request: Request) -> None:
         or not supplied
         or not user
         or bound_user != user
-        or not hmac.compare_digest(expected, supplied)
+        # bytes: compare_digest() raises TypeError on non-ASCII str
+        or not hmac.compare_digest(expected.encode(), supplied.encode())
     ):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "CSRF token missing or invalid")

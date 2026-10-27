@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import Request
 from fastapi.templating import Jinja2Templates
@@ -13,6 +14,7 @@ from starlette.responses import Response
 
 from app.csrf import get_csrf_token
 from app.db import INFINITY
+from app.security import route_path
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 STATIC_DIR = Path(__file__).parent / "static"
@@ -49,8 +51,6 @@ def fmt_ts(value: Any) -> str:
 def fmt_interval(value: Any) -> str:
     if value is None:
         return "—"
-    if isinstance(value, timedelta):
-        return str(value)
     return str(value)
 
 
@@ -63,12 +63,17 @@ def fmt_json(value: Any) -> str:
 def _context(request: Request) -> dict[str, Any]:
     def path_for(route: str, /, **params: Any) -> str:
         # path only (keeps root_path): scheme and host must not be guessed
-        # behind a reverse proxy
-        return request.url_for(route, **params).path
+        # behind a reverse proxy.  Parameters are percent-encoded: a role
+        # name may contain '/', '?', '#' or '%' (the routes taking a role or
+        # a pair use the path convertor, the server decodes the path)
+        quoted = {k: quote(str(v), safe="") for k, v in params.items()}
+        return request.url_for(route, **quoted).path
 
     user = getattr(request.state, "user", None)
     return {
         "path_for": path_for,
+        # path without the root_path prefix (active navigation link)
+        "route_path": route_path(request.scope),
         # no token (and no session cookie) for the anonymous error pages shown
         # before authentication: a token is only issued to an identified user
         "csrf_token": get_csrf_token(request) if user else "",

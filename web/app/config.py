@@ -5,7 +5,7 @@ from __future__ import annotations
 import ipaddress
 from typing import Literal
 
-from pydantic import SecretStr, model_validator
+from pydantic import PrivateAttr, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _BCRYPT_PREFIXES = ("$2a$", "$2b$", "$2y$")
@@ -39,18 +39,41 @@ class Settings(BaseSettings):
     # application_name prefix recorded in pass_policy.audit_log
     app_name: str = "pgpp-web"
 
+    # parsed once by _check(), read on every request by the authentication
+    _user_hashes: dict[str, bytes] = PrivateAttr(default_factory=dict)
+    _networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = PrivateAttr(
+        default_factory=list
+    )
+    _proxy_tokens: frozenset[str] = PrivateAttr(default_factory=frozenset)
+
     @model_validator(mode="after")
     def _check(self) -> Settings:
         if len(self.secret.get_secret_value()) < MIN_SECRET_LENGTH:
             raise ValueError(f"PGPP_WEB_SECRET must be at least {MIN_SECRET_LENGTH} characters")
-        if self.auth == "basic" and not self.basic_user_hashes():
+        self._user_hashes = self._parse_basic_users()
+        if self.auth == "basic" and not self._user_hashes:
             raise ValueError("PGPP_WEB_BASIC_USERS must list at least one user:bcrypt-hash")
-        self.trusted_networks()  # validates the syntax
+        self._networks = self._parse_trusted_networks()  # also validates the syntax
+        self._proxy_tokens = frozenset(t.strip() for t in self.trusted_proxies.split(","))
         if self.page_size < 1 or self.page_size > 1000:
             raise ValueError("PGPP_WEB_PAGE_SIZE must be between 1 and 1000")
         return self
 
     def basic_user_hashes(self) -> dict[str, bytes]:
+        """{user: bcrypt hash} from PGPP_WEB_BASIC_USERS (parsed at startup)."""
+        return self._user_hashes
+
+    def trusted_networks(self) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+        """Networks of PGPP_WEB_TRUSTED_PROXIES (parsed at startup)."""
+        return self._networks
+
+    def trust_all_proxies(self) -> bool:
+        return "*" in self._proxy_tokens
+
+    def trust_unix_peer(self) -> bool:
+        return "unix" in self._proxy_tokens
+
+    def _parse_basic_users(self) -> dict[str, bytes]:
         """Parse PGPP_WEB_BASIC_USERS into {user: bcrypt hash}."""
         users: dict[str, bytes] = {}
         for entry in self.basic_users.split(","):
@@ -63,7 +86,7 @@ class Settings(BaseSettings):
             users[user] = digest.encode("ascii")
         return users
 
-    def trusted_networks(self) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+    def _parse_trusted_networks(self) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
         networks = []
         for token in self.trusted_proxies.split(","):
             token = token.strip()
@@ -71,12 +94,6 @@ class Settings(BaseSettings):
                 continue
             networks.append(ipaddress.ip_network(token, strict=False))
         return networks
-
-    def trust_all_proxies(self) -> bool:
-        return "*" in [t.strip() for t in self.trusted_proxies.split(",")]
-
-    def trust_unix_peer(self) -> bool:
-        return "unix" in [t.strip() for t in self.trusted_proxies.split(",")]
 
     def proxy_header_name(self) -> str:
         """HTTP header name, lower case; REMOTE_USER (CGI style) maps to remote-user."""

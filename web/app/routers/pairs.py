@@ -75,7 +75,8 @@ def pair_create(
     )
 
 
-@router.post("/{pair}/switch", name="pair_switch")
+# {pair:path}: a pair name is free text and may contain '/'
+@router.post("/{pair:path}/switch", name="pair_switch")
 def pair_switch(
     request: Request,
     pair: str,

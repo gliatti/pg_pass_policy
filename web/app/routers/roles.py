@@ -81,6 +81,11 @@ def _row_response(
     return render(request, "roles/_row.html", context, status_code=status_code, headers=headers)
 
 
+# {role:path}: a role name may contain '/' (sent percent-encoded, decoded by
+# the server); every action route ends with its own suffix, so a role named
+# "x/lock" cannot be mistaken for the lock action on "x"
+
+
 def _run(conn: Connection, action, *args: Any) -> str | None:
     """Run one action in a savepoint; return the error message, if any."""
     try:
@@ -88,10 +93,19 @@ def _run(conn: Connection, action, *args: Any) -> str | None:
             action(conn, *args)
     except psycopg.Error as exc:
         return db.error_message(exc)
+    _commit(conn)
     return None
 
 
-@router.post("/{role}/rotate", name="role_rotate")
+def _commit(conn: Connection) -> None:
+    """Commit before re-reading the row: the extension applies its
+    shared-memory changes (lock, unlock, failure counter) at commit, so
+    v_role_status read in the same transaction would still show the old
+    state."""
+    conn.commit()
+
+
+@router.post("/{role:path}/rotate", name="role_rotate")
 def rotate(
     request: Request,
     role: str,
@@ -104,11 +118,12 @@ def rotate(
             password = db.rotate_password(conn, role, length)
     except psycopg.Error as exc:
         return _row_response(request, conn, role, error=db.error_message(exc))
+    _commit(conn)
     # the password exists only in this response (no-store), never in a log or a URL
     return _row_response(request, conn, role, password=password)
 
 
-@router.post("/{role}/lock", name="role_lock")
+@router.post("/{role:path}/lock", name="role_lock")
 def lock(
     request: Request,
     role: str,
@@ -121,7 +136,7 @@ def lock(
     return _row_response(request, conn, role, error=error, notice=notice)
 
 
-@router.post("/{role}/unlock", name="role_unlock")
+@router.post("/{role:path}/unlock", name="role_unlock")
 def unlock(request: Request, role: str, conn: Connection = Depends(db.get_conn)):
     error = _run(conn, db.unlock_role, role)
     return _row_response(
@@ -129,7 +144,7 @@ def unlock(request: Request, role: str, conn: Connection = Depends(db.get_conn))
     )
 
 
-@router.post("/{role}/expire", name="role_expire")
+@router.post("/{role:path}/expire", name="role_expire")
 def expire(request: Request, role: str, conn: Connection = Depends(db.get_conn)):
     error = _run(conn, db.expire_password, role)
     return _row_response(

@@ -11,6 +11,7 @@ from tests.conftest import (
     T_GROUP,
     T_PAIR,
     T_PROFILE,
+    T_SLASH,
     csrf_token,
     revealed_password,
 )
@@ -389,3 +390,87 @@ def test_static_assets_served(client):
     assert "htmx" in response.text[:200]
     assert client.get("/static/app.js").status_code == 200
     assert client.get("/static/app.css").status_code == 200
+
+
+def test_role_name_needing_url_encoding(client, super_conn):
+    """A role name with '/', '?', '#' and '%' (W3): the page renders, the
+    action URLs are percent-encoded and reach the right role."""
+    from urllib.parse import quote
+
+    encoded = quote(T_SLASH, safe="")
+    page = client.get("/roles")
+    assert page.status_code == 200, page.text
+    assert f'hx-post="/roles/{encoded}/rotate"' in page.text
+    token = csrf_token(client, "/roles")
+    headers = {"X-CSRF-Token": token, "HX-Request": "true"}
+
+    response = client.post(f"/roles/{encoded}/rotate", headers=headers)
+    assert response.status_code == 200, response.text
+    revealed_password(response.text)
+    assert f'hx-post="/roles/{encoded}/lock"' in response.text
+
+    response = client.post(f"/roles/{encoded}/lock", data={"duration": "1 hour"}, headers=headers)
+    assert response.status_code == 200, response.text
+    assert super_conn.execute(
+        "SELECT status FROM pass_policy.v_role_status WHERE role_name = %s", (T_SLASH,)
+    ).fetchone() == ("locked",)
+    response = client.post(f"/roles/{encoded}/unlock", headers=headers)
+    assert response.status_code == 200 and "Role unlocked" in response.text
+    # the other roles were not touched
+    assert super_conn.execute(
+        "SELECT count(*) FROM pass_policy.v_role_status"
+        " WHERE status = 'locked' AND role_name LIKE 'web_t_app%%'"
+    ).fetchone() == (0,)
+
+    # a pair name with '/' reaches the switch handler, decoded
+    response = client.post(f"/pairs/{quote('web_t_x/y', safe='')}/switch", headers=headers)
+    assert response.status_code == 422
+    assert "does not exist" in response.text and "web_t_x/y" in response.text
+
+
+def test_worker_status_unavailable(client, monkeypatch):
+    """worker_status() failing (library not preloaded, W2): the pages render
+    the "not running" branch and the rest of the transaction still works."""
+    from app import db
+
+    monkeypatch.setattr(db, "WORKER_STATUS_SQL", "SELECT * FROM pass_policy.no_such_function()")
+    response = client.get("/")
+    assert response.status_code == 200, response.text
+    assert "The background worker is not running" in response.text
+    assert "Full audit log" in response.text
+    response = client.get("/maintenance")
+    assert response.status_code == 200, response.text
+    assert "Worker pid" not in response.text
+    token = csrf_token(client, "/maintenance")
+    response = client.post("/maintenance/run", headers={"X-CSRF-Token": token})
+    assert response.status_code == 200 and "Maintenance completed" in response.text
+
+
+def test_validation_errors_are_html(client):
+    """FastAPI's 422 JSON body never reaches the page (W5)."""
+    token = csrf_token(client, "/roles")
+    headers = {"X-CSRF-Token": token, "HX-Request": "true"}
+    # (an empty field is not an error: FastAPI applies the default, 24)
+    response = client.post("/roles/web_t_alpha/rotate", data={"length": "4"}, headers=headers)
+    assert response.status_code == 422
+    assert "text/html" in response.headers["content-type"]
+    assert '<div class="alert alert-error" role="alert">Invalid request: length:' in response.text
+    response = client.post("/roles/web_t_alpha/rotate", data={"length": "abc"}, headers=headers)
+    assert response.status_code == 422 and "Invalid request: length:" in response.text
+    assert "abc" not in response.text
+
+    response = client.get("/audit", params={"page": "0"})
+    assert response.status_code == 422
+    assert "Error 422" in response.text and "Invalid request: page:" in response.text
+    response = client.get("/audit/table", params={"page": "x"}, headers={"HX-Request": "true"})
+    assert response.status_code == 422 and "Invalid request: page:" in response.text
+
+
+def test_audit_page_past_the_end_keeps_the_total(client):
+    first = client.get("/audit/table", params={"role": "web_t_alpha"})
+    far = client.get("/audit/table", params={"role": "web_t_alpha", "page": 99999})
+    assert far.status_code == 200
+    assert "No event matches." in far.text
+    total = first.text.split(" event", 1)[0].rsplit(">", 1)[1]
+    assert int(total) > 0
+    assert f"{total} event" in far.text

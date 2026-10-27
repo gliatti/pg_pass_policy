@@ -118,7 +118,9 @@ def super_conn(super_url):
         yield conn
 
 
-T_ROLES = ("web_t_alpha", "web_t_beta", "web_t_pa", "web_t_pb")
+# T_SLASH: a role name that needs percent-encoding in the action URLs
+T_SLASH = "web_t_app/batch?#%"
+T_ROLES = ("web_t_alpha", "web_t_beta", "web_t_pa", "web_t_pb", T_SLASH)
 T_GROUP = "web_t_group"
 T_PROFILE = "web_t_profile"
 T_PAIR = "web_t_pair"
@@ -144,13 +146,13 @@ def pg_fixture(super_conn):
 
     _cleanup(super_conn)
     super_conn.execute(sql.SQL("CREATE ROLE {} NOLOGIN").format(sql.Identifier(T_GROUP)))
-    for role in ("web_t_alpha", "web_t_beta"):
+    for role in ("web_t_alpha", "web_t_beta", T_SLASH):
         super_conn.execute(sql.SQL("CREATE ROLE {} LOGIN").format(sql.Identifier(role)))
     super_conn.execute(
         "SELECT pass_policy.create_profile(%s, %s::jsonb)",
         (T_PROFILE, '{"min_age": "0", "lock_duration": "1 hour"}'),
     )
-    for role in ("web_t_alpha", "web_t_beta"):
+    for role in ("web_t_alpha", "web_t_beta", T_SLASH):
         super_conn.execute("SELECT pass_policy.assign_profile(%s, %s)", (role, T_PROFILE))
     yield
     _cleanup(super_conn)

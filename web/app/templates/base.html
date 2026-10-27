@@ -14,12 +14,12 @@
 <header class="topbar">
   <a class="brand" href="{{ path_for('dashboard') }}">pg_pass_policy</a>
   <nav>
-    <a href="{{ path_for('dashboard') }}"{% if request.url.path == '/' %} class="active"{% endif %}>Dashboard</a>
-    <a href="{{ path_for('roles') }}"{% if request.url.path.startswith('/roles') %} class="active"{% endif %}>Roles</a>
-    <a href="{{ path_for('profiles') }}"{% if request.url.path.startswith('/profiles') %} class="active"{% endif %}>Profiles</a>
-    <a href="{{ path_for('audit') }}"{% if request.url.path.startswith('/audit') %} class="active"{% endif %}>Audit</a>
-    <a href="{{ path_for('pairs') }}"{% if request.url.path.startswith('/pairs') %} class="active"{% endif %}>Rotation pairs</a>
-    <a href="{{ path_for('maintenance') }}"{% if request.url.path.startswith('/maintenance') %} class="active"{% endif %}>Maintenance</a>
+    <a href="{{ path_for('dashboard') }}"{% if route_path == '/' %} class="active"{% endif %}>Dashboard</a>
+    <a href="{{ path_for('roles') }}"{% if route_path.startswith('/roles') %} class="active"{% endif %}>Roles</a>
+    <a href="{{ path_for('profiles') }}"{% if route_path.startswith('/profiles') %} class="active"{% endif %}>Profiles</a>
+    <a href="{{ path_for('audit') }}"{% if route_path.startswith('/audit') %} class="active"{% endif %}>Audit</a>
+    <a href="{{ path_for('pairs') }}"{% if route_path.startswith('/pairs') %} class="active"{% endif %}>Rotation pairs</a>
+    <a href="{{ path_for('maintenance') }}"{% if route_path.startswith('/maintenance') %} class="active"{% endif %}>Maintenance</a>
   </nav>
   <span class="whoami">{% if user %}signed in as <strong>{{ user }}</strong>{% endif %}</span>
 </header>
