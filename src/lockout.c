@@ -3,11 +3,15 @@
  * lockout.c
  *		Account lockout after repeated authentication failures.
  *
- * The ClientAuthentication_hook runs in a backend that is not fully
- * initialised yet: no transaction, no catalog access, no SPI.  Everything it
- * needs therefore lives in shared memory (ppp_role_hash), which is filled
- * by the background worker (profile parameters, persisted locks) and read
- * back by the worker to write audit rows and role_state (see worker.c).
+ * The ClientAuthentication_hook runs during InitPostgres(), after the
+ * catalog caches have been initialised and a transaction has been started
+ * (PerformAuthentication() is called once StartTransactionCommand() and
+ * GetTransactionSnapshot() have run, PG 13 to 17 at least): syscache lookups
+ * work there, as get_role_password() itself does SearchSysCache1(AUTHNAME).
+ * The hook only uses one, to know whether the user name is an existing role;
+ * no SPI.  Everything else lives in shared memory (ppp_role_hash), which is
+ * filled by the background worker (profile parameters, persisted locks) and
+ * read back by the worker to write audit rows and role_state (worker.c).
  *
  * This file also provides the C functions exposed in SQL:
  *	 failed_attempts(), shmem_reload(), shmem_lock_role(),
@@ -17,9 +21,11 @@
  * shmem_* functions are (lock_role() updates role_state, then the shared
  * memory, in one transaction).  The writes requested by shmem_lock_role(),
  * shmem_unlock_role() and shmem_reset_failures(), and the signal sent by
- * shmem_reload(), are therefore deferred to the COMMIT of the calling
+ * shmem_reload(), are therefore deferred to the end of the calling
  * transaction through a transaction callback (ppp_xact_callback), with
- * sub-transaction support: a ROLLBACK (TO SAVEPOINT) discards them.
+ * sub-transaction support: a ROLLBACK (TO SAVEPOINT) discards them.  Locks
+ * are applied at PRE_COMMIT (where an ERROR still aborts the transaction),
+ * unlocks and counter resets at COMMIT (once the transaction is durable).
  *
  * See docs/SPEC.md, sections 4 and 6.3.
  *
@@ -30,6 +36,7 @@
 #include <signal.h>
 
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "libpq/auth.h"
@@ -38,6 +45,7 @@
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/timestamp.h"
 #include "utils/tuplestore.h"
@@ -90,93 +98,82 @@ ppp_init_entry(pppRoleEntry *entry)
 	entry->lock_pending_audit = false;
 	entry->pending_failures = 0;
 	entry->lock_from_state = false;
+	entry->lock_inflight = 0;
+	entry->lock_seq = 0;
 	entry->role_missing = false;
 	entry->reload_profile_seen = false;
 	entry->reload_lock_seen = false;
 }
 
 /*
- * Is the lock of an entry active at time "now"?
+ * Has the failure window of an entry elapsed?  A window <= 0 means "no
+ * window": failures add up until a success, the window never elapses.
  */
-static inline bool
-ppp_is_locked(const pppRoleEntry *entry, TimestampTz now)
+bool
+ppp_window_elapsed(const pppRoleEntry *entry, TimestampTz now)
 {
-	if (entry->locked_until == 0)
-		return false;
-	if (entry->locked_until == DT_NOEND)
-		return true;
-	return entry->locked_until > now;
+	return entry->failure_window_secs > 0 &&
+		now - entry->first_failure_at >
+		(int64) entry->failure_window_secs * USECS_PER_SEC;
 }
 
 /*
- * Maximum number of entries the authentication hook may reach by creating
- * plain failure-counting entries: about 90% of max_tracked_roles (at least
- * one slot reserved).  The remaining slots are kept for locks, re-injected
- * persisted locks and profile entries (PPP_ENTER_PRIORITY), so that an
- * unauthenticated client trying many (possibly non-existent) user names
- * cannot prevent a lock from being applied.
- *
- * The limit applies to the total number of entries, whatever their kind:
- * it is a simple and conservative approximation (the hook never creates an
- * entry once the hash holds limit entries, even if most are locks).
+ * Class of an entry, role existence aside (see pppEntryClass).  Caller holds
+ * ppp_shared->lock.
  */
-int
-ppp_count_entry_limit(void)
-{
-	int			reserve = ppp_max_tracked_roles / 10;
-
-	if (reserve < 1)
-		reserve = 1;
-	return ppp_max_tracked_roles - reserve;
-}
-
-/*
- * Eviction classes, from the cheapest loss to the most expensive one.
- * Entries carrying an active lock, a lock not yet audited or profile
- * parameters are never evicted (PPP_EVICT_NONE).
- */
-typedef enum pppEvictClass
-{
-	PPP_EVICT_WORTHLESS = 0,	/* counter meaningless, nothing to audit */
-	PPP_EVICT_LIVE_COUNTER,		/* failure counter still in its window */
-	PPP_EVICT_PENDING_AUDIT,	/* failures not yet written to audit_log */
-	PPP_EVICT_NONE
-} pppEvictClass;
-
-static pppEvictClass
-ppp_evict_class(const pppRoleEntry *entry, TimestampTz now)
+pppEntryClass
+ppp_entry_real_class(const pppRoleEntry *entry, TimestampTz now)
 {
 	if (entry->from_profile || entry->lock_pending_audit ||
 		ppp_is_locked(entry, now))
-		return PPP_EVICT_NONE;
+		return PPP_CLASS_KEEP;
 	if (entry->pending_failures > 0)
-		return PPP_EVICT_PENDING_AUDIT;
-	if (entry->failed_count <= 0 || entry->role_missing ||
-		(entry->failure_window_secs > 0 &&
-		 now - entry->first_failure_at >
-		 (int64) entry->failure_window_secs * USECS_PER_SEC))
-		return PPP_EVICT_WORTHLESS;
-	return PPP_EVICT_LIVE_COUNTER;
+		return PPP_CLASS_PENDING_AUDIT;
+	if (entry->failed_count <= 0 || ppp_window_elapsed(entry, now))
+		return PPP_CLASS_INACTIVE;
+	return PPP_CLASS_LIVE_COUNTER;
+}
+
+/*
+ * Class of an entry.  The entry of a non-existent role (role_missing, set
+ * by the authentication hook) is always PPP_CLASS_GHOST, even when it holds
+ * a pseudo-lock or failures not yet audited: losing them is harmless (the
+ * name cannot log in anyway), whereas keeping them would let a client that
+ * tries many non-existent names fill the hash and prevent the failures of
+ * real roles from being counted.
+ */
+pppEntryClass
+ppp_entry_class(const pppRoleEntry *entry, TimestampTz now)
+{
+	if (entry->role_missing)
+		return PPP_CLASS_GHOST;
+	return ppp_entry_real_class(entry, now);
 }
 
 /*
  * Find or create the entry of a role.  Caller must hold ppp_shared->lock
  * exclusively.  Returns NULL when there is no room left.
  *
- * When the hash is full (PPP_ENTER_PRIORITY: max_tracked_roles entries;
- * PPP_ENTER_COUNT: ppp_count_entry_limit() entries), the least recently
- * failed entry of the cheapest eviction class allowed for the mode is
- * removed to make room:
- *	 - PPP_ENTER_COUNT only evicts PPP_EVICT_WORTHLESS entries: evicting a
- *	   live counter would let an attacker reset the counter of the role he
- *	   is brute-forcing by trying many other user names;
- *	 - PPP_ENTER_PRIORITY evicts up to PPP_EVICT_PENDING_AUDIT: a lock is
- *	   worth more than a failure counter or a few audit rows.
- * The evicted entry is described in *ev (which may be NULL) so that the
- * caller can log it once the lock is released (ppp_log_eviction).
+ * When the hash is full (max_tracked_roles entries), the least recently
+ * failed entry of the cheapest class allowed for the mode is removed to
+ * make room:
+ *	 - PPP_ENTER_COUNT evicts PPP_CLASS_GHOST, then PPP_CLASS_INACTIVE
+ *	   entries: evicting a live counter would let an attacker reset the
+ *	   counter of the role he is brute-forcing by trying many other existing
+ *	   user names;
+ *	 - PPP_ENTER_PRIORITY also evicts PPP_CLASS_LIVE_COUNTER, then
+ *	   PPP_CLASS_PENDING_AUDIT entries: a lock or profile is worth more than
+ *	   a failure counter or a few audit rows.
+ * PPP_CLASS_KEEP entries are never evicted.  The evicted entry is described
+ * in *ev (which may be NULL) so that the caller can log it once the lock is
+ * released (ppp_log_eviction).
  *
- * The scan is linear in max_tracked_roles; it only happens once the hash
- * is full.
+ * The scan is linear in max_tracked_roles and only happens once the hash is
+ * full.  In PPP_ENTER_COUNT mode, a scan that found nothing is not repeated
+ * for one second (ppp_shared->evict_failed_at, ev->scan_skipped): the hash
+ * is then full of entries the hook may not evict, and a flood of failed
+ * connections would otherwise rescan it at every attempt under the
+ * exclusive lock.
  *
  * The explicit size check is needed: a shared hash can grow beyond its
  * max_size as long as the shared memory segment has free space left.
@@ -188,7 +185,6 @@ ppp_enter_role(const char *rolename, pppEnterMode mode, TimestampTz now,
 	pppRoleKey	key;
 	pppRoleEntry *entry;
 	bool		found;
-	long		limit;
 
 	if (ev)
 		memset(ev, 0, sizeof(pppEviction));
@@ -198,22 +194,28 @@ ppp_enter_role(const char *rolename, pppEnterMode mode, TimestampTz now,
 	if (entry)
 		return entry;
 
-	limit = (mode == PPP_ENTER_PRIORITY) ? ppp_max_tracked_roles :
-		ppp_count_entry_limit();
-
-	if (hash_get_num_entries(ppp_role_hash) >= limit)
+	if (hash_get_num_entries(ppp_role_hash) >= ppp_max_tracked_roles)
 	{
-		pppEvictClass max_class = (mode == PPP_ENTER_PRIORITY) ?
-			PPP_EVICT_PENDING_AUDIT : PPP_EVICT_WORTHLESS;
-		pppEvictClass best_class = PPP_EVICT_NONE;
+		pppEntryClass max_class = (mode == PPP_ENTER_PRIORITY) ?
+			PPP_CLASS_PENDING_AUDIT : PPP_CLASS_INACTIVE;
+		pppEntryClass best_class = PPP_CLASS_KEEP;
 		pppRoleEntry *victim = NULL;
 		HASH_SEQ_STATUS seq;
 		pppRoleEntry *e;
 
+		if (mode == PPP_ENTER_COUNT && ppp_shared->evict_failed_at != 0 &&
+			now >= ppp_shared->evict_failed_at &&
+			now - ppp_shared->evict_failed_at < USECS_PER_SEC)
+		{
+			if (ev)
+				ev->scan_skipped = true;
+			return NULL;
+		}
+
 		hash_seq_init(&seq, ppp_role_hash);
 		while ((e = (pppRoleEntry *) hash_seq_search(&seq)) != NULL)
 		{
-			pppEvictClass c = ppp_evict_class(e, now);
+			pppEntryClass c = ppp_entry_class(e, now);
 
 			if (c > max_class)
 				continue;
@@ -226,15 +228,22 @@ ppp_enter_role(const char *rolename, pppEnterMode mode, TimestampTz now,
 		}
 
 		if (victim == NULL)
+		{
+			if (mode == PPP_ENTER_COUNT)
+				ppp_shared->evict_failed_at = now;
 			return NULL;
+		}
 
 		if (ev)
 		{
 			ev->evicted = true;
+			ev->ghost = (best_class == PPP_CLASS_GHOST);
 			strlcpy(ev->rolename, victim->key.rolename, NAMEDATALEN);
-			if (best_class >= PPP_EVICT_LIVE_COUNTER)
+			if (best_class >= PPP_CLASS_LIVE_COUNTER)
+			{
 				ev->lost_failed_count = victim->failed_count;
-			ev->lost_pending_failures = victim->pending_failures;
+				ev->lost_pending_failures = victim->pending_failures;
+			}
 		}
 		hash_search(ppp_role_hash, &victim->key, HASH_REMOVE, NULL);
 	}
@@ -248,8 +257,9 @@ ppp_enter_role(const char *rolename, pppEnterMode mode, TimestampTz now,
 
 /*
  * Report an eviction made by ppp_enter_role().  Must be called without
- * holding ppp_shared->lock.  Evicting a worthless entry is routine (DEBUG1);
- * losing a live counter or unaudited failures is logged.
+ * holding ppp_shared->lock.  Evicting the entry of a non-existent role or an
+ * inactive entry is routine (DEBUG1); losing a live counter or unaudited
+ * failures of an existing role is logged.
  */
 void
 ppp_log_eviction(const pppEviction *ev)
@@ -263,6 +273,9 @@ ppp_log_eviction(const pppEviction *ev)
 						ev->rolename, ev->lost_failed_count,
 						ev->lost_pending_failures),
 				 errhint("Increase pg_pass_policy.max_tracked_roles.")));
+	else if (ev->ghost)
+		elog(DEBUG1, PPP_LOG_PREFIX "shared memory full: entry of non-existent role \"%s\" evicted",
+			 ev->rolename);
 	else
 		elog(DEBUG1, PPP_LOG_PREFIX "shared memory full: inactive entry of role \"%s\" evicted",
 			 ev->rolename);
@@ -321,12 +334,30 @@ ppp_lockout_init(void)
 }
 
 /*
+ * Does a user name match an existing role?  The hook runs inside the
+ * transaction started by InitPostgres() for authentication, with catalog
+ * caches available (see the file header); the check is skipped (role
+ * assumed to exist, the conservative answer) if that ever stops being true.
+ */
+static bool
+ppp_role_exists(const char *rolename)
+{
+	if (!IsTransactionState())
+		return true;
+	return OidIsValid(get_role_oid(rolename, true));
+}
+
+/*
  * ClientAuthentication_hook: see SPEC 6.3.
  *
  * - a locked role is refused with FATAL whatever the authentication result,
  *   so that a correct password cannot be told apart from a wrong one while
  *   the role is locked;
- * - STATUS_ERROR is counted as a failure;
+ * - STATUS_ERROR is counted as a failure, for existing and non-existent
+ *   user names alike: a non-existent name is "locked" after max_failures
+ *   failures too, so that the answer does not reveal whether the role
+ *   exists (like the mock SCRAM exchange of PostgreSQL).  Its entry is
+ *   flagged role_missing, which makes it always evictable;
  * - STATUS_EOF (client closed the connection when asked for a password, as
  *   psql does before prompting) is NOT counted: no password was tried.
  */
@@ -339,6 +370,7 @@ ppp_client_auth_hook(Port *port, int status)
 	bool		refuse = false;
 	bool		just_locked = false;
 	bool		hash_full = false;
+	bool		role_missing = false;
 	int			failed_count = 0;
 	pppRoleKey	key;
 	pppRoleEntry *entry;
@@ -355,8 +387,13 @@ ppp_client_auth_hook(Port *port, int status)
 		return;
 	}
 
-	now = GetCurrentTimestamp();
 	ppp_make_key(&key, rolename);
+
+	/* catalog lookup before taking the LWLock */
+	if (status == STATUS_ERROR)
+		role_missing = !ppp_role_exists(key.rolename);
+
+	now = GetCurrentTimestamp();
 
 	LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
 
@@ -365,19 +402,26 @@ ppp_client_auth_hook(Port *port, int status)
 	if (entry == NULL && status == STATUS_ERROR)
 	{
 		/*
-		 * A plain counting entry: it may not use the slots reserved for
-		 * locks and profiles (ppp_count_entry_limit), and only evicts
-		 * worthless entries.  port->user_name has not been checked against
-		 * pg_authid (no catalog access here): the worker flags and purges
-		 * the entries of non-existent roles (ppp_sync_cleanup).
+		 * A plain counting entry: when the hash is full it only evicts the
+		 * entries of non-existent roles, then inactive entries.
 		 */
 		entry = ppp_enter_role(rolename, PPP_ENTER_COUNT, now, &ev);
 		if (entry == NULL)
-			hash_full = true;
+			hash_full = !ev.scan_skipped;
 	}
 
 	if (entry != NULL)
 	{
+		/*
+		 * Refreshed at every failure: a role created after its name was
+		 * first tried loses the flag.  A successful authentication proves
+		 * that the role exists.
+		 */
+		if (status == STATUS_ERROR)
+			entry->role_missing = role_missing;
+		else if (status == STATUS_OK)
+			entry->role_missing = false;
+
 		if (ppp_is_locked(entry, now))
 		{
 			refuse = true;
@@ -413,15 +457,10 @@ ppp_client_auth_hook(Port *port, int status)
 			}
 			else if (status == STATUS_ERROR)
 			{
-				/*
-				 * Restart counting when the window has elapsed.  A window <= 0
-				 * means "no window": failures add up until a success.
-				 */
+				/* restart counting when the window has elapsed */
 				if (entry->failed_count == 0 ||
 					entry->first_failure_at == 0 ||
-					(entry->failure_window_secs > 0 &&
-					 now - entry->first_failure_at >
-					 (int64) entry->failure_window_secs * USECS_PER_SEC))
+					ppp_window_elapsed(entry, now))
 				{
 					entry->failed_count = 0;
 					entry->first_failure_at = now;
@@ -455,8 +494,8 @@ ppp_client_auth_hook(Port *port, int status)
 		ereport(LOG,
 				(errmsg(PPP_LOG_PREFIX "cannot track authentication failures of role \"%s\": too many tracked roles",
 						rolename),
-				 errdetail("Failure-counting entries may use at most %d of the %d shared memory entries; the others are reserved for locks and profiles.",
-						   ppp_count_entry_limit(), ppp_max_tracked_roles),
+				 errdetail("All %d shared memory entries hold active locks, profile parameters or live failure counters of existing roles; failures are not counted for the next second.",
+						   ppp_max_tracked_roles),
 				 errhint("Increase pg_pass_policy.max_tracked_roles.")));
 
 	if (just_locked && ppp_log_events)
@@ -489,7 +528,7 @@ ppp_client_auth_hook(Port *port, int status)
  */
 
 /* ------------------------------------------------------------------------
- * Deferred shared memory writes (applied at COMMIT)
+ * Deferred shared memory writes (applied at PRE_COMMIT / COMMIT)
  * ------------------------------------------------------------------------
  */
 typedef enum pppShmemOp
@@ -505,12 +544,22 @@ typedef struct pppPendingOp
 	char		rolename[NAMEDATALEN];
 	TimestampTz until;			/* PPP_OP_LOCK only */
 	SubTransactionId subxid;	/* sub-transaction that requested it */
+
+	/* PPP_OP_LOCK applied at PRE_COMMIT (ppp_apply_lock_ops) */
+	bool		applied;
+	bool		prev_existed;	/* entry existed before the lock */
+	pppRoleEntry prev;			/* its previous content (undo on ERROR) */
+	pppEviction ev;				/* eviction made to create it */
+
 	struct pppPendingOp *next;
 } pppPendingOp;
 
 /* list of the current transaction, allocated in TopTransactionContext */
 static pppPendingOp *ppp_pending_ops = NULL;
 static pppPendingOp *ppp_pending_ops_tail = NULL;
+
+/* the list holds at least one PPP_OP_LOCK (set at PRE_COMMIT) */
+static bool ppp_xact_has_lock_ops = false;
 
 /* shmem_reload() was called in the current transaction */
 static bool ppp_reload_in_xact = false;
@@ -548,168 +597,232 @@ ppp_signal_worker_reload(void)
 }
 
 /*
- * Is a role the target of a PPP_OP_LOCK queued before "upto" (NULL = in the
- * whole list)?
+ * Is an operation overridden by a later operation of the opposite kind on
+ * the same role (a lock followed by an unlock, or the reverse)?  The lock
+ * and the unlock are not applied at the same point of the commit, so the
+ * order of the list must be resolved beforehand.
  */
 static bool
-ppp_lock_op_targets(const char *rolename, const pppPendingOp *upto)
+ppp_op_overridden(const pppPendingOp *op)
 {
-	const pppPendingOp *op;
+	const pppPendingOp *o;
+	pppShmemOp	opposite = (op->op == PPP_OP_LOCK) ? PPP_OP_UNLOCK : PPP_OP_LOCK;
 
-	for (op = ppp_pending_ops; op != NULL && op != upto; op = op->next)
-		if (op->op == PPP_OP_LOCK &&
-			strncmp(op->rolename, rolename, NAMEDATALEN) == 0)
+	for (o = op->next; o != NULL; o = o->next)
+		if (o->op == opposite &&
+			strncmp(o->rolename, op->rolename, NAMEDATALEN) == 0)
 			return true;
 	return false;
 }
 
 /*
- * XACT_EVENT_PRE_COMMIT: make sure that every PPP_OP_LOCK of the
- * transaction will find an entry at COMMIT, and raise an ERROR otherwise.
+ * XACT_EVENT_PRE_COMMIT: apply every PPP_OP_LOCK of the transaction, in
+ * PPP_ENTER_PRIORITY mode, under one exclusive hold of the lock.  If one of
+ * them finds no room (every entry is PPP_CLASS_KEEP), the locks already
+ * applied by this call are undone and an ERROR is raised: the transaction
+ * aborts (role_state update and audit row included), lock_role() fails
+ * visibly and nothing claims a lock that is not enforced (fail-closed).
  *
- * The writes themselves are applied at XACT_EVENT_COMMIT, once the rows are
- * visible (ppp_apply_pending_ops), but an ERROR is no longer possible
- * there: the transaction is already committed (an ERROR in a commit
- * callback is promoted to PANIC), so a lock that cannot be applied could
- * only be reported as a WARNING while role_state says "locked".  Checking
- * here aborts the whole transaction instead (role_state update and audit
- * row included): lock_role() fails visibly and nothing claims a lock that
- * is not enforced (fail-closed).
+ * Applying the locks here rather than at COMMIT means that no other
+ * insertion (the authentication hook, another lock_role(), a worker reload)
+ * can take the room between the check and the write.  The lock may then
+ * be enforced a little before the transaction is visible, which is harmless;
+ * if the transaction fails after PRE_COMMIT, the lock stays in shared
+ * memory without a role_state row (fail-closed): unlock_role() lifts it,
+ * and so does the next worker reload on a primary (lock_from_state, see
+ * ppp_finish_lock_ops).  The entry is marked lock_inflight until COMMIT or
+ * ABORT, so that a worker reload whose snapshot predates the commit does
+ * not lift it.
  *
- * Room = free slots + entries that PPP_ENTER_PRIORITY may evict (see
- * ppp_enter_role), the entries of the roles being locked excepted.  Between
- * this check and the COMMIT, another priority insertion (another lock_role,
- * the worker reloading locks or profiles) may still take the last slots:
- * the authentication hook cannot, as it never goes beyond
- * ppp_count_entry_limit().  That narrow race keeps the WARNING of
- * ppp_apply_pending_ops().
+ * Nothing is done (and the lock is not taken) when the transaction queued
+ * no PPP_OP_LOCK.
  */
 static void
-ppp_check_pending_capacity(void)
+ppp_apply_lock_ops(void)
 {
 	pppPendingOp *op;
-	char		missing[NAMEDATALEN];
-	long		room;
-	long		needed = 0;
-	HASH_SEQ_STATUS seq;
-	pppRoleEntry *e;
+	pppPendingOp **ops;
+	int			nops = 0;
+	int			i;
 	TimestampTz now;
-	bool		full = false;
+	bool		in_recovery;
+	const char *missing = NULL;
 
+	ppp_xact_has_lock_ops = false;
 	if (ppp_pending_ops == NULL || ppp_shared == NULL || ppp_role_hash == NULL)
 		return;
 
-	missing[0] = '\0';
-	now = GetCurrentTimestamp();
-
-	LWLockAcquire(ppp_shared->lock, LW_SHARED);
-
-	room = ppp_max_tracked_roles - hash_get_num_entries(ppp_role_hash);
-	if (room < 0)
-		room = 0;
-	hash_seq_init(&seq, ppp_role_hash);
-	while ((e = (pppRoleEntry *) hash_seq_search(&seq)) != NULL)
-	{
-		if (ppp_evict_class(e, now) <= PPP_EVICT_PENDING_AUDIT &&
-			!ppp_lock_op_targets(e->key.rolename, NULL))
-			room++;
-	}
-
 	for (op = ppp_pending_ops; op != NULL; op = op->next)
+		if (op->op == PPP_OP_LOCK)
+			nops++;
+	if (nops == 0)
+		return;
+	ppp_xact_has_lock_ops = true;
+
+	ops = (pppPendingOp **) palloc(sizeof(pppPendingOp *) * nops);
+	nops = 0;
+	for (op = ppp_pending_ops; op != NULL; op = op->next)
+		if (op->op == PPP_OP_LOCK && !ppp_op_overridden(op))
+			ops[nops++] = op;
+
+	now = GetCurrentTimestamp();
+	in_recovery = RecoveryInProgress();
+
+	LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
+	for (i = 0; i < nops; i++)
 	{
+		pppRoleEntry *entry;
 		pppRoleKey	key;
 
-		if (op->op != PPP_OP_LOCK || ppp_lock_op_targets(op->rolename, op))
-			continue;
+		op = ops[i];
 		ppp_make_key(&key, op->rolename);
-		if (hash_search(ppp_role_hash, &key, HASH_FIND, NULL) != NULL)
-			continue;
-		if (++needed > room)
+		entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key, HASH_FIND, NULL);
+		op->prev_existed = (entry != NULL);
+		if (entry != NULL)
+			memcpy(&op->prev, entry, sizeof(pppRoleEntry));
+		else
+			entry = ppp_enter_role(op->rolename, PPP_ENTER_PRIORITY, now, &op->ev);
+		if (entry == NULL)
 		{
-			strlcpy(missing, op->rolename, NAMEDATALEN);
-			full = true;
+			missing = op->rolename;
 			break;
 		}
+
+		entry->locked_until = op->until;
+		/* the SQL caller writes its own audit row */
+		entry->lock_pending_audit = false;
+
+		/*
+		 * Mirrored in role_state by lock_role(): a later reload lifts it if
+		 * the row says otherwise.  Not on a standby, where shmem_lock_role()
+		 * is the only way to lock a role locally (nothing can be written in
+		 * role_state there): such a lock must survive the reloads.
+		 */
+		entry->lock_from_state = !in_recovery;
+		entry->lock_inflight++;
+		entry->role_missing = false;
+		op->applied = true;
 	}
 
+	if (missing != NULL)
+	{
+		/* undo, in reverse order: we still hold the lock, nothing changed */
+		while (--i >= 0)
+		{
+			pppRoleKey	key;
+
+			op = ops[i];
+			ppp_make_key(&key, op->rolename);
+			if (op->prev_existed)
+			{
+				pppRoleEntry *entry;
+
+				entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key,
+													 HASH_FIND, NULL);
+				if (entry != NULL)
+					memcpy(entry, &op->prev, sizeof(pppRoleEntry));
+			}
+			else
+				hash_search(ppp_role_hash, &key, HASH_REMOVE, NULL);
+			op->applied = false;
+		}
+	}
 	LWLockRelease(ppp_shared->lock);
 
-	if (full)
+	for (op = ppp_pending_ops; op != NULL; op = op->next)
+		if (op->op == PPP_OP_LOCK)
+			ppp_log_eviction(&op->ev);
+
+	if (missing != NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 				 errmsg("cannot lock role \"%s\": pg_pass_policy shared memory is full",
 						missing),
-				 errdetail("All %d entries of pg_pass_policy.max_tracked_roles hold locks or profile parameters, none can be evicted.",
+				 errdetail("All %d entries of pg_pass_policy.max_tracked_roles hold active locks, locks not yet audited or profile parameters of existing roles; none can be evicted.",
 						   ppp_max_tracked_roles),
 				 errhint("Increase pg_pass_policy.max_tracked_roles (requires a restart).")));
+
+	pfree(ops);
 }
 
 /*
- * Apply the deferred writes, in order, under the lock.  Runs after COMMIT:
- * nothing here may raise an ERROR.  Room for the locks has been checked at
- * PRE_COMMIT (ppp_check_pending_capacity); if a concurrent insertion took it
- * meanwhile, a WARNING is all that can be done.
+ * Bump ppp_shared->lock_seq and stamp an entry with it.  Caller holds the
+ * lock exclusively.
+ */
+static inline void
+ppp_stamp_entry(pppRoleEntry *entry)
+{
+	entry->lock_seq = ++ppp_shared->lock_seq;
+}
+
+/*
+ * XACT_EVENT_COMMIT or XACT_EVENT_ABORT: the locks applied at PRE_COMMIT
+ * are no longer in flight.  After a COMMIT their role_state rows are
+ * visible to any snapshot taken from now on; after an ABORT there is no
+ * row, and the next worker reload lifts the lock (lock_from_state).  Then,
+ * at COMMIT only, apply the unlocks and counter resets, in order.  Runs
+ * after the transaction has ended: nothing here may raise an ERROR.
  */
 static void
-ppp_apply_pending_ops(void)
+ppp_finish_pending_ops(bool commit)
 {
 	pppPendingOp *op;
-	TimestampTz now;
 
 	if (ppp_pending_ops == NULL || ppp_shared == NULL || ppp_role_hash == NULL)
 		return;
-
-	now = GetCurrentTimestamp();
+	if (!commit && !ppp_xact_has_lock_ops)
+		return;
 
 	LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
 	for (op = ppp_pending_ops; op != NULL; op = op->next)
 	{
 		pppRoleKey	key;
 		pppRoleEntry *entry;
-		pppEviction ev;
+
+		if (op->op == PPP_OP_LOCK && !op->applied)
+			continue;
+		if (op->op != PPP_OP_LOCK && !commit)
+			continue;
+		/* an unlock followed by a lock of the same role: the lock wins */
+		if (op->op == PPP_OP_UNLOCK && ppp_xact_has_lock_ops &&
+			ppp_op_overridden(op))
+			continue;
+
+		ppp_make_key(&key, op->rolename);
+		entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key, HASH_FIND, NULL);
+		if (entry == NULL)
+			continue;
 
 		switch (op->op)
 		{
 			case PPP_OP_LOCK:
-				entry = ppp_enter_role(op->rolename, PPP_ENTER_PRIORITY, now, &ev);
-				/* LOG/WARNING under the LWLock: no allocation that may fail */
-				ppp_log_eviction(&ev);
-				if (entry != NULL)
-				{
-					entry->locked_until = op->until;
-					/* the SQL caller writes its own audit row */
-					entry->lock_pending_audit = false;
-					entry->lock_from_state = false;
-				}
-				else
-					ereport(WARNING,
-							(errmsg(PPP_LOG_PREFIX "cannot lock role \"%s\" in shared memory: too many tracked roles",
-									op->rolename),
-							 errhint("Increase pg_pass_policy.max_tracked_roles.")));
+				if (entry->lock_inflight > 0)
+					entry->lock_inflight--;
+				ppp_stamp_entry(entry);
 				break;
 			case PPP_OP_UNLOCK:
-				ppp_make_key(&key, op->rolename);
-				entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key, HASH_FIND, NULL);
-				if (entry != NULL)
-				{
-					entry->locked_until = 0;
-					entry->lock_pending_audit = false;
-					entry->lock_from_state = false;
-				}
+				entry->locked_until = 0;
+				entry->lock_pending_audit = false;
+				entry->lock_from_state = false;
+				ppp_stamp_entry(entry);
 				break;
 			case PPP_OP_RESET:
-				ppp_make_key(&key, op->rolename);
-				entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key, HASH_FIND, NULL);
-				if (entry != NULL)
-				{
-					entry->failed_count = 0;
-					entry->first_failure_at = 0;
-					entry->last_failure_at = 0;
-				}
+				entry->failed_count = 0;
+				entry->first_failure_at = 0;
+				entry->last_failure_at = 0;
 				break;
 		}
 	}
 	LWLockRelease(ppp_shared->lock);
+}
+
+static void
+ppp_reset_pending_ops(void)
+{
+	/* memory goes away with TopTransactionContext */
+	ppp_pending_ops = NULL;
+	ppp_pending_ops_tail = NULL;
+	ppp_xact_has_lock_ops = false;
 }
 
 static void
@@ -718,16 +831,16 @@ ppp_xact_callback(XactEvent event, void *arg)
 	switch (event)
 	{
 		case XACT_EVENT_PRE_COMMIT:
+		case XACT_EVENT_PARALLEL_PRE_COMMIT:
 			/* last point where an ERROR still aborts the transaction */
-			ppp_check_pending_capacity();
+			ppp_apply_lock_ops();
 			break;
 
 		case XACT_EVENT_COMMIT:
 		case XACT_EVENT_PARALLEL_COMMIT:
 			/* after ProcArrayEndTransaction: our rows are visible to the worker */
-			ppp_apply_pending_ops();
-			ppp_pending_ops = NULL;
-			ppp_pending_ops_tail = NULL;
+			ppp_finish_pending_ops(true);
+			ppp_reset_pending_ops();
 			if (ppp_reload_in_xact)
 			{
 				ppp_reload_in_xact = false;
@@ -737,9 +850,9 @@ ppp_xact_callback(XactEvent event, void *arg)
 
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
-			/* memory goes away with TopTransactionContext */
-			ppp_pending_ops = NULL;
-			ppp_pending_ops_tail = NULL;
+			/* locks applied at PRE_COMMIT, if the commit failed afterwards */
+			ppp_finish_pending_ops(false);
+			ppp_reset_pending_ops();
 			ppp_reload_in_xact = false;
 			break;
 
@@ -830,7 +943,7 @@ ppp_register_xact_callbacks(void)
 	}
 }
 
-/* Queue a write for the COMMIT of the current (sub-)transaction. */
+/* Queue a write for the end of the current (sub-)transaction. */
 static void
 ppp_defer_op(pppShmemOp opcode, const char *rolename, TimestampTz until)
 {
@@ -843,6 +956,9 @@ ppp_defer_op(pppShmemOp opcode, const char *rolename, TimestampTz until)
 	strlcpy(op->rolename, rolename, NAMEDATALEN);
 	op->until = until;
 	op->subxid = GetCurrentSubTransactionId();
+	op->applied = false;
+	op->prev_existed = false;
+	memset(&op->ev, 0, sizeof(pppEviction));
 	op->next = NULL;
 
 	if (ppp_pending_ops_tail != NULL)
@@ -1035,9 +1151,11 @@ ppp_text_to_rolename(text *t, char *buf)
  * shmem_lock_role(role text, until timestamptz) RETURNS void
  *
  * until NULL (or 'infinity') = locked until manual unlock.  The write is
- * applied at COMMIT.  If the shared memory has no room for it (every entry
- * holds a lock or profile parameters), the COMMIT fails with an ERROR
- * (ppp_check_pending_capacity).
+ * applied at PRE_COMMIT.  If the shared memory has no room for it (every
+ * entry holds an active lock, a lock not yet audited or profile parameters
+ * of an existing role), the COMMIT fails with an ERROR (ppp_apply_lock_ops).
+ * On a primary, a lock set this way without a role_state row (direct call,
+ * not through lock_role()) is lifted by the next worker reload.
  */
 Datum
 ppp_shmem_lock_role(PG_FUNCTION_ARGS)

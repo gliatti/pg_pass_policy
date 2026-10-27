@@ -53,20 +53,46 @@ typedef struct pppRoleEntry
 	bool		lock_pending_audit;		/* posé par le hook, effacé par le worker */
 	int32		pending_failures;		/* échecs non encore journalisés */
 
-	/* maintained by the worker */
-	bool		lock_from_state;		/* locked_until re-injected from role_state */
-	bool		role_missing;			/* not in pg_authid at the last cleanup */
-	bool		reload_profile_seen;	/* scratch marks of ppp_sync_reload() */
+	/*
+	 * Lock state.  lock_from_state: the lock is expected to be mirrored in
+	 * role_state (re-injected by the worker, or set by shmem_lock_role() on
+	 * a primary): a reload lifts it when role_state no longer holds it.
+	 * lock_inflight / lock_seq: see ppp_shared->lock_seq.
+	 */
+	bool		lock_from_state;
+	uint32		lock_inflight;			/* PPP_OP_LOCK applied, not yet committed */
+	uint64		lock_seq;				/* ppp_shared->lock_seq of the last change */
+
+	/* set by the authentication hook: user name not found in pg_authid */
+	bool		role_missing;
+
+	/* scratch marks of ppp_sync_reload() */
+	bool		reload_profile_seen;
 	bool		reload_lock_seen;
 } pppRoleEntry;
 
 /*
+ * Classes of entries, from the cheapest to lose to the most expensive one
+ * (SPEC 6.3).  Single definition used by the authentication hook, the
+ * eviction (ppp_enter_role) and the worker purge (ppp_sync_cleanup).
+ */
+typedef enum pppEntryClass
+{
+	PPP_CLASS_GHOST = 0,		/* role_missing: always evictable */
+	PPP_CLASS_INACTIVE,			/* zero counter or elapsed window, nothing
+								 * pending, no lock, no profile */
+	PPP_CLASS_LIVE_COUNTER,		/* failure counter still inside its window */
+	PPP_CLASS_PENDING_AUDIT,	/* failures not yet written to audit_log */
+	PPP_CLASS_KEEP				/* active lock, lock not yet audited, or
+								 * profile parameters: never evicted */
+} pppEntryClass;
+
+/*
  * Entry creation when the hash is full (SPEC 6.3):
- * - PPP_ENTER_COUNT: plain failure counting (authentication hook), limited
- *   to ppp_count_entry_limit() entries; only evicts worthless entries
- *   (zero counter, elapsed window or non-existent role);
+ * - PPP_ENTER_COUNT: plain failure counting (authentication hook); evicts
+ *   PPP_CLASS_GHOST then PPP_CLASS_INACTIVE entries only;
  * - PPP_ENTER_PRIORITY: lock, re-injection from role_state or profile; may
- *   use the reserve and evict any entry without lock nor profile.
+ *   also evict PPP_CLASS_LIVE_COUNTER then PPP_CLASS_PENDING_AUDIT entries.
  */
 typedef enum pppEnterMode
 {
@@ -78,6 +104,8 @@ typedef enum pppEnterMode
 typedef struct pppEviction
 {
 	bool		evicted;
+	bool		ghost;					/* evicted entry was a non-existent role */
+	bool		scan_skipped;			/* COUNT mode: recent failed scan, skipped */
 	char		rolename[NAMEDATALEN];
 	int32		lost_failed_count;		/* counter still inside its window */
 	int32		lost_pending_failures;	/* failures lost before being audited */
@@ -96,6 +124,25 @@ typedef struct pppSharedState
 	pid_t		worker_pid;
 	TimestampTz worker_last_run;
 	TimestampTz worker_last_reload;
+
+	/*
+	 * Last time an eviction scan in PPP_ENTER_COUNT mode found nothing to
+	 * evict: the authentication hook skips the scan for one second after
+	 * that, so that a flood of failed connections against a hash full of
+	 * locks and profiles does not scan it under the exclusive lock at every
+	 * attempt.
+	 */
+	TimestampTz evict_failed_at;
+
+	/*
+	 * Incremented (under the lock) each time a lock or unlock requested
+	 * through shmem_lock_role() / shmem_unlock_role() is committed or
+	 * aborted; the entry keeps the value in lock_seq.  The worker reads it
+	 * before taking the snapshot used to reload role_state: an entry whose
+	 * lock_seq is greater, or whose lock_inflight is not zero, has changed
+	 * after that snapshot and is left alone by the reload.
+	 */
+	uint64		lock_seq;
 } pppSharedState;
 
 extern pppSharedState *ppp_shared;
@@ -125,7 +172,22 @@ extern void ppp_lockout_shmem_init(void); /* appelé depuis shmem_startup_hook *
 extern pppRoleEntry *ppp_enter_role(const char *rolename, pppEnterMode mode,
 									TimestampTz now, pppEviction *ev);
 extern void ppp_log_eviction(const pppEviction *ev);
-extern int	ppp_count_entry_limit(void);
+/* failure_window_secs > 0 and elapsed since first_failure_at */
+extern bool ppp_window_elapsed(const pppRoleEntry *entry, TimestampTz now);
+/* class of an entry; ppp_entry_real_class() ignores role_missing */
+extern pppEntryClass ppp_entry_class(const pppRoleEntry *entry, TimestampTz now);
+extern pppEntryClass ppp_entry_real_class(const pppRoleEntry *entry, TimestampTz now);
+
+/* Is the lock of an entry active at time "now"? */
+static inline bool
+ppp_is_locked(const pppRoleEntry *entry, TimestampTz now)
+{
+	if (entry->locked_until == 0)
+		return false;
+	if (entry->locked_until == DT_NOEND)
+		return true;
+	return entry->locked_until > now;
+}
 
 /* ---- worker.c ---------------------------------------------------------- */
 extern void ppp_worker_register(void);	/* appelé depuis _PG_init */

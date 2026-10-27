@@ -4,7 +4,9 @@
 # Primaire temporaire (common.sh) + standby en streaming (pg_basebackup -R,
 # second port, même répertoire temporaire, arrêté par le trap EXIT). Le worker
 # du standby fait un tour en lecture seule toutes les worker_interval (2 s) :
-# il recharge role_state et les profils répliqués dans la shmem locale.
+# il recharge role_state et les profils répliqués dans la shmem locale. Les
+# échecs et verrous comptés sur le standby restent en attente et sont écrits
+# dans audit_log / role_state par le premier tour qui suit la promotion.
 set -euo pipefail
 . "$(dirname "$0")/common.sh"
 
@@ -58,6 +60,16 @@ sb_catch_up() {
 	while [ "$SECONDS" -lt "$deadline" ]; do
 		[ "$(sb_admin "SELECT pg_last_wal_replay_lsn() >= '$lsn'::pg_lsn" 2>/dev/null || true)" = t ] && return 0
 		sleep 0.2
+	done
+	return 1
+}
+
+# wait_for_sb SQL : attend que SQL, exécuté sur le standby, renvoie 't' (30 s)
+wait_for_sb() {
+	local deadline=$((SECONDS + 30))
+	while [ "$SECONDS" -lt "$deadline" ]; do
+		[ "$(sb_admin "$1" 2>/dev/null || true)" = t ] && return 0
+		sleep 0.5
 	done
 	return 1
 }
@@ -188,5 +200,34 @@ n=$(grep -cE 'pg_pass_policy: worker .* failed|read-only transaction' "$PPP_TMP/
 check_eq "standby : aucun échec de cycle du worker (aucune écriture tentée)" "0" "$n"
 n=$(grep -c 'pg_pass_policy: worker .* failed' "$PPP_TMP/server.log" || true)
 check_eq "primaire : aucun échec de cycle du worker" "0" "$n"
+
+# --- promotion : les verrous locaux du standby sont audités ------------------
+n_locked_before=$(sb_admin "SELECT count(*) FROM pass_policy.audit_log WHERE event_type = 'role_locked' AND role_name = 'regress_sb_auto'")
+for i in 1 2; do sb_as regress_sb_auto "$BAD" >/dev/null || true; done
+out=$(sb_as regress_sb_auto "$GOOD") || true
+check_contains "standby : nouveau verrou local avant promotion" "is locked by pg_pass_policy" "$out"
+sleep 3 # un tour du worker du standby : rien n'est acquitté
+n=$(grep -c 'not written to the audit log' "$PPP_TMP/standby.log" || true)
+check_eq "standby : échecs et verrous locaux non acquittés (restent en attente)" "0" "$n"
+"$PPP_BINDIR/pg_ctl" -D "$SB_DATA" -w -t 60 promote >/dev/null
+if wait_for_sb "SELECT NOT pg_is_in_recovery()"; then
+	ok "standby promu"
+else
+	fail "le standby n'a pas été promu"
+fi
+if wait_for_sb "SELECT coalesce((SELECT locked_until > now() AND locked_by = 'auto' FROM pass_policy.role_state WHERE role_name = 'regress_sb_auto'), false)"; then
+	ok "nouveau primaire : verrou local du standby copié dans role_state"
+else
+	fail "nouveau primaire : role_state ne contient pas le verrou" "$(sb_admin "SELECT * FROM pass_policy.role_state WHERE role_name = 'regress_sb_auto'")"
+fi
+n_locked_after=$(sb_admin "SELECT count(*) FROM pass_policy.audit_log WHERE event_type = 'role_locked' AND role_name = 'regress_sb_auto'")
+check_eq "nouveau primaire : audit role_locked du verrou local écrit" "1" "$( [ "$n_locked_after" -gt "$n_locked_before" ] && echo 1 || echo 0)"
+out=$(sb_admin "SELECT coalesce(sum((details->>'count')::int), 0) >= 2 FROM pass_policy.audit_log
+                 WHERE event_type = 'auth_failed' AND role_name = 'regress_sb_auto' AND event_time > now() - interval '1 minute'")
+check_eq "nouveau primaire : échecs comptés sur le standby audités (auth_failed)" "t" "$out"
+out=$(sb_as regress_sb_auto "$GOOD") || true
+check_contains "nouveau primaire : le rôle reste verrouillé" "is locked by pg_pass_policy" "$out"
+n=$(grep -c 'pg_pass_policy: worker .* failed' "$PPP_TMP/standby.log" || true)
+check_eq "nouveau primaire : aucun échec de cycle du worker" "0" "$n"
 
 ppp_finish
