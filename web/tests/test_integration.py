@@ -857,6 +857,23 @@ def test_reserved_profile_names_are_refused(client, super_conn):
         super_conn.execute("DELETE FROM pass_policy.profile WHERE name = 'new'")
 
 
+def test_reserved_profile_created_in_sql_is_not_deleted(client, super_conn):
+    """A "." profile created with SQL: POST /profiles/p/%2E/delete answers
+    the 404 of the reserved names, the profile stays."""
+    super_conn.execute("SELECT pass_policy.create_profile('.', '{}'::jsonb)")
+    try:
+        token = csrf_token(client, "/profiles")
+        for headers in ({"X-CSRF-Token": token, "HX-Request": "true"}, {"X-CSRF-Token": token}):
+            response = client.post("/profiles/p/%2E/delete", headers=headers)
+            assert response.status_code == 404, response.text
+            assert "cannot be managed from this interface" in response.text
+        assert super_conn.execute(
+            "SELECT count(*) FROM pass_policy.profile WHERE name = '.'"
+        ).fetchone() == (1,)
+    finally:
+        super_conn.execute("DELETE FROM pass_policy.profile WHERE name = '.'")
+
+
 PRIV_ROLES = {
     # role: (CREATE ROLE options, granted roles)
     "web_t_priv_plain": ("LOGIN", ()),

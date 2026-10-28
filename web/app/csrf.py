@@ -34,11 +34,13 @@ class InvalidCsrfToken(HTTPException):
 
     supplied tells the two cases apart.  A token was sent but does not match
     (page opened before its session was lost: cookie expired or cleared,
-    PGPP_WEB_SECRET changed, another identity): main.py asks htmx to reload
-    the page (HX-Refresh), which issues a fresh token, instead of failing
-    each action.  No token at all: a client that never fetched a page (the
-    pages carry the token in hx-headers and in every form), a reload would
-    not help."""
+    PGPP_WEB_SECRET changed, another identity): if the session cookie came
+    with it, main.py asks htmx to reload the page (HX-Refresh), which issues
+    a fresh token, instead of failing each action.  No token at all: a
+    client that never fetched a page (the pages carry the token in
+    hx-headers and in every form), a reload would not help.  Without the
+    session cookie, a reload would not help either (cookie blocked or
+    dropped): main.py explains instead."""
 
     def __init__(self, *, supplied: bool) -> None:
         self.supplied = supplied

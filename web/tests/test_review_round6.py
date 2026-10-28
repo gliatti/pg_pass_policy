@@ -275,7 +275,7 @@ def test_profile_edit_refuses_dot_names(app, monkeypatch, encoded):
     client, _ = _client(app)
     response = client.get(f"/profiles/p/{encoded}")
     assert response.status_code == 404
-    assert "is managed in SQL only" in response.text
+    assert "cannot be managed from this interface" in response.text
     assert 'id="profile-form"' not in response.text
     assert looked_up == []
 

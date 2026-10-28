@@ -1,7 +1,7 @@
 """Unit tests, thirteenth review round: the Secure-cookie-over-HTTP alert
-only without a session cookie (Origin only, no Referer), its message
-composed with the CSRF refusal, the 404 of the routes of a "." / ".."
-profile, no edit link nor delete form for such a profile in the listing."""
+only without a session cookie, its message composed with the CSRF
+refusal, the 404 of the routes of a "." / ".." profile (delete included),
+no edit link nor delete form for such a profile in the listing."""
 
 from __future__ import annotations
 
@@ -56,25 +56,6 @@ def test_a_stale_token_without_the_cookie_over_http_is_reported():
     assert "Session cookie not stored" in response.text
 
 
-# --- 2: Origin only ------------------------------------------------------------------------
-
-
-def test_secure_cookie_over_http_reads_origin_only():
-    settings = make_settings(session_https_only=True)
-
-    class Req:
-        def __init__(self, headers):
-            self.headers = headers
-
-    assert main.secure_cookie_over_http(Req({"origin": "http://x"}), settings)
-    assert not main.secure_cookie_over_http(Req({"origin": "https://x"}), settings)
-    # a Referer is never sent (Referrer-Policy: no-referrer): not consulted
-    assert not main.secure_cookie_over_http(Req({"referer": "http://x/page"}), settings)
-    assert not main.secure_cookie_over_http(
-        Req({"origin": "http://x"}), make_settings(session_https_only=False)
-    )
-
-
 # --- 5: the CSRF refusal kept, completed by the cookie alert -------------------------------
 
 
@@ -104,9 +85,36 @@ def test_reserved_profile_routes_say_sql_only(app, monkeypatch, encoded, method)
     assert response.status_code == 404
     name = "." if encoded == "%2E" else ".."
     # autoescaped quotes
-    assert f"profile &#34;{name}&#34; is managed in SQL only" in response.text
+    assert f"profile &#34;{name}&#34; cannot be managed from this interface" in response.text
     assert "is reserved by the web interface" not in response.text
     assert profiles.SQL_ONLY_MESSAGE != profiles.RESERVED_MESSAGE
+
+
+@pytest.mark.parametrize("encoded", ["%2E", "%2E%2E"])
+@pytest.mark.parametrize("htmx", [False, True])
+def test_reserved_profile_delete_is_refused_before_any_query(
+    app,  # noqa: F811
+    monkeypatch,
+    encoded,
+    htmx,
+):
+    """POST /profiles/p/%2E/delete: the same 404 as the edit page and the
+    update, before drop_profile() (a profile "." created with SQL is not
+    dropped from the web interface)."""
+    monkeypatch.setattr(db, "drop_profile", lambda *a: pytest.fail("drop_profile called"))
+    monkeypatch.setattr(db, "run_action", lambda *a: pytest.fail("run_action called"))
+    client, token = _client(app)
+    headers = {"X-CSRF-Token": token}
+    if htmx:
+        headers["HX-Request"] = "true"
+    response = client.post(f"/profiles/p/{encoded}/delete", headers=headers)
+    assert response.status_code == 404
+    name = "." if encoded == "%2E" else ".."
+    assert f"profile &#34;{name}&#34; cannot be managed from this interface" in response.text
+    # does not claim that the profile exists
+    assert "exist" not in response.text.lower()
+    if htmx:
+        assert response.headers["HX-Retarget"] == "#alerts"
 
 
 # --- 4: no edit link nor delete form for "." / ".." ----------------------------------------

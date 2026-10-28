@@ -203,22 +203,21 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
   n'est émis sur les pages 401/403 affichées avant l'authentification. Une
   requête marquée `Sec-Fetch-Site: cross-site` ou `same-site` est refusée : le
   back-office n'a pas d'appelant légitime sur un autre sous-domaine ou port.
-  Un jeton périmé (session perdue pendant que la page restait ouverte : cookie
-  expiré ou effacé, `PGPP_WEB_SECRET` changé) donne un 403 « CSRF token
-  invalid: reload the page » ; pour une requête htmx, la réponse porte
-  `HX-Refresh: true` et la page est rechargée avec un jeton neuf. Exception :
-  avec `PGPP_WEB_SESSION_HTTPS_ONLY=true` et une page chargée en HTTP clair
-  (en-tête `Origin` en `http://` ; pas de `Referer`, absent avec
-  `Referrer-Policy: no-referrer`) et une requête arrivée sans cookie de
-  session, le navigateur ne garde jamais le cookie `Secure` ; au lieu d'un
-  rechargement qui échouerait à chaque action, le message « CSRF token
-  invalid » est complété d'une alerte « Session cookie not stored (or
+  Un refus CSRF suit deux règles. Sans cookie de session (client qui n'a
+  chargé aucune page, cookies bloqués par le navigateur, cookie `Secure`
+  écarté d'une page servie en HTTP clair avec
+  `PGPP_WEB_SESSION_HTTPS_ONLY=true`, session expirée), le jeton ne peut pas
+  correspondre et un rechargement échouerait à chaque action : le message
+  (« CSRF token invalid: reload the page » ou « CSRF token missing: fetch a
+  page first ») est complété d'une alerte « Session cookie not stored (or
   expired) » qui invite à vérifier `PGPP_WEB_SESSION_HTTPS_ONLY` et les
-  cookies. Si le cookie est bien présent, le jeton est seulement périmé : la
-  page est rechargée comme ci-dessus. Une requête sans
-  aucun jeton (client qui n'a chargé aucune page) reçoit « CSRF token
-  missing: fetch a page first », complété par la même alerte si elle ne porte
-  pas non plus de cookie de session. Le jeton n'est publié que dans `hx-headers` (pas de
+  cookies, sans rechargement automatique. Avec le cookie, un jeton fourni
+  mais périmé (session renouvelée pendant que la page restait ouverte :
+  `PGPP_WEB_SECRET` changé, autre identité) donne un 403 « CSRF token
+  invalid: reload the page » ; pour une requête htmx, la réponse porte
+  `HX-Refresh: true` et la page est rechargée avec un jeton neuf. Une requête
+  sans aucun jeton mais avec le cookie reçoit seulement « CSRF token missing:
+  fetch a page first ». Le jeton n'est publié que dans `hx-headers` (pas de
   balise `<meta>`).
 - **En-têtes** : `Content-Security-Policy` sans script inline (nonce par
   requête, `script-src 'self'`, `frame-ancestors 'none'`, `form-action 'self'`),
@@ -332,9 +331,10 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
   `x/delete` ne peut pas exister, ce que vérifie un test d'intégration). Seuls
   `.` et `..` (segments supprimés de l'URL par le navigateur), acceptés par
   l'extension, restent injoignables : l'interface refuse de créer un profil
-  portant l'un d'eux (422, message explicite) ; son formulaire d'édition et sa
-  modification répondent 404 « profile "…" is managed in SQL only » (même
-  garde, avant toute requête) ; dans la liste des profils, un tel profil
+  portant l'un d'eux (422, message explicite) ; son formulaire d'édition, sa
+  modification et sa suppression répondent 404 « profile "…" cannot be
+  managed from this interface » (même garde, avant toute requête, sans
+  affirmer que le profil existe) ; dans la liste des profils, un tel profil
   n'a ni lien d'édition ni bouton de suppression (mention « SQL only ») : il
   se gère en SQL.
 - **Droits** : le rôle de service est seulement membre de `pass_policy_admin` ;

@@ -85,21 +85,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         headers = exc.headers
         detail = str(exc.detail)
         if isinstance(exc, InvalidCsrfToken):
-            has_cookie = session_cookie_name(settings) in request.cookies
-            if not exc.supplied:
-                # no token: a client that never fetched a page; without the
-                # session cookie either, say that it must be kept as well
-                if not has_cookie:
-                    detail = f"{detail}. {SESSION_NOT_STORED}"
-            elif not has_cookie and secure_cookie_over_http(request, settings):
-                # a Secure cookie the browser drops (page served over plain
-                # HTTP): a reload would fail the same way on every action.
-                # With the cookie present, the token is merely stale: the
-                # reload below applies
+            # no session cookie: the token can never match (a client that
+            # never fetched a page, cookies blocked, a Secure cookie dropped
+            # over plain HTTP, an expired session).  A reload would fail the
+            # same way on every action: explain instead
+            if session_cookie_name(settings) not in request.cookies:
                 detail = f"{detail}. {SESSION_NOT_STORED}"
-            elif is_hx(request):
-                # a stale token (session expired or lost while the page
-                # stayed open): reload the page for a fresh one
+            elif exc.supplied and is_hx(request):
+                # the cookie is there, the token is merely stale (session
+                # lost or renewed while the page stayed open): reload the
+                # page for a fresh one
                 headers = {**(headers or {}), "HX-Refresh": "true"}
         return _error_response(request, exc.status_code, detail, headers)
 
@@ -157,18 +152,6 @@ SESSION_NOT_STORED = (
     " check PGPP_WEB_SESSION_HTTPS_ONLY / cookies (a Secure cookie is not kept"
     " over plain HTTP, the browser may block cookies)"
 )
-
-
-def secure_cookie_over_http(request: Request, settings: Settings) -> bool:
-    """A Secure session cookie (PGPP_WEB_SESSION_HTTPS_ONLY) and a page the
-    browser loaded over plain HTTP (Origin as the browser sees it, whatever
-    the proxy in between): the cookie is never stored.  Origin only: the
-    pages are served with Referrer-Policy: no-referrer, the browser sends no
-    Referer, and htmx requests (POST) always carry Origin."""
-    if not settings.session_https_only:
-        return False
-    origin = request.headers.get("origin") or ""
-    return origin.lower().startswith("http://")
 
 
 def session_cookie_name(settings: Settings) -> str:
