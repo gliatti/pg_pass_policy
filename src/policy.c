@@ -54,7 +54,11 @@ PG_FUNCTION_INFO_V1(ppp_record_done);
 
 static check_password_hook_type prev_check_password_hook = NULL;
 
-/* WARNING "extension not installed here" emitted once per session */
+/*
+ * WARNING "policy not applied" (extension not installed here, or outside
+ * pg_pass_policy.database: hook and generate_password()) emitted once per
+ * session
+ */
 static bool ppp_missing_schema_warned = false;
 
 /*
@@ -1094,13 +1098,18 @@ ppp_evaluate_plain(const char *username, Oid roleid, const char *password,
  *   then the minimum age (PPP-030) when check_history and the caller is not
  *   a superuser; complexity and history cannot be checked on a verifier;
  * - clear text: PPP-002 when password_encryption is md5 with require_scram,
- *   then complexity (skipped for a superuser caller with superuser_bypass),
- *   minimum age and history (ppp_evaluate_plain()).
+ *   then complexity (skipped when bypass_complexity), minimum age and
+ *   history (ppp_evaluate_plain()).
+ *
+ * bypass_complexity is superuser_bypass applied to a superuser caller: the
+ * hook passes it, check_password() never does (it answers for the profile
+ * of the role, whoever calls it).
  */
 static const char *
 ppp_evaluate_password(const char *username, Oid roleid, const char *password,
 					  PasswordType password_type, const pppProfile *p,
-					  bool check_history, bool caller_is_super)
+					  bool check_history, bool caller_is_super,
+					  bool bypass_complexity)
 {
 	if (password_type != PASSWORD_TYPE_PLAINTEXT)
 	{
@@ -1117,8 +1126,8 @@ ppp_evaluate_password(const char *username, Oid roleid, const char *password,
 	if (ppp_require_scram && Password_encryption == PASSWORD_TYPE_MD5)
 		return "PPP-002";
 	return ppp_evaluate_plain(username, roleid, password, p,
-							  ppp_superuser_bypass && caller_is_super,
-							  check_history, caller_is_super);
+							  bypass_complexity, check_history,
+							  caller_is_super);
 }
 
 
@@ -1297,7 +1306,8 @@ ppp_policy_not_applicable(const char *username, bool in_ppp_db)
  * always_error (check_password()): ERROR PPP-003 whatever enforce_database,
  * since an answer "compliant" would be meaningless.  Otherwise
  * (generate_password()): ERROR PPP-003 with enforce_database, else a
- * WARNING and the caller goes on (a random password harms nobody).
+ * WARNING (once per session, shared with the hook) and the caller goes on
+ * (a random password harms nobody).
  */
 static void
 ppp_require_policy_database(bool always_error)
@@ -1320,11 +1330,16 @@ ppp_require_policy_database(bool always_error)
 				 errhint("%s", hint),
 				 errhidestmt(true),
 				 errhidecontext(true)));
-	ereport(WARNING,
-			(errmsg("pg_pass_policy: password policy not applied outside database \"%s\"",
-					ppp_database),
-			 errhidestmt(true),
-			 errhidecontext(true)));
+	/* same once-per-session flag as the hook (ppp_policy_not_applicable) */
+	if (!ppp_missing_schema_warned)
+	{
+		ereport(WARNING,
+				(errmsg("pg_pass_policy: password policy not applied outside database \"%s\"",
+						ppp_database),
+				 errhidestmt(true),
+				 errhidecontext(true)));
+		ppp_missing_schema_warned = true;
+	}
 }
 
 /*
@@ -1353,7 +1368,8 @@ ppp_apply_policy(const char *username, const char *shadow_pass,
 
 	/* steps 3 to 6 (same evaluation as check_password()) */
 	code = ppp_evaluate_password(username, roleid, shadow_pass, password_type,
-								 &prof, may_check_history, caller_is_super);
+								 &prof, may_check_history, caller_is_super,
+								 ppp_superuser_bypass && caller_is_super);
 	if (code != NULL)
 		ppp_reject(username, code, &prof);
 
@@ -1470,9 +1486,11 @@ ppp_check_secret(FunctionCallInfo fcinfo, const char *username, Oid roleid,
 		pwtext = PG_GETARG_TEXT_PP(1);
 		password = text_to_cstring(pwtext);
 
+		/* superuser_bypass ignored: the answer is that of the profile */
 		code = ppp_evaluate_password(username, roleid, password,
 									 get_password_type(password), prof,
-									 may_check_history, caller_is_super);
+									 may_check_history, caller_is_super,
+									 false);
 	}
 	PG_FINALLY();
 	{
@@ -1495,6 +1513,11 @@ ppp_check_secret(FunctionCallInfo fcinfo, const char *username, Oid roleid,
  *
  * NULL if the password complies with the effective profile of the role,
  * otherwise "PPP-0xx: reason".  No side effect, no audit.
+ *
+ * pg_pass_policy.superuser_bypass is ignored: the function answers for the
+ * profile of the role, so that a superuser checking a password for someone
+ * else (client, CLI) is not told that a weak password complies.  The hook
+ * still lets such a password through for a superuser caller.
  *
  * The minimum age, history and current password checks are only done when
  * the caller is a superuser, the role itself, or may change the role's

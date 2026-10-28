@@ -632,6 +632,23 @@ AS 'MODULE_PATHNAME', 'ppp_is_exempt'
 LANGUAGE C STABLE STRICT;
 COMMENT ON FUNCTION _is_exempt(text) IS 'Internal: true if the role is listed in pg_pass_policy.exempt_roles (same function as the C hooks)';
 
+-- Refusal shared by expire_password() and lock_role(): an exempt role can be
+-- neither expired nor locked by the extension (22023, same message and HINT)
+CREATE FUNCTION _require_not_exempt(p_role name)
+RETURNS void
+LANGUAGE plpgsql STABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+BEGIN
+    IF pass_policy._is_exempt(p_role::text) THEN
+        RAISE EXCEPTION 'pg_pass_policy: role "%" is exempt from the policy', p_role
+              USING ERRCODE = 'invalid_parameter_value',
+                    HINT = 'Remove it from pg_pass_policy.exempt_roles first.';
+    END IF;
+END
+$$;
+COMMENT ON FUNCTION _require_not_exempt(name) IS 'Internal: raises 22023 if the role is listed in pg_pass_policy.exempt_roles';
+
 /*
  * Calls to the C shared-memory functions.  'lock', 'unlock' and
  * 'unlock_expired' (unlock only if the lock has expired, see
@@ -756,14 +773,17 @@ COMMENT ON FUNCTION _refresh_role_state(oid) IS 'Internal: recomputes expires_at
  *             rotation pair only): the extension does not manage the
  *             expiry, it only lifts a block it caused; a past VALID UNTIL
  *             set by hand (to disable the account) is left alone.
- *   'release' switch_rotation_pair(), role becoming active again, when the
- *             extension does not manage its VALID UNTIL ('unblock' mode
- *             above): lifts the bound the pair wrote when the role became
- *             the previous one (= valid_until_synced), even if it is still
- *             in the future; 'unblock' only lifts a past one, and nothing
- *             would ever lift this one: the active role would be blocked
- *             at the end of the grace period.  A value set by hand is left
- *             alone, as in 'unblock'.
+ *   'release' _rotate_role() (rotate_password(), switch_rotation_pair()),
+ *             password just changed, when the extension does not manage
+ *             the role's VALID UNTIL (manage_valid_until = off, or exempt
+ *             role): lifts a bound written by the extension
+ *             (= valid_until_synced: expire_password(), pair bound written
+ *             when the role became the previous one, former sync) even if
+ *             it is still in the future: the password it bounded has just
+ *             been replaced, and nothing would ever lift a future bound
+ *             ('unblock' only lifts a past one), so the role would be
+ *             blocked when it passes.  A value set by hand is left alone,
+ *             as in 'unblock'.
  * Returns a jsonb description of the change, or NULL if nothing was done.
  * Step d of run_maintenance() computes the same target value for all roles
  * at once, to call this function only for those whose VALID UNTIL differs
@@ -794,21 +814,17 @@ BEGIN
 
     IF p_mode = 'force' THEN
         v_new := coalesce(v_desired, 'infinity');
-    ELSIF p_mode = 'unblock' THEN
-        IF r.rolvaliduntil IS NULL OR r.rolvaliduntil > now()
+    ELSIF p_mode IN ('unblock', 'release') THEN
+        IF r.rolvaliduntil IS NULL OR r.rolvaliduntil = 'infinity'
            -- not written by us: a manual VALID UNTIL (account disabled by
            -- hand) is respected, as in step d of run_maintenance()
-           OR r.rolvaliduntil IS DISTINCT FROM r.valid_until_synced THEN
+           OR r.rolvaliduntil IS DISTINCT FROM r.valid_until_synced
+           -- 'unblock' only lifts a bound already passed
+           OR (p_mode = 'unblock' AND r.rolvaliduntil > now()) THEN
             RETURN NULL;
         END IF;
         -- not grace_until: with manage_valid_until = off nothing would ever
         -- lift that new value once passed, and the role would end up blocked
-        v_new := coalesce(r.pair_bound, 'infinity');
-    ELSIF p_mode = 'release' THEN
-        IF r.rolvaliduntil IS NULL OR r.rolvaliduntil = 'infinity'
-           OR r.rolvaliduntil IS DISTINCT FROM r.valid_until_synced THEN
-            RETURN NULL;
-        END IF;
         v_new := coalesce(r.pair_bound, 'infinity');
     ELSE
         IF v_desired IS NULL THEN
@@ -1330,16 +1346,18 @@ BEGIN
     PERFORM pass_policy._ensure_recorded(p_role);
 
     PERFORM pass_policy._refresh_role_state(p_oid);
-    -- run_maintenance() step d never synchronises an exempt role (it only
-    -- lifts a past VALID UNTIL, 'unblock'): a VALID UNTIL written here would
-    -- never be updated again, so only a past one written by the extension
-    -- (valid_until_synced) is lifted, as with manage_valid_until = off (this
-    -- also lifts the bound left by a previous switch_rotation_pair()); a
-    -- past VALID UNTIL set by hand is kept
+    -- When the extension does not manage the role's VALID UNTIL
+    -- (manage_valid_until = off, or exempt role: run_maintenance() step d
+    -- then only lifts a past one, 'unblock'), a VALID UNTIL written here
+    -- would never be updated again: 'release' only lifts a bound written by
+    -- the extension (valid_until_synced), even a future one (expire_password(),
+    -- bound left by a previous switch_rotation_pair(), former sync), since
+    -- the password it bounded has just been replaced; a VALID UNTIL set by
+    -- hand is kept
     PERFORM pass_policy._apply_valid_until(p_oid,
               CASE WHEN pass_policy._guc_on('pg_pass_policy.manage_valid_until', true)
                         AND NOT pass_policy._is_exempt(p_role)
-                   THEN 'force' ELSE 'unblock' END);
+                   THEN 'force' ELSE 'release' END);
 END
 $$;
 COMMENT ON FUNCTION _rotate_role(name, oid, int) IS 'Internal: generates, sets and records a new password for an already checked role; returns it and the profile used';
@@ -1392,11 +1410,7 @@ BEGIN
     -- An exempt role is never synchronised nor reported as expired
     -- (v_role_status shows 'exempt'): a VALID UNTIL now() written here would
     -- block the role silently, hence the refusal.
-    IF pass_policy._is_exempt(v_role) THEN
-        RAISE EXCEPTION 'pg_pass_policy: role "%" is exempt from the policy', v_role
-              USING ERRCODE = 'invalid_parameter_value',
-                    HINT = 'Remove it from pg_pass_policy.exempt_roles first.';
-    END IF;
+    PERFORM pass_policy._require_not_exempt(v_role);
     -- also refreshes role_state.role_name (current name, after a rename)
     PERFORM pass_policy._ensure_state(v_oid);
     UPDATE pass_policy.role_state s
@@ -1426,10 +1440,7 @@ BEGIN
     -- The lockout hook ignores exempt roles: the lock would only show in
     -- v_role_status (status 'locked') and apply unexpectedly as soon as the
     -- role leaves exempt_roles.
-    IF pass_policy._is_exempt(v_role) THEN
-        RAISE EXCEPTION 'pg_pass_policy: role "%" is exempt from the policy: remove it from pg_pass_policy.exempt_roles first', v_role
-              USING ERRCODE = 'invalid_parameter_value';
-    END IF;
+    PERFORM pass_policy._require_not_exempt(v_role);
     IF $2 IS NOT NULL AND $2 <= interval '0' THEN
         RAISE EXCEPTION 'pg_pass_policy: lock duration must be positive'
               USING ERRCODE = 'invalid_parameter_value';
@@ -1618,17 +1629,9 @@ BEGIN
            previous_valid_until = NULL
      WHERE r.pair_name = rp.pair_name;
 
+    -- also lifts the bound written by a previous switch, even a future one,
+    -- when the extension does not manage VALID UNTIL ('release')
     SELECT r.password INTO v_pwd FROM pass_policy._rotate_role(v_new, v_new_oid, $2) r;
-    -- When the extension does not manage VALID UNTIL (manage_valid_until =
-    -- off, or exempt role), _rotate_role() only lifts a past bound
-    -- ('unblock'): the bound written by a previous switch, still in the
-    -- future after two quick switches, would block the active role at the
-    -- end of the grace period.  'release' lifts it (bound written by the
-    -- extension only).
-    IF NOT (pass_policy._guc_on('pg_pass_policy.manage_valid_until', true)
-            AND NOT pass_policy._is_exempt(v_new)) THEN
-        PERFORM pass_policy._apply_valid_until(v_new_oid, 'release');
-    END IF;
 
     IF v_old IS NOT NULL THEN
         SELECT now() + p.grace_period INTO v_bound FROM pass_policy.effective_profile(v_old) p;

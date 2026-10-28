@@ -310,7 +310,8 @@ SELECT r AS role_name, pass_policy._is_exempt(r) AS sql_exempt,
   FROM unnest(ARRAY['Regress_Exempt Q', 'regress_exempt_u', 'Regress_Exempt_U']) r
  ORDER BY 1;
 -- Rôle exempté : rotate_password() ne pose pas de VALID UNTIL (run_maintenance()
--- ne le resynchroniserait jamais), il relève seulement une borne passée
+-- ne le resynchroniserait jamais), il relève seulement une borne écrite par
+-- l'extension
 INSERT INTO ppp_test.secrets SELECT 'exempt_rot', pass_policy.rotate_password('regress_exempt_u');
 SELECT rolvaliduntil IS NULL AS exempt_rotate_no_valid_until FROM pg_roles WHERE rolname = 'regress_exempt_u';
 -- (vérification 6) expire_password() et lock_role() refusés pour un rôle
@@ -319,6 +320,21 @@ SELECT rolvaliduntil IS NULL AS exempt_rotate_no_valid_until FROM pg_roles WHERE
 -- ignore le verrou d'un rôle exempté ; rien n'est écrit
 SELECT ppp_test.try($$SELECT pass_policy.expire_password('regress_exempt_u')$$) AS expire_exempt;
 SELECT ppp_test.try($$SELECT pass_policy.lock_role('regress_exempt_u')$$) AS lock_exempt;
+-- (vérification 7) même refus des deux fonctions (_require_not_exempt()) :
+-- message et HINT identiques
+CREATE FUNCTION ppp_test.err_text(stmt text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE m text; h text;
+BEGIN
+  EXECUTE stmt;
+  RETURN 'ok';
+EXCEPTION WHEN OTHERS THEN
+  GET STACKED DIAGNOSTICS m = MESSAGE_TEXT, h = PG_EXCEPTION_HINT;
+  RETURN m || ' / HINT: ' || h;
+END $$;
+SELECT ppp_test.err_text($$SELECT pass_policy.expire_password('regress_exempt_u')$$) AS expire_exempt_msg;
+SELECT ppp_test.err_text($$SELECT pass_policy.lock_role('regress_exempt_u')$$) AS lock_exempt_msg;
+DROP FUNCTION ppp_test.err_text(text);
 SELECT r.rolvaliduntil IS NULL AS exempt_no_valid_until,
        NOT s.must_change AS exempt_not_expired, s.locked_until IS NULL AS exempt_not_locked
   FROM pg_roles r JOIN pass_policy.role_state s ON s.role_oid = r.oid
@@ -340,6 +356,18 @@ END $$;
 SELECT ppp_test.expired_before_exemption('regress_exempt_u');
 INSERT INTO ppp_test.secrets SELECT 'exempt_rot2', pass_policy.rotate_password('regress_exempt_u');
 SELECT rolvaliduntil = 'infinity' AS exempt_rotate_unblocked FROM pg_roles WHERE rolname = 'regress_exempt_u';
+-- (vérification 7) borne future écrite par l'extension (valid_until_synced,
+-- par exemple synchronisée avant l'exemption) : levée par la rotation (mode
+-- release) ; une borne future posée à la main est conservée
+UPDATE pass_policy.role_state s SET valid_until_synced = '2099-01-01 00:00:00+00'
+ WHERE s.role_oid = 'regress_exempt_u'::regrole;
+ALTER ROLE regress_exempt_u VALID UNTIL '2099-01-01 00:00:00+00';
+INSERT INTO ppp_test.secrets SELECT 'exempt_rot_f1', pass_policy.rotate_password('regress_exempt_u');
+SELECT rolvaliduntil = 'infinity' AS exempt_future_bound_released FROM pg_roles WHERE rolname = 'regress_exempt_u';
+ALTER ROLE regress_exempt_u VALID UNTIL '2099-01-01 00:00:00+00';
+INSERT INTO ppp_test.secrets SELECT 'exempt_rot_f2', pass_policy.rotate_password('regress_exempt_u');
+SELECT rolvaliduntil = '2099-01-01 00:00:00+00' AS exempt_manual_bound_kept FROM pg_roles WHERE rolname = 'regress_exempt_u';
+ALTER ROLE regress_exempt_u VALID UNTIL 'infinity';
 -- Rôle exempté dont le mot de passe est changé par un ALTER ROLE direct (le
 -- hook ne l'enregistre pas) : run_maintenance() réconcilie l'historique puis
 -- relève le VALID UNTIL posé par expire_password() (mode unblock), sans

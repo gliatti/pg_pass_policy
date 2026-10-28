@@ -19,8 +19,11 @@
 > - **Superutilisateur** : ajoutez `pg_pass_policy.exempt_roles = 'postgres'`
 >   (ou votre compte d'administration) pour ne pas vous verrouiller dehors :
 >   pendant la fenêtre de démarrage, tout rôle non exempté est refusé
->   (`57P03`), y compris par `peer` ou `trust`. Un rôle exempté ne peut être
->   ni expiré ni verrouillé par l'extension.
+>   (`57P03`), y compris par `trust` en TCP. Seule exception, la voie de
+>   secours : un superutilisateur authentifié en `peer`, ou en `trust` sur
+>   socket Unix, passe toujours (sauf verrou déjà en mémoire partagée) ;
+>   gardez une telle ligne `local` dans `pg_hba.conf`. Un rôle exempté ne
+>   peut être ni expiré ni verrouillé par l'extension.
 
 Extension PostgreSQL (C + SQL) de gestion du cycle de vie des mots de passe des
 rôles, pour PostgreSQL **14 à 18** :
@@ -80,11 +83,12 @@ Puis, connecté en superutilisateur **à la base désignée** :
 CREATE EXTENSION pg_pass_policy;
 ```
 
-Au démarrage, seuls les rôles de `exempt_roles` passent tant que le worker
-n'a pas chargé les verrous (les autres connexions, quelle que soit la
-méthode d'authentification, `trust` et `peer` compris, et celles des
-superutilisateurs aussi, reçoivent `57P03`, voir « Verrouillage et
-déverrouillage »). Le worker occupe une place de `max_worker_processes` : si
+Au démarrage, seuls les rôles de `exempt_roles` et les superutilisateurs
+authentifiés en `peer` ou en `trust` sur socket Unix passent tant que le
+worker n'a pas chargé les verrous (les autres connexions, quelle que soit la
+méthode d'authentification, `trust` en TCP compris, et celles des
+superutilisateurs par mot de passe aussi, reçoivent `57P03`, voir
+« Verrouillage et déverrouillage »). Le worker occupe une place de `max_worker_processes` : si
 aucune n'est libre, ou si `pg_pass_policy.database` n'existe pas, il ne
 démarre pas ; 10 secondes après le démarrage, les superutilisateurs sont
 alors acceptés et le log porte, au plus une fois par minute, le message
@@ -150,8 +154,10 @@ SELECT pass_policy.generate_password(32, 'applicatif');
 ```
 
 `check_password` répond comme le ferait `ALTER ROLE … PASSWORD` du même
-appelant (même évaluation que le hook, `superuser_bypass` et `min_age` d'un
-vérificateur pré-haché compris). Hors de la base `pg_pass_policy.database`,
+appelant (même évaluation que le hook, `min_age` d'un vérificateur pré-haché
+compris), à une exception près : elle ignore `superuser_bypass` et répond
+pour le profil du rôle, même appelée par un superutilisateur (un client qui
+vérifie un mot de passe pour autrui ne doit pas le croire conforme). Hors de la base `pg_pass_policy.database`,
 où la politique ne s'applique pas, `check_password` lève `PPP-003` et
 `generate_password` aussi avec `enforce_database = on` (sinon `WARNING`,
 mot de passe produit).
@@ -267,15 +273,24 @@ toutes les 5 secondes, y compris sur un standby, et
 `pass_policy.worker_status()` montre `locks_loaded` à faux. Le client, lui,
 ne reçoit que le `57P03`, sans détail sur l'état interne. Les rôles de
 `pg_pass_policy.exempt_roles` passent toujours : c'est le filet de sécurité
-de l'administrateur (l'accès local par `peer` ou `trust` d'un rôle non
-exempté attend lui aussi la fin de la fenêtre). Une connexion de
+de l'administrateur. Un **superutilisateur** authentifié par une méthode
+locale sans secret (`peer`, ou `trust` sur socket Unix) passe aussi, quel
+que soit l'état du worker : la fenêtre peut rester fermée indéfiniment
+(extension non fiable, verrous trop nombreux pour `max_tracked_roles`) et
+cet accès local est alors la seule voie d'administration ; il est refusé
+« locked » si un verrou est déjà en mémoire partagée, et le log en garde la
+trace (LOG « superuser … admitted by local peer authentication … »). Un rôle
+ordinaire en `peer` ou en `trust` local, un superutilisateur en `trust` par
+TCP (même sur 127.0.0.1) ou dont le contrôle `peer` échoue reçoivent le
+`57P03`. Une connexion de
 réplication d'un rôle non exempté est concernée de la même façon.
-Les superutilisateurs ne passent que si le worker est absent (aucun worker
-10 secondes après le démarrage : base inexistante, `max_worker_processes`
-épuisé), pour qu'une installation dont le worker ne démarre pas reste
-administrable ; ils restent alors refusés si un verrou est déjà en mémoire
-partagée. Pendant un démarrage normal, un superutilisateur verrouillé dans
-`role_state` est donc refusé comme les autres. Avec `enabled = off`, rien
+Par mot de passe, les superutilisateurs ne passent que si le worker est
+absent (aucun worker 10 secondes après le démarrage : base inexistante,
+`max_worker_processes` épuisé), pour qu'une installation dont le worker ne
+démarre pas reste administrable ; ils restent alors refusés si un verrou est
+déjà en mémoire partagée. Pendant un démarrage normal, un superutilisateur
+verrouillé dans `role_state` qui se connecte par mot de passe est donc
+refusé comme les autres. Avec `enabled = off`, rien
 n'est bloqué ; avec `worker_interval = 0`, le worker fait quand même ce
 premier chargement au démarrage.
 
@@ -306,7 +321,8 @@ l'expiration levée par `run_maintenance()`, `manual` pour `unlock_role()`). Les
 rôles inexistants sont journalisés en une seule ligne `auth_failed` par tour
 du worker (`role_name` NULL, `details.unknown_roles` et `details.attempts`).
 De même, `failed_attempts()` ne nomme ces entrées que pour un
-superutilisateur : un nom saisi dans le champ utilisateur peut être un mot de
+superutilisateur (l'existence du nom est vérifiée à chaque appel : un rôle
+créé ou renommé sous ce nom apparaît aussitôt par son nom) : un nom saisi dans le champ utilisateur peut être un mot de
 passe. Les autres appelants (`pass_policy_viewer`, `pass_policy_admin`) en
 reçoivent une seule ligne de `role_name` NULL (compteurs additionnés).
 `lock_role()` refuse un rôle de `exempt_roles` (`22023`) : le hook ignore le
@@ -371,7 +387,7 @@ Tous préfixés `pg_pass_policy.`. Contexte `postmaster` = redémarrage ;
 | `log_events` | bool | `on` | SIGHUP | une ligne `LOG: pg_pass_policy: …` par événement |
 | `notify_channel` | string | `pg_pass_policy` | SIGHUP | canal `NOTIFY` (charge utile JSON `event`/`role`/`at`/`details`) |
 | `exempt_roles` | liste | `''` | SIGHUP | rôles exemptés de la politique **et** du verrouillage, séparés par des virgules, règles des identifiants SQL : noms non cités mis en minuscules, noms entre guillemets conservés tels quels (`'postgres, "App User"'`). `rotate_password()`, `switch_rotation_pair()` et `run_maintenance()` ne posent pas de `VALID UNTIL` sur un rôle exempté : ils relèvent seulement une borne déjà passée posée par l'extension (`expire_password()`, borne de paire ; pour `run_maintenance()`, une fois le mot de passe changé), jamais un `VALID UNTIL` posé à la main pour désactiver le compte |
-| `superuser_bypass` | bool | `off` | SIGHUP | `on` : les superutilisateurs échappent à la complexité (pas à l'historique) |
+| `superuser_bypass` | bool | `off` | SIGHUP | `on` : les superutilisateurs échappent à la complexité dans le hook (pas à l'historique) ; ignoré par `check_password()` |
 | `require_scram` | bool | `on` | SIGHUP | refuse les mots de passe MD5 (`PPP-002`) |
 | `enforce_database` | bool | `on` | SIGHUP | hors de `database`, `ALTER ROLE … PASSWORD` est refusé (`PPP-003`), même si l'extension est installée dans la base courante ; `off` : accepté sans contrôle avec un `WARNING` |
 
@@ -509,7 +525,10 @@ compte comme « spécial ».
   `ALTER ROLE … PASSWORD` classique. `rotate_password()` et
   `switch_rotation_pair()` ne posent alors pas non plus de `VALID UNTIL` sur
   le rôle dont le mot de passe change : ils relèvent seulement une borne
-  passée posée par l'extension, jamais un `VALID UNTIL` posé à la main.
+  posée par l'extension (`expire_password`, borne de paire, ancienne
+  synchronisation), même future, le mot de passe qu'elle bornait venant
+  d'être remplacé ; jamais un `VALID UNTIL` posé à la main. Il en va de même
+  pour un rôle exempté.
 - **Propriétaire du schéma** : le schéma `pass_policy` doit appartenir à un
   superutilisateur (celui qui a fait `CREATE EXTENSION`). S'il est cédé à un
   autre rôle (`ALTER SCHEMA … OWNER TO`) ou si son propriétaire perd l'attribut

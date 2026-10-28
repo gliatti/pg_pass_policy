@@ -170,8 +170,10 @@ SELECT ppp_test.code(pass_policy.check_password('regress_prehash', 'SCRAM-SHA-25
 RESET SESSION AUTHORIZATION;
 REVOKE pass_policy_admin FROM regress_prehash;
 -- superuser_bypass = on : un superutilisateur échappe aux règles de
--- complexité, pour check_password() comme pour le hook (GUC SIGHUP : attente
--- d'une instruction par tour, sortie masquée, comme dans 90_privileges)
+-- complexité dans le hook ; check_password() l'ignore (vérification 7) : elle
+-- répond pour le profil du rôle, quel que soit l'appelant (GUC SIGHUP :
+-- attente d'une instruction par tour, sortie masquée, comme dans
+-- 90_privileges)
 INSERT INTO ppp_test.secrets VALUES ('bypass_weak', 'weakbypass');
 ALTER SYSTEM SET pg_pass_policy.superuser_bypass = on;
 SELECT pg_reload_conf();

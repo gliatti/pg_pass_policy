@@ -160,6 +160,11 @@ check_contains "enforce_database = off, autre base, check_password() : toujours 
 out=$(psql_other "SELECT length(pass_policy.generate_password())") || true
 check_contains "enforce_database = off, autre base, generate_password() : WARNING" 'WARNING: +pg_pass_policy: password policy not applied outside database' "$out"
 check_contains "enforce_database = off, autre base, generate_password() : mot de passe produit" '^24$' "$(printf '%s\n' "$out" | grep -v WARNING)"
+# (vérification 7) une seule fois par session : generate_password() répété
+# puis ALTER ROLE dans la même session partagent le verrou du hook
+out=$(psql_other "SELECT length(pass_policy.generate_password()); SELECT length(pass_policy.generate_password()); SELECT length(pass_policy.generate_password()); ALTER ROLE regress_notify PASSWORD 'Other-Db#Pass-2028'") || true
+n=$(printf '%s\n' "$out" | grep -c 'policy not applied outside database' || true)
+check_eq "enforce_database = off, autre base : WARNING une seule fois par session" "1" "$n"
 psql_admin "ALTER SYSTEM RESET pg_pass_policy.enforce_database" >/dev/null
 psql_admin "SELECT pg_reload_conf()" >/dev/null
 

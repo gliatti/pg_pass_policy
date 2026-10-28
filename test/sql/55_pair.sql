@@ -124,7 +124,7 @@ SELECT ppp_test.try($$SELECT * FROM pass_policy.switch_rotation_pair('no_such_pa
 
 DROP TABLE ppp_test.switches;
 
--- (vérification 6) manage_valid_until = off : _rotate_role() ne relève
+-- (vérification 6) manage_valid_until = off : _rotate_role() ne relevait
 -- qu'une borne passée (mode unblock). Après deux basculements rapides, le
 -- rôle qui redevient actif garde la borne future posée par le premier
 -- (previous_valid_until) : elle est levée (mode release), sinon le rôle actif
@@ -153,6 +153,26 @@ SELECT o3.active_role = o1.active_role AS back_to_first,
 SELECT abs(extract(epoch FROM r.rolvaliduntil - o.previous_valid_until)) < 2 AS previous_bounded
   FROM off2 o JOIN pg_roles r ON r.rolname = o.previous_role
  WHERE o.n = 3;
+-- (vérification 7) rotate_password() applique la même règle (mode release,
+-- dans _rotate_role()) : l'ancien rôle de la paire reste borné par
+-- previous_valid_until ; un rôle hors paire perd une borne future écrite par
+-- l'extension (valid_until_synced), garde une borne future posée à la main
+INSERT INTO ppp_test.secrets SELECT 'off2_prev_rot', pass_policy.rotate_password(o.previous_role)
+  FROM off2 o WHERE o.n = 3;
+SELECT abs(extract(epoch FROM r.rolvaliduntil - o.previous_valid_until)) < 2 AS previous_still_bounded
+  FROM off2 o JOIN pg_roles r ON r.rolname = o.previous_role
+ WHERE o.n = 3;
+CREATE ROLE regress_off2_solo LOGIN;
+INSERT INTO ppp_test.secrets SELECT 'off2_solo1', pass_policy.rotate_password('regress_off2_solo');
+UPDATE pass_policy.role_state s SET valid_until_synced = '2099-01-01 00:00:00+00'
+ WHERE s.role_oid = 'regress_off2_solo'::regrole;
+ALTER ROLE regress_off2_solo VALID UNTIL '2099-01-01 00:00:00+00';
+INSERT INTO ppp_test.secrets SELECT 'off2_solo2', pass_policy.rotate_password('regress_off2_solo');
+SELECT rolvaliduntil = 'infinity' AS solo_future_bound_released FROM pg_roles WHERE rolname = 'regress_off2_solo';
+ALTER ROLE regress_off2_solo VALID UNTIL '2099-01-01 00:00:00+00';
+INSERT INTO ppp_test.secrets SELECT 'off2_solo3', pass_policy.rotate_password('regress_off2_solo');
+SELECT rolvaliduntil = '2099-01-01 00:00:00+00' AS solo_manual_bound_kept FROM pg_roles WHERE rolname = 'regress_off2_solo';
+DROP ROLE regress_off2_solo;
 SELECT ppp_test.leaks();
 DROP TABLE off2;
 ALTER SYSTEM RESET pg_pass_policy.manage_valid_until;
