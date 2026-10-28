@@ -16,10 +16,23 @@ Pages :
 | `/` | tableau de bord : compteurs par statut (`v_role_status`), rôles en expiration (`v_expiring`), état du worker (`worker_status()`), derniers événements (`v_recent_audit`) |
 | `/roles` | tableau filtrable (statut, profil, recherche) ; actions rotate / lock / unlock / expire avec confirmation ; la rotation affiche le mot de passe **une seule fois** avec un bouton « Copy » |
 | `/profiles` | liste, création, modification, suppression, assignation aux rôles |
-| `/audit` | journal d'audit avec filtres (rôle, type, depuis) et pagination |
+| `/audit` | journal d'audit avec filtres (rôle, type, depuis) et pagination (voir ci-dessous) |
 | `/pairs` | paires de rotation : liste, création, bascule avec affichage unique du mot de passe |
 | `/maintenance` | exécution manuelle de `run_maintenance()` |
 | `/healthz` | sonde de vie (sans authentification, ne touche pas la base) |
+
+Audit : le filtre « depuis » accepte une date (`2026-10-27`,
+`2026-10-27T10:00`) ou une durée avec son unité (`7 days`, `12 hours`). Une
+valeur qui ressemble à une date sans en être une (`2026-13-45`) est refusée
+(« invalid date »), de même qu'un nombre seul (`7`), que PostgreSQL lirait
+comme des secondes : l'unité est exigée. La pagination lit une ligne de plus
+que la page pour savoir s'il existe une page suivante, sans compter toute la
+sélection à chaque page (pas de `count(*) OVER ()`). Le total affiché est
+exact jusqu'à 10 000 événements : sur la dernière page il découle de la page
+elle-même, ailleurs un comptage borné s'arrête à 10 001 lignes, et au-delà
+le total s'affiche « 10,000+ » sans nombre de pages (lien « next » seul).
+Une page au-delà de la fin (lien périmé) déclenche un comptage exact pour
+afficher la vraie dernière page.
 
 Statut et état du mot de passe : la colonne `status` de `v_role_status`
 montre d'abord le verrou (`locked`) puis l'exemption (`exempt`) ; l'état du
@@ -76,12 +89,12 @@ Tout passe par des variables d'environnement préfixées `PGPP_WEB_`.
 | `PGPP_WEB_SECRET` | **obligatoire** | clé de signature du cookie de session (jeton CSRF), 32 caractères minimum : `python3 -c 'import secrets; print(secrets.token_urlsafe(48))'` |
 | `PGPP_WEB_AUTH` | `basic` | `basic` (HTTP basic) ou `proxy` (en-tête posé par un reverse proxy) |
 | `PGPP_WEB_BASIC_USERS` | *(vide)* | mode `basic` : `user:hash-bcrypt,user2:hash-bcrypt`, toutes les empreintes du même coût bcrypt ; un utilisateur cité deux fois empêche le démarrage |
-| `PGPP_WEB_PROXY_HEADER` | `X-Remote-User` | mode `proxy` : en-tête portant l'utilisateur authentifié (`REMOTE_USER` est accepté et correspond à `Remote-User`) |
+| `PGPP_WEB_PROXY_HEADER` | `X-Remote-User` | mode `proxy` : en-tête portant l'utilisateur authentifié (`REMOTE_USER` est accepté et correspond à `Remote-User`), en UTF-8 (voir « Reverse proxy ») |
 | `PGPP_WEB_TRUSTED_PROXIES` | `127.0.0.1,::1` | mode `proxy` : adresses ou réseaux (CIDR) autorisés à poser l'en-tête ; `unix` pour un socket Unix ; `*` pour tout accepter (déconseillé) |
 | `PGPP_WEB_SESSION_HTTPS_ONLY` | `false` | marque le cookie de session `Secure` et le nomme `__Host-pgpp_session` : **obligatoire derrière HTTPS** (voir Sécurité) |
 | `PGPP_WEB_REALM` | `pg_pass_policy` | realm HTTP basic |
-| `PGPP_WEB_POOL_MIN` / `PGPP_WEB_POOL_MAX` | `1` / `4` | taille du pool de connexions (chaque connexion est vérifiée à sa sortie du pool et remplacée si le serveur l'a fermée) |
-| `PGPP_WEB_POOL_TIMEOUT` | `10` | attente maximale (s) d'une connexion du pool |
+| `PGPP_WEB_POOL_MIN` / `PGPP_WEB_POOL_MAX` | `1` / `4` | taille du pool de connexions (chaque connexion est vérifiée à sa sortie du pool et remplacée si le serveur l'a fermée) ; `POOL_MIN` ≥ 0, `POOL_MAX` ≥ 1 et `POOL_MAX` ≥ `POOL_MIN`, sinon l'application refuse de démarrer |
+| `PGPP_WEB_POOL_TIMEOUT` | `10` | attente maximale (s) d'une connexion du pool, nombre strictement positif et fini (refus au démarrage sinon) |
 | `PGPP_WEB_PAGE_SIZE` | `50` | taille de page de l'audit |
 | `PGPP_WEB_APP_NAME` | `pgpp-web` | préfixe de l'`application_name` PostgreSQL |
 
@@ -104,6 +117,22 @@ export PGPP_WEB_BASIC_USERS='alice:$2b$12$...,bob:$2b$12$...'
 Une empreinte tronquée ou abîmée (coupée par le shell, une apostrophe, un
 retour à la ligne) est refusée au démarrage : une empreinte bcrypt compte
 60 caractères, `$2b$NN$` puis 53 caractères de `[./A-Za-z0-9]`.
+
+Le navigateur renvoie le même en-tête `Authorization` à chaque requête : pour
+ne pas payer la vérification bcrypt (coûteuse par construction) à chaque
+fois, une vérification réussie est mémorisée dans la session. Celle-ci ne
+garde qu'une empreinte HMAC-SHA256, calculée avec `PGPP_WEB_SECRET`, de
+l'en-tête et de l'empreinte bcrypt configurée, jamais l'en-tête ni le mot de
+passe (le cookie de session est signé, pas chiffré). Un autre en-tête (autre
+utilisateur, autre mot de passe), une empreinte modifiée dans
+`PGPP_WEB_BASIC_USERS` (mot de passe changé, utilisateur retiré) ou un
+changement de `PGPP_WEB_SECRET` invalident ce cache : bcrypt est alors
+rejoué. Un échec efface le cache.
+
+Nom d'utilisateur (HTTP basic ou en-tête du proxy) : 1 à 128 caractères,
+sans caractère de contrôle C0 ou C1 (U+0000 à U+001F, U+007F à U+009F) ni
+séparateur de ligne ou de paragraphe (U+2028, U+2029), qu'un journal ou un
+terminal afficherait comme un saut de ligne.
 
 Le nom de l'utilisateur web est enregistré dans `pass_policy.audit_log`
 (colonne `application_name`, valeur `pgpp-web:alice`) : chaque action reste
@@ -164,6 +193,11 @@ lancer uvicorn avec `--no-proxy-headers` en mode `proxy`, ou ajouter les
 réseaux des clients à `PGPP_WEB_TRUSTED_PROXIES` en connaissance de cause.
 Les liens générés sont relatifs (chemin seul) : un préfixe de chemin se
 déclare avec `--root-path /pgpp`.
+
+En mode `proxy`, la valeur de l'en-tête est lue en UTF-8 (`Émilie` arrive
+sous la forme des octets `C3 89 6D…`) : une valeur qui n'est pas de l'UTF-8
+valide est refusée (401) au lieu d'être devinée, de sorte que deux en-têtes
+différents ne donnent jamais le même nom.
 
 Derrière HTTPS, `PGPP_WEB_SESSION_HTTPS_ONLY=true` est requis : le cookie de
 session devient `__Host-pgpp_session` (`Secure`, `Path=/`, sans `Domain`),
@@ -308,6 +342,9 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
   aucune ligne, la bascule est validée mais le mot de passe est inconnu :
   l'application répond 200 avec un avertissement (erreur journalisée) et la
   liste des paires relue normalement, sans inviter à recommencer la bascule.
+  De même, une rotation validée dont `rotate_password()` renvoie `NULL` ou une
+  chaîne vide répond 200 avec un avertissement (erreur journalisée) et la
+  ligne du rôle relue normalement, jamais un mot de passe affiché « None ».
 - **Bibliothèque non préchargée** : sans `pg_pass_policy` dans
   `shared_preload_libraries`, les vues (`v_role_status` appelle
   `failed_attempts()`) et les actions échouent toutes avec le SQLSTATE `55000`.
@@ -387,7 +424,10 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
   (ligne du rôle, liste des paires) échoue, le mot de passe est affiché quand
   même, avec un avertissement invitant à recharger la page : il n'existe nulle
   part ailleurs. Les deux routes partagent `db.reread_after_commit()`, qui
-  journalise l'échec et renvoie le résultat ou l'avertissement.
+  journalise l'échec et renvoie le résultat ou l'avertissement. La
+  maintenance manuelle l'utilise aussi pour relire l'état du worker après son
+  `COMMIT` : un échec de cette relecture affiche les actions effectuées avec
+  un avertissement, au lieu d'une page 500 qui inviterait à relancer.
 
 ## Tests
 

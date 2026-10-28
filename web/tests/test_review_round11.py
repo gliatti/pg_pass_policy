@@ -34,7 +34,7 @@ def test_the_audit_page_is_clamped(monkeypatch, total, requested, shown, offsets
     def list_audit(conn, *, offset, limit, **kw):
         seen.append(offset)
         rows = [] if offset >= total else [{"id": 1, "event_type": "auth_failed"}]
-        return rows, total
+        return db.AuditPage(rows, total)
 
     monkeypatch.setattr(db, "list_audit", list_audit)
     client, _ = _recording_client(app, events)

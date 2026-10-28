@@ -1197,3 +1197,44 @@ def test_expire_is_refused_for_an_exempt_role(client, status_roles, super_conn):
     assert response.status_code == 422, response.text
     assert "is exempt from the policy" in response.text
     assert _view_rows(super_conn)[S_EXEMPT][0] == "exempt"
+
+
+def test_list_audit_pages_without_count_over(client, test_url):
+    """db.list_audit() against the server: one row more than the page tells
+    whether a next page exists, the total is exact (bounded count, or the
+    last page itself), a page past the end gets the exact count."""
+    from psycopg.rows import dict_row
+
+    token = csrf_token(client, "/roles")
+    for _ in range(3):
+        client.post("/roles/web_t_alpha/rotate", headers={"X-CSRF-Token": token})
+    with psycopg.connect(test_url, row_factory=dict_row) as conn:
+        total = conn.execute(
+            "SELECT count(*) AS n FROM pass_policy.audit_log WHERE role_name = 'web_t_alpha'"
+        ).fetchone()["n"]
+        assert total >= 3
+        first = db.list_audit(conn, role="web_t_alpha", limit=2, offset=0)
+        assert len(first.rows) == 2 and first.has_next and first.total == total
+        assert not first.capped and "total" not in first.rows[0]
+        last_offset = (total - 1) // 2 * 2
+        last = db.list_audit(conn, role="web_t_alpha", limit=2, offset=last_offset)
+        assert not last.has_next and last.total == total
+        assert len(last.rows) == total - last_offset
+        past = db.list_audit(conn, role="web_t_alpha", limit=2, offset=total + 10)
+        assert past == db.AuditPage([], total)
+        ids = [r["id"] for r in first.rows]
+        assert ids == sorted(ids, reverse=True)
+
+
+def test_audit_since_is_checked_before_the_query(client):
+    for since, message in [
+        ("2026-13-45", "invalid date"),
+        ("2026-02-30", "invalid date"),
+        ("7", "needs a unit"),
+        ("not a date", "Invalid filter"),
+    ]:
+        response = client.get("/audit/table", params={"since": since})
+        assert response.status_code == 200
+        assert message in response.text, since
+    response = client.get("/audit/table", params={"since": "7 days"})
+    assert "Invalid filter" not in response.text

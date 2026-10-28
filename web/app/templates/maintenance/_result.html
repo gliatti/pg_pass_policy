@@ -1,4 +1,5 @@
 <div class="alert alert-ok">Maintenance completed: {{ actions|length }} action{{ 's' if actions|length != 1 else '' }}.</div>
+{% if warning %}<div class="alert alert-warn" role="alert">{{ warning }}</div>{% endif %}
 {% if actions %}
 <table>
   <thead><tr><th>action</th><th>role</th><th>details</th></tr></thead>

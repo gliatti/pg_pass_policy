@@ -100,7 +100,8 @@ def make_pool(settings: Settings) -> ConnectionPool:
     return ConnectionPool(
         settings.database_url,
         min_size=settings.pool_min,
-        max_size=max(settings.pool_max, settings.pool_min),
+        # config.Settings guarantees pool_max >= pool_min >= 0, pool_max >= 1
+        max_size=settings.pool_max,
         timeout=settings.pool_timeout,
         open=False,
         name="pgpp-web",
@@ -634,14 +635,40 @@ def unassign_profile(conn: Connection, role: str) -> None:
 # --- audit -------------------------------------------------------------------
 
 
+class InvalidFilter(ValueError):
+    """A filter value refused before any query (shown as "Invalid filter")."""
+
+
+# starts like an ISO date (2026-10-27, 2026-1-5, 2026-10-27T10:00...): parsed
+# as a date or refused, never handed to PostgreSQL as an interval
+_DATE_LIKE_RE = re.compile(r"^\d{4}-\d")
+# a number without unit ('7', '-3', '1.5'): PostgreSQL would read it as
+# seconds, rarely what was meant
+_BARE_NUMBER_RE = re.compile(r"^[+-]?(\d+\.?\d*|\.\d+)$")
+
+
 def parse_since(text: str | None) -> datetime | str | None:
-    """'2026-10-27' / '2026-10-27T10:00' -> datetime ; '7 days' -> interval text ; '' -> None."""
+    """'2026-10-27' / '2026-10-27T10:00' -> datetime ; '7 days' -> interval text ; '' -> None.
+
+    InvalidFilter for a value that looks like a date but is not one
+    ('2026-13-45': "invalid date") and for a bare number ('7': a unit is
+    required).  Any other text is an interval checked by PostgreSQL (a
+    DataError for an invalid one)."""
     if not text or not text.strip():
         return None
     text = text.strip()
+    if _BARE_NUMBER_RE.match(text):
+        raise InvalidFilter(
+            f"since {text!r}: a number needs a unit ('7 days', '12 hours') or use a date"
+            " (YYYY-MM-DD)"
+        )
     try:
         return datetime.fromisoformat(text)
     except ValueError:
+        if _DATE_LIKE_RE.match(text):
+            raise InvalidFilter(
+                f"since {text!r}: invalid date (expected YYYY-MM-DD or YYYY-MM-DDTHH:MM)"
+            ) from None
         return text
 
 
@@ -665,6 +692,25 @@ def _audit_where(
     return " AND ".join(where), params
 
 
+# the total shown above the audit table is exact up to this number of
+# matching events, "10,000+" beyond (see list_audit())
+AUDIT_COUNT_CAP = 10_000
+
+
+@dataclass(frozen=True)
+class AuditPage:
+    """A page of the audit log.
+
+    total is exact unless capped, in which case more than AUDIT_COUNT_CAP
+    events match (total is then AUDIT_COUNT_CAP + 1).  has_next: another
+    page follows this one."""
+
+    rows: list[dict[str, Any]]
+    total: int
+    capped: bool = False
+    has_next: bool = False
+
+
 def list_audit(
     conn: Connection,
     role: str | None = None,
@@ -672,29 +718,48 @@ def list_audit(
     since: datetime | str | None = None,
     limit: int = 50,
     offset: int = 0,
-) -> tuple[list[dict[str, Any]], int]:
+) -> AuditPage:
+    """One page of events, newest first, and how many events match.
+
+    The page is read with one row more than shown (LIMIT limit + 1), which
+    tells whether a next page exists without counting.  The total then
+    costs:
+
+    - nothing on the last page (offset + rows shown) or when nothing
+      matches at all;
+    - a bounded count otherwise (a next page exists): it stops after
+      AUDIT_COUNT_CAP + 1 rows, so that a large audit_log is never scanned
+      whole to display "10,000+";
+    - an exact count only for a page past the end (stale link, hand-typed
+      URL), so that the caller can show the real last page.
+
+    count(*) OVER () would instead compute the whole match before LIMIT, on
+    every page."""
     where, params = _audit_where(role, event_type, since)
-    # one scan: the total comes with each row (count(*) OVER () is computed
-    # before LIMIT/OFFSET)
     rows = conn.execute(
         "SELECT id, event_time, event_type, role_name, actor, database, client_addr,"
-        "       application_name, details, count(*) OVER () AS total"
+        "       application_name, details"
         f"  FROM pass_policy.audit_log WHERE {where}"
         " ORDER BY id DESC LIMIT %s OFFSET %s",
-        [*params, limit, offset],
+        [*params, limit + 1, offset],
     ).fetchall()
+    has_next = len(rows) > limit
+    del rows[limit:]
+    if rows and not has_next:
+        return AuditPage(rows, offset + len(rows))
+    if not rows and not offset:
+        return AuditPage(rows, 0)
     if rows:
-        total = rows[0]["total"]
-        for row in rows:
-            del row["total"]
-    elif offset:
-        # page past the end: no row carries the total, count separately
-        total = conn.execute(
-            f"SELECT count(*) AS n FROM pass_policy.audit_log WHERE {where}", params
+        n = conn.execute(
+            f"SELECT count(*) AS n FROM (SELECT 1 FROM pass_policy.audit_log WHERE {where}"
+            " LIMIT %s) AS matching",
+            [*params, AUDIT_COUNT_CAP + 1],
         ).fetchone()["n"]
-    else:
-        total = 0
-    return rows, total
+        return AuditPage(rows, n, capped=n > AUDIT_COUNT_CAP, has_next=True)
+    n = conn.execute(
+        f"SELECT count(*) AS n FROM pass_policy.audit_log WHERE {where}", params
+    ).fetchone()["n"]
+    return AuditPage(rows, n)
 
 
 # --- rotation pairs ----------------------------------------------------------

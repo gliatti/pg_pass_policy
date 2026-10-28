@@ -15,6 +15,10 @@ router = APIRouter(prefix="/roles")
 log = get_logger("roles")
 
 REREAD_WARNING = reread_warning("The password was changed", "the role")
+NO_PASSWORD_WARNING = (
+    "Role {}: the rotation was applied but returned no password, so the new password"
+    " cannot be shown; rotate again to get one."
+)
 
 
 def _filters(
@@ -74,9 +78,9 @@ def _row_response(
     *,
     error: str | None = None,
     notice: str | None = None,
+    warning: str | None = None,
     password: str | None = None,
 ) -> Any:
-    warning = None
     if password is None:
         row = db.get_role(conn, role)
     else:
@@ -110,6 +114,14 @@ def rotate(
     password, error = db.run_action(conn, db.rotate_password, role, length)
     if error is not None:
         return _row_response(request, conn, role, error=error)
+    if not password:
+        # committed, but rotate_password() returned NULL or an empty string:
+        # said as such (200: the rotation did happen, the role's old password
+        # no longer works) rather than a password displayed as "None" or an
+        # empty reveal box, as for a pair switch (pairs.NO_ROW_WARNING); no
+        # password to protect, so the row is read the normal way
+        log.error("role %s: rotation applied but no password returned", role)
+        return _row_response(request, conn, role, warning=NO_PASSWORD_WARNING.format(role))
     # the password exists only in this response (no-store), never in a log or a URL
     return _row_response(request, conn, role, password=password)
 

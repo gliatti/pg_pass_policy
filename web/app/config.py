@@ -77,7 +77,28 @@ class Settings(BaseSettings):
         self._proxy_tokens = frozenset(t.strip() for t in self.trusted_proxies.split(","))
         if self.page_size < 1 or self.page_size > 1000:
             raise ValueError("PGPP_WEB_PAGE_SIZE must be between 1 and 1000")
+        self._check_pool()
         return self
+
+    def _check_pool(self) -> None:
+        """Pool bounds that psycopg_pool would refuse late (at the first
+        connection) or accept with a surprising effect: a pool that can never
+        open a connection, a timeout that fails every wait at once."""
+        if self.pool_min < 0:
+            raise ValueError(f"PGPP_WEB_POOL_MIN must be 0 or more (got {self.pool_min})")
+        if self.pool_max < 1:
+            raise ValueError(f"PGPP_WEB_POOL_MAX must be 1 or more (got {self.pool_max})")
+        if self.pool_max < self.pool_min:
+            raise ValueError(
+                f"PGPP_WEB_POOL_MAX ({self.pool_max}) must be at least"
+                f" PGPP_WEB_POOL_MIN ({self.pool_min})"
+            )
+        # not (> 0) also refuses NaN, which every comparison rejects
+        if not self.pool_timeout > 0 or self.pool_timeout == float("inf"):
+            raise ValueError(
+                f"PGPP_WEB_POOL_TIMEOUT must be a positive number of seconds"
+                f" (got {self.pool_timeout})"
+            )
 
     def basic_user_hashes(self) -> dict[str, bytes]:
         """{user: bcrypt hash} from PGPP_WEB_BASIC_USERS (parsed at startup)."""

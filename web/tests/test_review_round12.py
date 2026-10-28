@@ -22,7 +22,7 @@ def test_an_empty_audit_is_queried_once(monkeypatch, requested, offsets):
 
     def list_audit(conn, *, offset, limit, **kw):
         seen.append(offset)
-        return [], 0
+        return db.AuditPage([], 0)
 
     monkeypatch.setattr(db, "list_audit", list_audit)
     client, _ = _recording_client(app, events)

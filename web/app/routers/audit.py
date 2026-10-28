@@ -33,17 +33,23 @@ def _page_count(total: int, page_size: int) -> int:
     return max(1, math.ceil(total / page_size))
 
 
+def total_label(result: db.AuditPage) -> str:
+    """The total shown above the table: exact, or "10,000+" when capped."""
+    if result.capped:
+        return f"{db.AUDIT_COUNT_CAP:,}+"
+    return str(result.total)
+
+
 def _context(request: Request, conn: Connection, filters: dict[str, Any]) -> dict[str, Any]:
     page_size = request.app.state.settings.page_size
     error = None
-    rows: list[dict[str, Any]] = []
-    total = 0
+    result = db.AuditPage([], 0)
     page = filters["page"]
     try:
         with conn.transaction():
             since = db.parse_since(filters["since"])
 
-            def fetch(number: int) -> tuple[list[dict[str, Any]], int]:
+            def fetch(number: int) -> db.AuditPage:
                 return db.list_audit(
                     conn,
                     role=filters["role"],
@@ -53,22 +59,29 @@ def _context(request: Request, conn: Connection, filters: dict[str, Any]) -> dic
                     offset=(number - 1) * page_size,
                 )
 
-            rows, total = fetch(page)
+            result = fetch(page)
             # a page past the end (stale link, hand-typed URL): the last
             # page, not an empty table with a "page 7 / 2" footer; no second
-            # query when nothing matches (the last page is empty as well)
-            clamped = min(page, _page_count(total, page_size))
-            if clamped != page:
-                page = clamped
-                if total:
-                    rows, total = fetch(page)
-    except psycopg.DataError as exc:
+            # query when nothing matches (the last page is empty as well).
+            # The total of a page past the end is exact (list_audit()).
+            if not result.capped:
+                clamped = min(page, _page_count(result.total, page_size))
+                if clamped != page:
+                    page = clamped
+                    if result.total:
+                        result = fetch(page)
+    except (psycopg.DataError, db.InvalidFilter) as exc:
         error = f"Invalid filter: {db.error_message(exc)}"
-    pages = _page_count(total, page_size)
-    page = min(page, pages)
+    # more than AUDIT_COUNT_CAP events: the page count is unknown, the
+    # pager relies on has_next
+    pages = None if result.capped else _page_count(result.total, page_size)
+    if pages is not None:
+        page = min(page, pages)
     return {
-        "events": rows,
-        "total": total,
+        "events": result.rows,
+        "total": result.total,
+        "total_label": total_label(result),
+        "has_next": result.has_next if pages is None else page < pages,
         "page": page,
         "pages": pages,
         "filters": filters,

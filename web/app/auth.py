@@ -5,6 +5,8 @@ from __future__ import annotations
 import base64
 import binascii
 import functools
+import hashlib
+import hmac
 import ipaddress
 import re
 
@@ -42,7 +44,13 @@ def dummy_hash(users: dict[str, bytes]) -> bytes:
     return _dummy_hash_of_cost(cost or DEFAULT_COST)
 
 
-_USER_RE = re.compile(r"^[^\x00-\x1f\x7f]{1,128}$")
+# a user name: 1 to 128 characters, none of them a C0 or C1 control character
+# (U+0000-U+001F, U+007F-U+009F) or a line / paragraph separator (U+2028,
+# U+2029), which a log viewer or a terminal may render as a line break
+_USER_RE = re.compile(r"^[^\x00-\x1f\x7f-\x9f  ]{1,128}$")
+
+# session key of the cached basic authentication (see _basic_fingerprint())
+SESSION_BASIC_KEY = "basic_auth"
 
 
 def _unauthorized(settings: Settings, detail: str) -> HTTPException:
@@ -108,6 +116,64 @@ def verify_basic(authorization: str | None, users: dict[str, bytes]) -> str | No
     return user
 
 
+def _basic_fingerprint(settings: Settings, authorization: str, digest: bytes) -> str:
+    """HMAC-SHA256, keyed with PGPP_WEB_SECRET, of the Authorization header
+    and of the bcrypt hash it was checked against.
+
+    Stored in the session after a successful bcrypt check, so that the next
+    requests of the same browser (which sends the same header every time)
+    skip bcrypt: a bcrypt check costs tens of milliseconds by design, paid
+    on every request otherwise.  The session cookie is signed, not
+    encrypted: it holds this keyed fingerprint only, never the header or the
+    password, and the fingerprint cannot be checked against a guessed
+    password without the secret.  A change of the header (another user,
+    another password) gives another fingerprint, and so does a change of
+    the hash in PGPP_WEB_BASIC_USERS (password changed, user removed: the
+    user has no hash any more): the cache is then ignored and bcrypt runs
+    again."""
+    key = settings.secret.get_secret_value().encode()
+    message = b"pgpp-web basic\x00" + authorization.encode("latin-1", "replace") + b"\x00" + digest
+    return hmac.new(key, message, hashlib.sha256).hexdigest()
+
+
+def _cached_basic_user(request: Request, settings: Settings, authorization: str) -> str | None:
+    """The user of a session whose cached fingerprint matches this header."""
+    cached = request.session.get(SESSION_BASIC_KEY)
+    if not isinstance(cached, dict):
+        return None
+    user, fingerprint = cached.get("user"), cached.get("fp")
+    if not isinstance(user, str) or not isinstance(fingerprint, str):
+        return None
+    digest = settings.basic_user_hashes().get(user)
+    if digest is None or basic_user_name(authorization) != user:
+        return None
+    expected = _basic_fingerprint(settings, authorization, digest)
+    return user if hmac.compare_digest(fingerprint, expected) else None
+
+
+def authenticate_basic(request: Request, settings: Settings) -> str | None:
+    """verify_basic() on the Authorization header, skipped when the session
+    holds the fingerprint of the same header (_basic_fingerprint()).  A
+    failed check drops the cached fingerprint."""
+    authorization = request.headers.get("authorization")
+    if not authorization:
+        request.session.pop(SESSION_BASIC_KEY, None)
+        return None
+    user = _cached_basic_user(request, settings, authorization)
+    if user is not None:
+        return user
+    users = settings.basic_user_hashes()
+    user = verify_basic(authorization, users)
+    if user is None:
+        request.session.pop(SESSION_BASIC_KEY, None)
+        return None
+    request.session[SESSION_BASIC_KEY] = {
+        "user": user,
+        "fp": _basic_fingerprint(settings, authorization, users[user]),
+    }
+    return user
+
+
 def _client_is_trusted(request: Request, settings: Settings) -> bool:
     if settings.trust_all_proxies():
         return True
@@ -134,7 +200,21 @@ def user_from_proxy(request: Request, settings: Settings) -> str:
             detail="Requests must come through the trusted reverse proxy",
         )
     header = settings.proxy_header_name()
-    user = (request.headers.get(header) or "").strip()
+    # Starlette decodes header values as latin-1 (the HTTP default): the
+    # reverse proxy sends the user name in UTF-8, so "Émilie" would arrive
+    # as "Ã\x89milie".  The original bytes are recovered (latin-1 maps each
+    # byte to one character) and decoded as UTF-8; bytes that are not valid
+    # UTF-8 are refused rather than replaced, so that two different headers
+    # never give the same user name.
+    raw = request.headers.get(header) or ""
+    try:
+        user = raw.encode("latin-1").decode("utf-8").strip()
+    except UnicodeError:
+        log.warning("proxy header %s refused: not valid UTF-8", header)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated (proxy header is not valid UTF-8)",
+        ) from None
     if not user or not _USER_RE.match(user):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -151,7 +231,7 @@ def require_user(request: Request) -> str:
         return ""
     if settings.auth == "basic":
         authorization = request.headers.get("authorization")
-        user = verify_basic(authorization, settings.basic_user_hashes())
+        user = authenticate_basic(request, settings)
         if user is None:
             if authorization:
                 # one line per failure (user and peer, never the password) so
