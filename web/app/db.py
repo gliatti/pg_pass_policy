@@ -469,8 +469,11 @@ def get_role(conn: Connection, role: str) -> dict[str, Any] | None:
     return conn.execute(f"{_ROLE_SELECT} WHERE v.role_name = %s", (role,)).fetchone()
 
 
-def rotate_password(conn: Connection, role: str, length: int = 24) -> str:
-    """Returns the new password: shown once to the caller, never stored."""
+def rotate_password(conn: Connection, role: str, length: int | None = None) -> str:
+    """Returns the new password: shown once to the caller, never stored.
+
+    A NULL length lets the extension pick 24 characters raised to the
+    profile's min_length (and capped by its max_length)."""
     row = conn.execute(
         "SELECT pass_policy.rotate_password(%s, %s) AS password", (role, length)
     ).fetchone()
@@ -699,7 +702,7 @@ def create_pair(
     )
 
 
-def switch_pair(conn: Connection, pair: str, length: int = 24) -> dict[str, Any]:
+def switch_pair(conn: Connection, pair: str, length: int | None = None) -> dict[str, Any]:
     """Returns active_role, password (shown once), previous_role, previous_valid_until."""
     return conn.execute(
         "SELECT active_role, password, previous_role, previous_valid_until"

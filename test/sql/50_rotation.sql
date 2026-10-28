@@ -67,6 +67,46 @@ SELECT ppp_test.try($$SELECT pass_policy.rotate_password('regress_rot', 4)$$) <>
 -- Longueur incompatible avec le profil (min_length 12 par défaut) : refusée
 SELECT ppp_test.try($$SELECT pass_policy.rotate_password('regress_rot', 8)$$) <> 'ok' AS below_profile_min_refused;
 
+-- (clôture) Longueur par défaut relevée au min_length du profil (32 > 24),
+-- longueur explicite hors des bornes du profil refusée en 22023
+CREATE ROLE regress_rot32 LOGIN;
+SELECT pass_policy.create_profile('p_rot32', '{"min_length": 32, "max_length": 40, "min_age": "0"}') > 0 AS created;
+SELECT pass_policy.assign_profile('regress_rot32', 'p_rot32');
+INSERT INTO ppp_test.secrets
+  SELECT 'rot32', pass_policy.rotate_password('regress_rot32');
+SELECT length(pwd) AS len FROM ppp_test.secrets WHERE label = 'rot32';
+SELECT (details->>'length')::int AS audited_length FROM pass_policy.audit_log
+ WHERE event_type = 'password_rotated' AND role_name = 'regress_rot32';
+SELECT ppp_test.try($$SELECT pass_policy.rotate_password('regress_rot32', 24)$$) AS below_min;
+SELECT ppp_test.try($$SELECT pass_policy.rotate_password('regress_rot32', 41)$$) AS above_max;
+SELECT pass_policy.alter_profile('p_rot32', '{"min_length": 12, "max_length": 16}');
+INSERT INTO ppp_test.secrets
+  SELECT 'rot16', pass_policy.rotate_password('regress_rot32');
+SELECT length(pwd) AS len_capped FROM ppp_test.secrets WHERE label = 'rot16';
+
+-- (clôture) _record_done() : drapeau posé par le hook pour la transaction
+-- courante ; une seule ligne d'historique par rotation (pas de doublon par
+-- _ensure_recorded())
+BEGIN;
+SELECT pass_policy._record_done('regress_rot32') AS before_rotation;
+INSERT INTO ppp_test.secrets
+  SELECT 'rot32b', pass_policy.rotate_password('regress_rot32');
+SELECT pass_policy._record_done('regress_rot32') AS after_rotation,
+       pass_policy._record_done('regress_rot') AS other_role;
+COMMIT;
+SELECT pass_policy._record_done('regress_rot32') AS after_commit;
+SELECT count(*) AS history_rows FROM pass_policy.password_history WHERE role_name = 'regress_rot32';
+SELECT count(*) AS changed_rows FROM pass_policy.audit_log
+ WHERE event_type = 'password_changed' AND role_name = 'regress_rot32';
+-- drapeau retiré par l'annulation de la sous-transaction qui l'a posé
+BEGIN;
+SAVEPOINT s;
+INSERT INTO ppp_test.secrets
+  SELECT 'rot32c', pass_policy.rotate_password('regress_rot32');
+ROLLBACK TO SAVEPOINT s;
+SELECT pass_policy._record_done('regress_rot32') AS after_rollback_to_savepoint;
+ROLLBACK;
+
 -- Nom de rôle nécessitant des guillemets (format %I)
 CREATE ROLE "regress_Rot quoted" LOGIN;
 INSERT INTO ppp_test.secrets

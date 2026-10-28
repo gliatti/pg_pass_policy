@@ -49,6 +49,7 @@
 PG_FUNCTION_INFO_V1(ppp_check_password);
 PG_FUNCTION_INFO_V1(ppp_generate_password);
 PG_FUNCTION_INFO_V1(ppp_in_password_hook);
+PG_FUNCTION_INFO_V1(ppp_record_done);
 
 static check_password_hook_type prev_check_password_hook = NULL;
 
@@ -257,11 +258,8 @@ ppp_col(const char *colname)
 static int32
 ppp_get_int(HeapTuple tup, const char *colname, int32 defval)
 {
-	bool		isnull;
-	Datum		d;
-
-	d = SPI_getbinval(tup, SPI_tuptable->tupdesc, ppp_col(colname), &isnull);
-	return isnull ? defval : DatumGetInt32(d);
+	return ppp_spi_get_int32(tup, SPI_tuptable->tupdesc, ppp_col(colname),
+							 defval);
 }
 
 static bool
@@ -524,6 +522,92 @@ ppp_in_dictionary(const char *lower_pw)
 }
 
 /*
+ * Non-ASCII code points refused by PPP-020 in a UTF8 database: the Unicode
+ * general categories Cc (C1 controls), Cf (format: zero-width characters,
+ * bidirectional marks, BOM, tags...), Zs (spaces other than U+0020: U+00A0
+ * no-break space, U+3000...), Zl (U+2028) and Zp (U+2029), Unicode 15.
+ * They are invisible or ambiguous in a password and would otherwise count
+ * as "special" characters.  Explicit list, sorted, no dependency on ICU
+ * or on the server locale.
+ */
+static const struct
+{
+	pg_wchar	first;
+	pg_wchar	last;
+}			ppp_invisible_ranges[] =
+{
+	{0x0080, 0x00A0},			/* C1 controls (Cc), U+00A0 (Zs) */
+	{0x00AD, 0x00AD},			/* soft hyphen (Cf) */
+	{0x0600, 0x0605},			/* Arabic number signs (Cf) */
+	{0x061C, 0x061C},			/* Arabic letter mark (Cf) */
+	{0x06DD, 0x06DD},
+	{0x070F, 0x070F},
+	{0x0890, 0x0891},
+	{0x08E2, 0x08E2},
+	{0x1680, 0x1680},			/* Ogham space mark (Zs) */
+	{0x180E, 0x180E},			/* Mongolian vowel separator (Cf) */
+	{0x2000, 0x200F},			/* spaces (Zs), U+200B..U+200F (Cf) */
+	{0x2028, 0x202F},			/* U+2028 (Zl), U+2029 (Zp), bidi (Cf),
+								 * U+202F (Zs) */
+	{0x205F, 0x2064},			/* U+205F (Zs), word joiner... (Cf) */
+	{0x2066, 0x206F},			/* bidi isolates... (Cf) */
+	{0x3000, 0x3000},			/* ideographic space (Zs) */
+	{0xFEFF, 0xFEFF},			/* BOM / zero-width no-break space (Cf) */
+	{0xFFF9, 0xFFFB},			/* interlinear annotation (Cf) */
+	{0x110BD, 0x110BD},
+	{0x110CD, 0x110CD},
+	{0x13430, 0x1343F},
+	{0x1BCA0, 0x1BCA3},
+	{0x1D173, 0x1D17A},
+	{0xE0001, 0xE0001},			/* language tag (Cf) */
+	{0xE0020, 0xE007F}			/* tag characters (Cf) */
+};
+
+/*
+ * Code point of the UTF-8 sequence of len (2 to 4) bytes at s.  The string
+ * is valid in the server encoding (text input and the parser verify it).
+ */
+static pg_wchar
+ppp_utf8_code_point(const unsigned char *s, int len)
+{
+	switch (len)
+	{
+		case 2:
+			return ((pg_wchar) (s[0] & 0x1F) << 6) | (s[1] & 0x3F);
+		case 3:
+			return ((pg_wchar) (s[0] & 0x0F) << 12) |
+				((pg_wchar) (s[1] & 0x3F) << 6) | (s[2] & 0x3F);
+		case 4:
+			return ((pg_wchar) (s[0] & 0x07) << 18) |
+				((pg_wchar) (s[1] & 0x3F) << 12) |
+				((pg_wchar) (s[2] & 0x3F) << 6) | (s[3] & 0x3F);
+		default:
+			return 0;
+	}
+}
+
+/* Is a non-ASCII code point refused by PPP-020 (ppp_invisible_ranges)? */
+static bool
+ppp_is_invisible(pg_wchar cp)
+{
+	int			lo = 0;
+	int			hi = lengthof(ppp_invisible_ranges) - 1;
+
+	while (lo <= hi)
+	{
+		int			mid = (lo + hi) / 2;
+
+		if (cp < ppp_invisible_ranges[mid].first)
+			hi = mid - 1;
+		else if (cp > ppp_invisible_ranges[mid].last)
+			lo = mid + 1;
+		else
+			return true;
+	}
+	return false;
+}
+
+/*
  * Validate the clear-text password against the complexity rules of the
  * profile, in the order of SPEC 6.2 step 4.  Returns true if the password is
  * acceptable; otherwise sets *code to a static "PPP-0xx" string.
@@ -547,6 +631,7 @@ ppp_validate(const char *username, const char *password, const pppProfile *p,
 	const char *prev = NULL;
 	int			prevlen = 0;
 	size_t		pwlen = strlen(password);
+	bool		utf8 = (GetDatabaseEncoding() == PG_UTF8);
 
 	*code = NULL;
 
@@ -569,8 +654,13 @@ ppp_validate(const char *username, const char *password, const pppProfile *p,
 			else
 				nspecial++;
 		}
+		else if (utf8 &&
+				 ppp_is_invisible(ppp_utf8_code_point((const unsigned char *) c, l)))
+			nonprintable = true;	/* Unicode control, format or space */
 		else
-			nspecial++;			/* any non-ASCII character is "special" */
+			nspecial++;			/* any other non-ASCII character is
+								 * "special" (in a UTF8 database; every
+								 * non-ASCII character in other encodings) */
 
 		/* consecutive identical characters */
 		if (prev != NULL && prevlen == l && memcmp(prev, c, l) == 0)
@@ -754,7 +844,7 @@ ppp_describe(const char *code, const pppProfile *p, char **msg, char **detail,
 	else if (strcmp(code, "PPP-020") == 0)
 	{
 		*msg = pstrdup("password contains invalid characters");
-		*detail = pstrdup("The password must not contain control characters, nor start or end with a space.");
+		*detail = pstrdup("The password must not contain control, format or invisible space characters, nor start or end with a space.");
 	}
 	else if (strcmp(code, "PPP-030") == 0)
 	{
@@ -1037,6 +1127,7 @@ ppp_record_change(const char *username, const char *verifier)
 	if (ret != SPI_OK_SELECT)
 		elog(ERROR, "pg_pass_policy: record_password_change() failed: %s",
 			 SPI_result_code_string(ret));
+	ppp_note_password_recorded(username);
 }
 
 
@@ -1604,4 +1695,20 @@ Datum
 ppp_in_password_hook(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_BOOL(ppp_in_hook);
+}
+
+/*
+ * pass_policy._record_done(role name) RETURNS bool (STRICT)
+ *
+ * True if the password hook recorded a password change of this role in the
+ * current transaction (record_password_change() returned).  Used by
+ * _ensure_recorded() after an ALTER ROLE ... PASSWORD issued by the
+ * extension itself, instead of guessing from role_state.
+ */
+Datum
+ppp_record_done(PG_FUNCTION_ARGS)
+{
+	Name		role = PG_GETARG_NAME(0);
+
+	PG_RETURN_BOOL(ppp_password_recorded(NameStr(*role)));
 }

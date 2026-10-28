@@ -67,7 +67,7 @@ out=$(psql_as regress_e3 "$GOOD") || true
 check_contains "regress_e3 verrouillé automatiquement (5 échecs)" "is locked by pg_pass_policy" "$out"
 psql_admin "SELECT pass_policy.unlock_role('regress_e3')" >/dev/null
 kick || fail "pas de tour du worker après unlock_role(regress_e3)"
-out=$(psql_admin "SELECT string_agg(event_type || ':' || coalesce(details->>'locked_by', details->>'by', '?'), ',' ORDER BY event_type)
+out=$(psql_admin "SELECT string_agg(event_type || ':' || coalesce(details->>'locked_by', details->>'unlocked_by', '?'), ',' ORDER BY event_type)
                     FROM pass_policy.audit_log
                    WHERE role_name = 'regress_e3' AND event_type IN ('role_locked', 'role_unlocked')")
 check_eq "audit : role_locked (auto) ET role_unlocked (manual)" "role_locked:auto,role_unlocked:manual" "$out"

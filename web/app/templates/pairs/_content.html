@@ -14,7 +14,7 @@
     <td class="actions">
       <form hx-post="{{ path_for('pair_switch', pair=p.pair_name) }}" hx-target="#pairs-content" hx-swap="innerHTML"
             hx-confirm="Switch pair {{ p.pair_name }}? The inactive role gets a new password and becomes active.">
-        <input type="number" name="length" value="24" min="8" max="128" title="password length" class="w-len">
+        <input type="number" name="length" placeholder="auto" min="8" max="128" title="password length (empty: 24 raised to the profile minimum)" class="w-len">
         <button class="btn">Switch</button>
       </form>
     </td>

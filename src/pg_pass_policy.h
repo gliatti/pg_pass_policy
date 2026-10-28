@@ -6,6 +6,7 @@
 #define PG_PASS_POLICY_H
 
 #include "postgres.h"
+#include "access/htup.h"
 #include "access/tupdesc.h"
 #include "datatype/timestamp.h"
 #include "fmgr.h"
@@ -203,7 +204,13 @@ typedef struct pppSharedState
 	int32		default_lock_duration_secs;
 
 	pg_atomic_uint32 reload_requested;	/* posé par shmem_reload(), lu par le worker */
-	pid_t		worker_pid;
+	/*
+	 * PID of the running worker, 0 if none.  Atomic rather than under
+	 * "lock": the worker clears it from its on_shmem_exit callback, which
+	 * may run while it still holds the LWLock (FATAL), and LWLockAcquire()
+	 * would then wait for itself.  Read with ppp_get_worker_pid().
+	 */
+	pg_atomic_uint32 worker_pid;
 	TimestampTz worker_last_run;
 	TimestampTz worker_last_reload;
 
@@ -306,6 +313,9 @@ extern char *ppp_untrusted_detail(Oid nspowner);
 extern void ppp_begin_materialize(FunctionCallInfo fcinfo, TupleDesc *tupdesc,
 								  Tuplestorestate **tupstore,
 								  int expected_natts);
+/* colonne int4 (numéro 1-based) d'une ligne SPI, dflt si NULL */
+extern int32 ppp_spi_get_int32(HeapTuple tup, TupleDesc desc, int col,
+							   int32 dflt);
 /* efface une zone mémoire contenant un secret avant de la libérer */
 extern void ppp_secure_zero(void *p, size_t len);
 
@@ -320,6 +330,13 @@ extern void ppp_policy_init(void);		/* installe check_password_hook */
 extern void ppp_make_key(pppRoleKey *key, const char *rolename);
 extern void ppp_lockout_init(void);		/* installe ClientAuthentication_hook */
 extern void ppp_lockout_shmem_init(void); /* appelé depuis shmem_startup_hook */
+/*
+ * Changement de mot de passe enregistré par le hook dans la transaction
+ * courante (pass_policy._record_done()) : drapeau local au backend, remis
+ * à zéro au COMMIT / ABORT et à l'annulation de sa sous-transaction.
+ */
+extern void ppp_note_password_recorded(const char *rolename);
+extern bool ppp_password_recorded(const char *rolename);
 /*
  * Caller holds ppp_shared->lock exclusively; NULL when no room is left.
  * in_recovery: RecoveryInProgress(), read before taking the lock (see
@@ -351,6 +368,13 @@ extern pppEntryClass ppp_entry_real_class(const pppRoleEntry *entry,
  */
 extern bool ppp_expire_lock(pppRoleEntry *entry, TimestampTz now,
 							bool check_inflight);
+
+/* PID of the background worker, 0 when it is not running */
+static inline pid_t
+ppp_get_worker_pid(void)
+{
+	return (pid_t) pg_atomic_read_u32(&ppp_shared->worker_pid);
+}
 
 /* Is the lock of an entry active at time "now"? */
 static inline bool

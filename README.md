@@ -128,6 +128,8 @@ SELECT pass_policy.generate_password(32, 'applicatif');
 ```sql
 -- Génère un mot de passe, l'applique (ALTER ROLE), pose VALID UNTIL, audite,
 -- et le RETOURNE UNE SEULE FOIS : il n'est stocké nulle part.
+-- Sans longueur : 24 caractères, relevés au min_length du profil (et bornés
+-- par son max_length) ; une longueur explicite hors de ces bornes est refusée.
 SELECT pass_policy.rotate_password('app_user');
 SELECT pass_policy.rotate_password('app_user', 32);
 -- Forcer un changement : VALID UNTIL = maintenant, statut « expired »
@@ -218,7 +220,12 @@ sa ligne porte `details.replaced_by_manual = true`. À l'inverse, un nouveau ver
 posé juste avant ou pendant un `unlock_role()` ou un `run_maintenance()` (qui
 lève les verrous expirés) n'est pas levé par eux, et un verrou automatique
 expiré avant le passage du worker est journalisé normalement (sans
-`lifted_before_audit`), même si un `run_maintenance()` passe entre-temps. Les échecs sur des noms de
+`lifted_before_audit`), même si un `run_maintenance()` passe entre-temps.
+Quand `run_maintenance()` trouve ainsi un verrou plus récent en mémoire
+partagée, il n'écrit pas de ligne `role_unlocked` (le rôle reste verrouillé).
+Clés de `details` : `role_locked` porte `locked_by` (`auto` / `manual`),
+`locked_until` et `reason` ; `role_unlocked` porte `unlocked_by` (`auto` pour
+l'expiration levée par `run_maintenance()`, `manual` pour `unlock_role()`). Les échecs sur des noms de
 rôles inexistants sont journalisés en une seule ligne `auth_failed` par tour
 du worker (`role_name` NULL, `details.unknown_roles` et `details.attempts`).
 Si la bibliothèque a été retirée de
@@ -310,7 +317,7 @@ transaction) : la trace est une ligne du log serveur,
 | `PPP-017` | contient le nom du rôle, quelle que soit la casse, même inversé (`reject_username`) |
 | `PPP-018` | présent dans le dictionnaire des mots de passe courants (`reject_dictionary`) |
 | `PPP-019` | trop de caractères identiques consécutifs (`max_repeat`) |
-| `PPP-020` | caractère de contrôle, ou espace en début ou en fin |
+| `PPP-020` | caractère de contrôle, ou espace en début ou en fin ; dans une base UTF8, aussi les caractères Unicode de contrôle, de format et d'espace invisibles (U+0080–U+009F, U+00A0, U+00AD, U+200B–U+200F, U+2028–U+202F, U+2060–U+206F, U+3000, U+FEFF…) |
 | `PPP-030` | changé trop récemment (`min_age` ; non appliqué à un superutilisateur) |
 | `PPP-031` | parmi les `history_count` derniers mots de passe, l'actuel compris (`history_days`) |
 

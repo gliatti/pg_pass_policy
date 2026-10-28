@@ -47,6 +47,19 @@
 #endif
 
 /*
+ * Memory of a GUC "extra" value (returned by a check hook through *extra,
+ * freed by guc.c): plain malloc() up to PG 15 (guc.c calls free()), and
+ * guc_malloc() from PG 16, where guc.c frees it with guc_free() (the
+ * memory then belongs to GUCMemoryContext; guc_malloc() is static in
+ * guc.c before 16).  NULL on out of memory, after a LOG on PG 16+.
+ */
+#if PG_VERSION_NUM >= 160000
+#define PPP_GUC_MALLOC(size) guc_malloc(LOG, (size))
+#else
+#define PPP_GUC_MALLOC(size) malloc(size)
+#endif
+
+/*
  * pg_md5_encrypt() (common/md5.h):
  *   PG 14     : bool pg_md5_encrypt(const char *passwd, const char *salt,
  *                                   size_t salt_len, char *buf);

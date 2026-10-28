@@ -16,6 +16,7 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_namespace.h"
 #include "commands/extension.h"
+#include "executor/spi.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -129,7 +130,7 @@ ppp_shmem_startup(void)
 		ppp_shared->default_lock_duration_secs = PPP_DEFAULT_LOCK_DURATION_SECS;
 		/* force a first load of profiles and persisted locks */
 		pg_atomic_init_u32(&ppp_shared->reload_requested, 1);
-		ppp_shared->worker_pid = 0;
+		pg_atomic_init_u32(&ppp_shared->worker_pid, 0);
 		ppp_shared->worker_last_run = 0;
 		ppp_shared->worker_last_reload = 0;
 		/* fail-closed until the worker has re-injected the persisted locks */
@@ -148,101 +149,90 @@ ppp_shmem_startup(void)
 /*
  * pg_pass_policy.exempt_roles, parsed once per assignment.
  *
- * The check hook validates the syntax (SplitIdentifierString()); the
- * assign hook then stores the split names in ppp_exempt_cxt, so that
+ * The check hook does all the work that may fail: it splits the value
+ * (SplitIdentifierString(), which pallocs and may raise an ERROR on out of
+ * memory, as check hooks are allowed to) and builds the result in one
+ * GUC "extra" block (PPP_GUC_MALLOC, see compat.h): a pppExemptList
+ * followed by the names it points to.  guc.c keeps that block with the
+ * value and frees it when the value is discarded.  The assign hook,
+ * which must never fail, only copies the pointer, so that
  * ppp_role_is_exempt() (called by both hooks at every password change and
- * every authentication) only compares strings.  The GUC "extra" pointer is
- * not used: it must be malloc()ed up to PG 15 and guc_malloc()ed from PG 16,
- * a version test that only compat.h may make (SPEC 6.5); a private memory
- * context gives the same result on every version.
- *
- * ppp_exempt_valid is false when the last assignment could not be parsed
- * (out of memory): ppp_role_is_exempt() then parses the raw value itself.
+ * every authentication) only compares strings.
  */
-static MemoryContext ppp_exempt_cxt = NULL;
-static char **ppp_exempt_names = NULL;
-static int	ppp_exempt_count = 0;
-static bool ppp_exempt_valid = false;
+typedef struct pppExemptList
+{
+	int			count;
+	char	   *names[FLEXIBLE_ARRAY_MEMBER];	/* point into the same block */
+} pppExemptList;
+
+static const pppExemptList *ppp_exempt_list = NULL;
 
 /*
  * GUC check hook for pg_pass_policy.exempt_roles: the value must be a valid
- * comma-separated list of identifiers.
+ * comma-separated list of identifiers; the split list is returned in *extra.
  */
 static bool
 ppp_check_exempt_roles(char **newval, void **extra, GucSource source)
 {
 	char	   *rawstring;
 	List	   *elemlist;
-	bool		ok;
+	ListCell   *lc;
+	Size		size;
+	pppExemptList *list;
+	char	   *p;
+	int			n = 0;
 
 	rawstring = pstrdup(*newval ? *newval : "");
-	ok = SplitIdentifierString(rawstring, ',', &elemlist);
-	if (!ok)
+	if (!SplitIdentifierString(rawstring, ',', &elemlist))
+	{
 		GUC_check_errdetail("List syntax is invalid.");
+		list_free(elemlist);
+		pfree(rawstring);
+		return false;
+	}
+
+	size = offsetof(pppExemptList, names) +
+		sizeof(char *) * list_length(elemlist);
+	foreach(lc, elemlist)
+		size += strlen((const char *) lfirst(lc)) + 1;
+
+	list = (pppExemptList *) PPP_GUC_MALLOC(size);
+	if (list == NULL)
+	{
+		GUC_check_errcode(ERRCODE_OUT_OF_MEMORY);
+		GUC_check_errdetail("Out of memory.");
+		list_free(elemlist);
+		pfree(rawstring);
+		return false;
+	}
+
+	p = (char *) list + offsetof(pppExemptList, names) +
+		sizeof(char *) * list_length(elemlist);
+	foreach(lc, elemlist)
+	{
+		const char *name = (const char *) lfirst(lc);
+		size_t		len = strlen(name) + 1;
+
+		memcpy(p, name, len);
+		list->names[n++] = p;
+		p += len;
+	}
+	list->count = n;
+
 	list_free(elemlist);
 	pfree(rawstring);
-	return ok;
+	*extra = list;
+	return true;
 }
 
 /*
- * GUC assign hook for pg_pass_policy.exempt_roles.  Assign hooks should not
- * throw: the copies are allocated with MCXT_ALLOC_NO_OOM, a failure only
- * leaves the cache invalid (ppp_role_is_exempt() then parses the raw value).
+ * GUC assign hook for pg_pass_policy.exempt_roles: never fails, the list
+ * was built by the check hook.
  */
 static void
 ppp_assign_exempt_roles(const char *newval, void *extra)
 {
-	char	   *rawstring;
-	List	   *elemlist = NIL;
-	ListCell   *lc;
-	char	  **names;
-	int			n = 0;
-	size_t		len;
-
-	ppp_exempt_valid = false;
-	ppp_exempt_names = NULL;
-	ppp_exempt_count = 0;
-	if (ppp_exempt_cxt == NULL)
-		return;
-	MemoryContextReset(ppp_exempt_cxt);
-
-	if (newval == NULL || newval[0] == '\0')
-	{
-		ppp_exempt_valid = true;
-		return;
-	}
-
-	len = strlen(newval) + 1;
-	rawstring = MemoryContextAllocExtended(ppp_exempt_cxt, len, MCXT_ALLOC_NO_OOM);
-	if (rawstring == NULL)
-		return;
-	memcpy(rawstring, newval, len);
-
-	/*
-	 * The value was accepted by the check hook, so SplitIdentifierString()
-	 * cannot fail on its syntax; its small list allocations go to
-	 * ppp_exempt_cxt and could only fail on out of memory.
-	 */
-	{
-		MemoryContext old = MemoryContextSwitchTo(ppp_exempt_cxt);
-		bool		ok = SplitIdentifierString(rawstring, ',', &elemlist);
-
-		MemoryContextSwitchTo(old);
-		if (!ok)
-			return;
-	}
-
-	names = MemoryContextAllocExtended(ppp_exempt_cxt,
-									   sizeof(char *) * Max(list_length(elemlist), 1),
-									   MCXT_ALLOC_NO_OOM);
-	if (names == NULL)
-		return;
-	foreach(lc, elemlist)
-		names[n++] = (char *) lfirst(lc);	/* point into rawstring */
-
-	ppp_exempt_names = names;
-	ppp_exempt_count = n;
-	ppp_exempt_valid = true;
+	ppp_exempt_list = (const pppExemptList *) extra;
 }
 
 /*
@@ -268,15 +258,18 @@ ppp_role_is_exempt(const char *rolename)
 		ppp_exempt_roles[0] == '\0')
 		return false;
 
-	if (ppp_exempt_valid)
+	if (ppp_exempt_list != NULL)
 	{
-		for (i = 0; i < ppp_exempt_count; i++)
-			if (strcmp(ppp_exempt_names[i], rolename) == 0)
+		for (i = 0; i < ppp_exempt_list->count; i++)
+			if (strcmp(ppp_exempt_list->names[i], rolename) == 0)
 				return true;
 		return false;
 	}
 
-	/* cache unavailable (out of memory at assignment): parse here */
+	/*
+	 * No list (cannot happen: the check hook always builds one for an
+	 * accepted value, the boot value included): parse here.
+	 */
 	rawstring = pstrdup(ppp_exempt_roles);
 	if (!SplitIdentifierString(rawstring, ',', &elemlist))
 	{
@@ -413,6 +406,19 @@ ppp_secure_zero(void *p, size_t len)
 }
 
 /*
+ * int4 column "col" (1-based) of an SPI result row, dflt when NULL.  Shared
+ * by policy.c (profile) and worker.c (lockout parameters).
+ */
+int32
+ppp_spi_get_int32(HeapTuple tup, TupleDesc desc, int col, int32 dflt)
+{
+	bool		isnull;
+	Datum		d = SPI_getbinval(tup, desc, col, &isnull);
+
+	return isnull ? dflt : DatumGetInt32(d);
+}
+
+/*
  * See pg_pass_policy.h.  The checks are those of InitMaterializedSRF() (PG
  * 15+), which does not exist in PG 14.
  */
@@ -479,7 +485,7 @@ ppp_worker_status(PG_FUNCTION_ARGS)
 	ppp_begin_materialize(fcinfo, &tupdesc, &tupstore, 5);
 
 	LWLockAcquire(ppp_shared->lock, LW_SHARED);
-	pid = ppp_shared->worker_pid;
+	pid = ppp_get_worker_pid();
 	last_run = ppp_shared->worker_last_run;
 	last_reload = ppp_shared->worker_last_reload;
 	locks_loaded = ppp_shared->locks_loaded;
@@ -507,7 +513,7 @@ ppp_worker_status(PG_FUNCTION_ARGS)
  *
  * PID of the background worker, NULL when it is not running (or when the
  * shared memory is not initialised).  Called by _audit() for every audit
- * row: a single read under a shared lock, no tuplestore.
+ * row: a single atomic read, no lock, no tuplestore.
  */
 Datum
 ppp_worker_pid(PG_FUNCTION_ARGS)
@@ -517,10 +523,7 @@ ppp_worker_pid(PG_FUNCTION_ARGS)
 	if (ppp_shared == NULL)
 		PG_RETURN_NULL();
 
-	LWLockAcquire(ppp_shared->lock, LW_SHARED);
-	pid = ppp_shared->worker_pid;
-	LWLockRelease(ppp_shared->lock);
-
+	pid = ppp_get_worker_pid();
 	if (pid == 0)
 		PG_RETURN_NULL();
 	PG_RETURN_INT32((int32) pid);
@@ -534,11 +537,6 @@ _PG_init(void)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("pg_pass_policy must be loaded via shared_preload_libraries"),
 				 errhint("Add pg_pass_policy to shared_preload_libraries in postgresql.conf and restart the server.")));
-
-	/* must exist before the assign hook of exempt_roles first runs */
-	ppp_exempt_cxt = AllocSetContextCreate(TopMemoryContext,
-										   "pg_pass_policy exempt_roles",
-										   ALLOCSET_SMALL_SIZES);
 
 	DefineCustomBoolVariable("pg_pass_policy.enabled",
 							 "Enables the password policy and the lockout.",

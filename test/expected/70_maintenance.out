@@ -430,10 +430,10 @@ SELECT action, role_name FROM m_unlock
  role_unlocked | regress_dave
 (1 row)
 
-SELECT role_name, details->>'by' AS by FROM pass_policy.audit_log
+SELECT role_name, details->>'unlocked_by' AS unlocked_by FROM pass_policy.audit_log
  WHERE event_type = 'role_unlocked' AND role_name IN ('regress_carol', 'regress_dave');
-  role_name   |  by  
---------------+------
+  role_name   | unlocked_by 
+--------------+-------------
  regress_dave | auto
 (1 row)
 

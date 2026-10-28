@@ -104,7 +104,7 @@ def _row_response(
 def rotate(
     request: Request,
     role: str,
-    length: int = Form(default=24, ge=8, le=128),
+    length: int | None = Form(default=None, ge=8, le=128),
     conn: Connection = db.CONN,
 ):
     password, error = db.run_action(conn, db.rotate_password, role, length)

@@ -202,7 +202,7 @@ SELECT locked_until = 'infinity' AS infinite
 SELECT pass_policy.shmem_unlock_role('regress_lock');
  shmem_unlock_role 
 -------------------
- 
+ t
 (1 row)
 
 SELECT pass_policy.shmem_reset_failures('regress_lock');

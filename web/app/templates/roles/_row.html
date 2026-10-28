@@ -12,7 +12,7 @@
   <td class="actions">
     <form hx-post="{{ path_for('role_rotate', role=r.role_name) }}" hx-target="closest tbody" hx-swap="outerHTML"
           hx-confirm="Generate a new password for {{ r.role_name }}? The current password stops working immediately.">
-      <input type="number" name="length" value="24" min="8" max="128" title="password length" class="w-len">
+      <input type="number" name="length" placeholder="auto" min="8" max="128" title="password length (empty: 24 raised to the profile minimum)" class="w-len">
       <button class="btn">Rotate</button>
     </form>
     {% if r.status == 'locked' %}

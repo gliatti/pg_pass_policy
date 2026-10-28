@@ -207,13 +207,18 @@ ppp_worker_register(void)
 }
 
 /*
- * on_shmem_exit callback: unpublish our PID.
+ * on_shmem_exit callback: unpublish our PID, unless a newer worker has
+ * already published its own (compare-and-exchange, no LWLock: see
+ * pppSharedState.worker_pid).
  */
 static void
 ppp_worker_on_exit(int code, Datum arg)
 {
-	if (ppp_shared != NULL && ppp_shared->worker_pid == MyProcPid)
-		ppp_shared->worker_pid = 0;
+	uint32		expected = (uint32) MyProcPid;
+
+	if (ppp_shared != NULL)
+		(void) pg_atomic_compare_exchange_u32(&ppp_shared->worker_pid,
+											  &expected, 0);
 }
 
 /*
@@ -723,15 +728,6 @@ ppp_sync_cleanup(void)
  * Step 3b: reload profiles and persisted locks
  * ------------------------------------------------------------------------
  */
-static int32
-ppp_getint(HeapTuple tup, TupleDesc desc, int col, int32 dflt)
-{
-	bool		isnull;
-	Datum		d = SPI_getbinval(tup, desc, col, &isnull);
-
-	return isnull ? dflt : DatumGetInt32(d);
-}
-
 /* add an eviction made by ppp_enter_role() to the totals of a reload */
 static void
 ppp_count_eviction(const pppEviction *ev, int *n_evicted, int *lost_failed,
@@ -817,9 +813,9 @@ ppp_sync_reload(void)
 		TupleDesc	desc = SPI_tuptable->tupdesc;
 
 		have_default = true;
-		def_max = ppp_getint(tup, desc, 1, 0);
-		def_window = ppp_getint(tup, desc, 2, 0);
-		def_lock = ppp_getint(tup, desc, 3, -1);
+		def_max = ppp_spi_get_int32(tup, desc, 1, 0);
+		def_window = ppp_spi_get_int32(tup, desc, 2, 0);
+		def_lock = ppp_spi_get_int32(tup, desc, 3, -1);
 	}
 
 	/* roles with an assigned profile; current name taken from pg_roles */
@@ -847,9 +843,9 @@ ppp_sync_reload(void)
 			memset(profiles[i].rolename, 0, NAMEDATALEN);
 			if (name)
 				strlcpy(profiles[i].rolename, name, NAMEDATALEN);
-			profiles[i].max_failures = ppp_getint(tup, desc, 2, 0);
-			profiles[i].failure_window_secs = ppp_getint(tup, desc, 3, 0);
-			profiles[i].lock_duration_secs = ppp_getint(tup, desc, 4, -1);
+			profiles[i].max_failures = ppp_spi_get_int32(tup, desc, 2, 0);
+			profiles[i].failure_window_secs = ppp_spi_get_int32(tup, desc, 3, 0);
+			profiles[i].lock_duration_secs = ppp_spi_get_int32(tup, desc, 4, -1);
 			profiles[i].role_exists = DatumGetBool(SPI_getbinval(tup, desc, 5, &isnull));
 		}
 	}
@@ -1243,9 +1239,7 @@ ppp_worker_main(Datum main_arg)
 										   "pg_pass_policy worker",
 										   ALLOCSET_DEFAULT_SIZES);
 
-	LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
-	ppp_shared->worker_pid = MyProcPid;
-	LWLockRelease(ppp_shared->lock);
+	pg_atomic_write_u32(&ppp_shared->worker_pid, (uint32) MyProcPid);
 	on_shmem_exit(ppp_worker_on_exit, (Datum) 0);
 
 	ereport(LOG,

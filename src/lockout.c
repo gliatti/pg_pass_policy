@@ -709,7 +709,7 @@ ppp_client_auth_hook(Port *port, int status)
 	 */
 	if (check_window && !ppp_shared->locks_loaded)
 	{
-		worker_missing = (ppp_shared->worker_pid == 0 &&
+		worker_missing = (ppp_get_worker_pid() == 0 &&
 						  TimestampDifferenceExceeds(ppp_shared->shmem_init_at, now,
 													 PPP_WORKER_MISSING_GRACE_SECS * 1000));
 		if (!(is_superuser && worker_missing))
@@ -942,6 +942,17 @@ static bool ppp_xact_has_lock_ops = false;
  */
 static SubTransactionId ppp_reload_subxid = InvalidSubTransactionId;
 
+/*
+ * Last role whose password change the password hook recorded
+ * (record_password_change()) in the current transaction, read by
+ * pass_policy._record_done(); ppp_recorded_subxid is the sub-transaction
+ * that owns it (handed to the parent at sub-commit, dropped at sub-abort,
+ * like ppp_reload_subxid), InvalidSubTransactionId if none.  Cleared at
+ * COMMIT, ABORT and PREPARE.
+ */
+static char ppp_recorded_role[NAMEDATALEN];
+static SubTransactionId ppp_recorded_subxid = InvalidSubTransactionId;
+
 /* callbacks registered once per backend */
 static bool ppp_xact_cb_registered = false;
 
@@ -961,9 +972,7 @@ ppp_signal_worker_reload(void)
 
 	pg_atomic_write_u32(&ppp_shared->reload_requested, 1);
 
-	LWLockAcquire(ppp_shared->lock, LW_SHARED);
-	pid = ppp_shared->worker_pid;
-	LWLockRelease(ppp_shared->lock);
+	pid = ppp_get_worker_pid();
 
 	if (pid > 0 && pid != MyProcPid)
 	{
@@ -1319,6 +1328,7 @@ ppp_xact_callback(XactEvent event, void *arg)
 
 		case XACT_EVENT_COMMIT:
 		case XACT_EVENT_PARALLEL_COMMIT:
+			ppp_recorded_subxid = InvalidSubTransactionId;
 			/* after ProcArrayEndTransaction: our rows are visible to the worker */
 			ppp_finish_pending_ops(true);
 			ppp_reset_pending_ops();
@@ -1331,6 +1341,7 @@ ppp_xact_callback(XactEvent event, void *arg)
 
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
+			ppp_recorded_subxid = InvalidSubTransactionId;
 			/* locks applied at PRE_COMMIT, if the commit failed afterwards */
 			ppp_finish_pending_ops(false);
 			ppp_reset_pending_ops();
@@ -1351,6 +1362,7 @@ ppp_xact_callback(XactEvent event, void *arg)
 			break;
 
 		case XACT_EVENT_PREPARE:
+			ppp_recorded_subxid = InvalidSubTransactionId;
 			/* a reload request is simply dropped: the next run_maintenance() catches up */
 			ppp_reload_subxid = InvalidSubTransactionId;
 			break;
@@ -1365,6 +1377,15 @@ ppp_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 					 SubTransactionId parentSubid, void *arg)
 {
 	pppPendingOp *op;
+
+	/* the recorded password change, if this sub-transaction owns it */
+	if (ppp_recorded_subxid == mySubid)
+	{
+		if (event == SUBXACT_EVENT_COMMIT_SUB)
+			ppp_recorded_subxid = parentSubid;
+		else if (event == SUBXACT_EVENT_ABORT_SUB)
+			ppp_recorded_subxid = InvalidSubTransactionId;
+	}
 
 	/* the reload request, if this sub-transaction owns it */
 	if (ppp_reload_subxid == mySubid)
@@ -1431,6 +1452,29 @@ ppp_register_xact_callbacks(void)
 		RegisterSubXactCallback(ppp_subxact_callback, NULL);
 		ppp_xact_cb_registered = true;
 	}
+}
+
+/*
+ * Called by the password hook once record_password_change() has returned:
+ * the change of rolename is recorded in the current (sub-)transaction.
+ */
+void
+ppp_note_password_recorded(const char *rolename)
+{
+	ppp_register_xact_callbacks();
+	strlcpy(ppp_recorded_role, rolename, NAMEDATALEN);
+	ppp_recorded_subxid = GetCurrentSubTransactionId();
+}
+
+/*
+ * Did the password hook record a change of rolename in the current
+ * transaction (and in no sub-transaction rolled back since)?
+ */
+bool
+ppp_password_recorded(const char *rolename)
+{
+	return ppp_recorded_subxid != InvalidSubTransactionId &&
+		strncmp(ppp_recorded_role, rolename, NAMEDATALEN) == 0;
 }
 
 /* Queue a write for the end of the current (sub-)transaction. */
@@ -1689,27 +1733,52 @@ ppp_shmem_lock_role(PG_FUNCTION_ARGS)
 }
 
 /*
- * shmem_unlock_role(role text, expired_only bool DEFAULT false) RETURNS void
+ * shmem_unlock_role(role text, expired_only bool DEFAULT false) RETURNS bool
  * (STRICT)
  *
  * Removes the lock at COMMIT, except a lock that the caller cannot have
  * seen (see ppp_unlock_allowed); with expired_only, only a lock that has
  * expired by then.  The failure counter is left alone (see
  * shmem_reset_failures).
+ *
+ * Returns false, and queues nothing, when expired_only is set and the
+ * shared memory holds an active lock of the role right now (a newer
+ * automatic lock that role_state does not know yet): the unlock would be
+ * refused at COMMIT, and step f of run_maintenance() must then neither
+ * audit nor report it.  True otherwise (unlock queued).  A lock set
+ * between this call and the COMMIT is still kept at COMMIT (LOG), the
+ * answer then being optimistic.
  */
 Datum
 ppp_shmem_unlock_role(PG_FUNCTION_ARGS)
 {
 	char		rolename[NAMEDATALEN];
+	bool		expired_only = PG_GETARG_BOOL(1);
 
 	ppp_require_superuser("shmem_unlock_role");
 	ppp_check_shmem();
 
 	ppp_text_to_rolename(PG_GETARG_TEXT_PP(0), rolename);
 
-	ppp_defer_op(PPP_OP_UNLOCK, rolename, 0, PG_GETARG_BOOL(1));
+	if (expired_only && ppp_role_hash != NULL)
+	{
+		pppRoleKey	key;
+		pppRoleEntry *entry;
+		bool		locked = false;
 
-	PG_RETURN_VOID();
+		ppp_make_key(&key, rolename);
+		LWLockAcquire(ppp_shared->lock, LW_SHARED);
+		entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key, HASH_FIND, NULL);
+		if (entry != NULL)
+			locked = ppp_is_locked(entry, GetCurrentTimestamp());
+		LWLockRelease(ppp_shared->lock);
+		if (locked)
+			PG_RETURN_BOOL(false);
+	}
+
+	ppp_defer_op(PPP_OP_UNLOCK, rolename, 0, expired_only);
+
+	PG_RETURN_BOOL(true);
 }
 
 /*

@@ -346,11 +346,12 @@ COMMENT ON FUNCTION shmem_lock_role(text, timestamptz) IS 'Locks a role in share
 
 -- expired_only: lift the lock only if it has expired at COMMIT (step f of
 -- run_maintenance(): never lift a newer automatic lock not yet in role_state)
+-- Returns false (nothing queued) when expired_only and an active lock is held.
 CREATE FUNCTION shmem_unlock_role(role text, expired_only boolean DEFAULT false)
-RETURNS void
+RETURNS bool
 AS 'MODULE_PATHNAME', 'ppp_shmem_unlock_role'
 LANGUAGE C STRICT VOLATILE;
-COMMENT ON FUNCTION shmem_unlock_role(text, boolean) IS 'Removes the shared-memory lock of a role (expired_only: only if it has expired)';
+COMMENT ON FUNCTION shmem_unlock_role(text, boolean) IS 'Removes the shared-memory lock of a role (expired_only: only if it has expired; false if an active lock is kept)';
 
 CREATE FUNCTION shmem_reset_failures(role text)
 RETURNS void
@@ -382,9 +383,21 @@ COMMENT ON FUNCTION _in_password_hook() IS 'Internal: true while the pg_pass_pol
 
 /*
  * Addition to SPEC §4: PID of the background worker (NULL when it is not
- * running), read from shared memory under a shared LWLock.  Used by _audit()
+ * running), read atomically from shared memory.  Used by _audit()
  * for every row, instead of worker_status() (tuplestore, hash size).
  */
+/*
+ * Addition to SPEC §4: true if the password hook recorded a password change
+ * of this role in the current transaction (backend-local flag cleared at
+ * COMMIT / ABORT and when its sub-transaction is rolled back).  Used by
+ * _ensure_recorded() after an ALTER ROLE issued by the extension itself.
+ */
+CREATE FUNCTION _record_done(role name)
+RETURNS bool
+AS 'MODULE_PATHNAME', 'ppp_record_done'
+LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
+COMMENT ON FUNCTION _record_done(name) IS 'Internal: true if the pg_pass_policy password hook recorded a change of this role in the current transaction';
+
 CREATE FUNCTION _worker_pid()
 RETURNS int
 AS 'MODULE_PATHNAME', 'ppp_worker_pid'
@@ -554,8 +567,8 @@ BEGIN
                            RETURN true;
         WHEN 'unlock' THEN PERFORM pass_policy.shmem_unlock_role(p_role);
                            RETURN true;
-        WHEN 'unlock_expired' THEN PERFORM pass_policy.shmem_unlock_role(p_role, true);
-                           RETURN true;
+        -- false: an active (newer) lock is held, nothing is lifted
+        WHEN 'unlock_expired' THEN RETURN pass_policy.shmem_unlock_role(p_role, true);
         ELSE NULL;
     END CASE;
     BEGIN
@@ -862,12 +875,11 @@ LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
-    v_oid oid;
     v_ver text;
 BEGIN
-    SELECT a.oid, a.rolpassword INTO v_oid, v_ver FROM pg_catalog.pg_authid a WHERE a.rolname = p_role;
-    IF NOT EXISTS (SELECT FROM pass_policy.role_state s
-                    WHERE s.role_oid = v_oid AND s.password_changed_at = now() AND s.verifier_pending) THEN
+    -- explicit flag set by the C hook (no guess from role_state)
+    IF NOT pass_policy._record_done(p_role) THEN
+        SELECT a.rolpassword INTO v_ver FROM pg_catalog.pg_authid a WHERE a.rolname = p_role;
         PERFORM pass_policy._record_password_change(p_role::text, v_ver);
     END IF;
 END
@@ -1066,6 +1078,11 @@ BEGIN
         RAISE EXCEPTION 'pg_pass_policy: profile "%" does not exist', v_name
               USING ERRCODE = 'undefined_object';
     END IF;
+    -- rows of dropped roles (purged by the next run_maintenance()) do not
+    -- hold the profile: they are purged here, only existing roles count
+    DELETE FROM pass_policy.role_profile rp
+     WHERE rp.profile_id = v_id
+       AND NOT EXISTS (SELECT FROM pg_catalog.pg_authid a WHERE a.oid = rp.role_oid);
     SELECT count(*) INTO v_n FROM pass_policy.role_profile rp WHERE rp.profile_id = v_id;
     IF v_n > 0 THEN
         RAISE EXCEPTION 'pg_pass_policy: profile "%" is assigned to % role(s)', v_name, v_n
@@ -1158,16 +1175,35 @@ COMMENT ON FUNCTION unassign_profile(name) IS 'Removes the profile assignment of
  * The ALTER ROLE fires the C hook, which checks the policy and calls
  * record_password_change(); _ensure_recorded() covers the case where the
  * hook did not run.
+ *
+ * Length: p_length NULL (default of the callers) = 24 characters, raised
+ * to the min_length of the profile and capped by its max_length; an
+ * explicit p_length outside [min_length, max_length] is refused (22023).
  */
 CREATE FUNCTION _rotate_role(p_role name, p_oid oid, p_length int,
                              OUT password text, OUT profile text)
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
+DECLARE
+    v_min int;
+    v_max int;
+    v_len int;
 BEGIN
     -- read once: the caller's audit row names the profile actually used
-    SELECT p.name INTO profile FROM pass_policy.effective_profile(p_role) p;
-    password := pass_policy.generate_password(coalesce(p_length, 24), profile);
+    SELECT p.name, p.min_length, p.max_length INTO profile, v_min, v_max
+      FROM pass_policy.effective_profile(p_role) p;
+    IF p_length IS NULL THEN
+        v_len := least(greatest(24, v_min), v_max);
+    ELSIF p_length < v_min OR p_length > v_max THEN
+        RAISE EXCEPTION 'pg_pass_policy: password length % is outside the bounds of profile "%"', p_length, profile
+              USING ERRCODE = 'invalid_parameter_value',
+                    DETAIL = format('Profile "%s" requires %s to %s characters.', profile, v_min, v_max),
+                    HINT = 'Omit the length to use the default (24 characters, raised to min_length).';
+    ELSE
+        v_len := p_length;
+    END IF;
+    password := pass_policy.generate_password(v_len, profile);
     IF password IS NULL THEN
         RAISE EXCEPTION 'pg_pass_policy: password generation failed';
     END IF;
@@ -1193,7 +1229,8 @@ COMMENT ON FUNCTION _rotate_role(name, oid, int) IS 'Internal: generates, sets a
  * The password is generated and set by _rotate_role(); it is returned once
  * and never stored or logged.
  */
-CREATE FUNCTION rotate_password(role name, length int DEFAULT 24)
+-- length NULL (default) = 24 characters, raised to the profile min_length
+CREATE FUNCTION rotate_password(role name, length int DEFAULT NULL)
 RETURNS text
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
@@ -1211,7 +1248,7 @@ BEGIN
       FROM pass_policy._rotate_role(v_role, v_oid, $2) r;
 
     PERFORM pass_policy._audit('password_rotated', v_role,
-            jsonb_build_object('profile', v_profile, 'length', coalesce($2, 24),
+            jsonb_build_object('profile', v_profile, 'length', pg_catalog.length(v_pwd),
                                'valid_until', (SELECT a.rolvaliduntil FROM pg_catalog.pg_authid a
                                                 WHERE a.oid = v_oid)));
     RETURN v_pwd;
@@ -1269,7 +1306,7 @@ BEGIN
      WHERE s.role_oid = v_oid;
     PERFORM pass_policy._shmem('lock', v_role::text, CASE WHEN $2 IS NULL THEN NULL ELSE v_until END);
     PERFORM pass_policy._audit('role_locked', v_role,
-            jsonb_build_object('by', 'manual', 'until', v_until, 'reason', $3));
+            jsonb_build_object('locked_by', 'manual', 'locked_until', v_until, 'reason', $3));
     RETURN v_until;
 END
 $$;
@@ -1301,7 +1338,7 @@ BEGIN
      WHERE s.role_oid = v_oid;
     PERFORM pass_policy._shmem('unlock', v_role::text);
     PERFORM pass_policy._shmem('reset', v_role::text);
-    PERFORM pass_policy._audit('role_unlocked', v_role, jsonb_build_object('by', 'manual'));
+    PERFORM pass_policy._audit('role_unlocked', v_role, jsonb_build_object('unlocked_by', 'manual'));
 END
 $$;
 COMMENT ON FUNCTION unlock_role(name) IS 'Unlocks a role and resets its failure counter';
@@ -1392,7 +1429,8 @@ END
 $$;
 COMMENT ON FUNCTION create_rotation_pair(text, name, name, name) IS 'Declares a rotation pair, creating missing login roles as members of the group';
 
-CREATE FUNCTION switch_rotation_pair(pair text, length int DEFAULT 24)
+-- length NULL (default) = 24 characters, raised to the profile min_length
+CREATE FUNCTION switch_rotation_pair(pair text, length int DEFAULT NULL)
 RETURNS TABLE (active_role text, password text, previous_role text, previous_valid_until timestamptz)
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
@@ -1767,12 +1805,16 @@ BEGIN
           FROM pg_catalog.pg_authid a
          WHERE a.oid = s.role_oid AND s.locked_until < now()
         RETURNING a.rolname::text AS rname
+    -- An unlock refused by the shared memory (active newer lock, false) is
+    -- neither audited nor returned: the role is still locked, and the
+    -- worker copies the newer lock to role_state at its next cycle.
     LOOP
-        PERFORM pass_policy._shmem('unlock_expired', r.rname);
-        PERFORM pass_policy._audit('role_unlocked', r.rname, '{"by":"auto"}');
-        action := 'role_unlocked'; role_name := r.rname; details := '{"by":"auto"}';
-        v_actions := v_actions + 1;
-        RETURN NEXT;
+        IF pass_policy._shmem('unlock_expired', r.rname) THEN
+            PERFORM pass_policy._audit('role_unlocked', r.rname, '{"unlocked_by":"auto"}');
+            action := 'role_unlocked'; role_name := r.rname; details := '{"unlocked_by":"auto"}';
+            v_actions := v_actions + 1;
+            RETURN NEXT;
+        END IF;
     END LOOP;
 
     ---------------------------------------------------------------- g

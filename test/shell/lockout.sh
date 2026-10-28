@@ -81,7 +81,7 @@ check_eq "aucun mot de passe dans l'audit" "0" "$out"
 out=$(psql_admin "SELECT coalesce((SELECT s.locked_by = 'auto' AND s.locked_until IS NOT NULL
                                     FROM pass_policy.role_state s WHERE s.role_name = 'regress_lock'), false)
                       OR EXISTS (SELECT FROM pass_policy.audit_log l WHERE l.event_type = 'role_unlocked'
-                                    AND l.role_name = 'regress_lock' AND l.details->>'by' = 'auto')")
+                                    AND l.role_name = 'regress_lock' AND l.details->>'unlocked_by' = 'auto')")
 check_eq "verrou automatique copié dans role_state" "t" "$out"
 
 # --- déverrouillage automatique après lock_duration (5 s) ---------------------
@@ -221,6 +221,8 @@ check_eq "unlock_role dans un SAVEPOINT validé : déverrouillé au COMMIT" "reg
 # que role_state ne connaît pas encore (le worker dort). L'étape f de
 # run_maintenance() lève le verrou expiré de role_state, mais pas, en shmem,
 # le verrou actif (shmem_unlock_role(…, expired_only => true)).
+# (clôture) shmem_unlock_role() renvoie alors false : l'étape f n'écrit pas
+# d'audit role_unlocked et ne renvoie pas l'action (le rôle reste verrouillé).
 psql_admin "SELECT pass_policy.alter_profile('p_lock', '{\"failure_window\": \"1 minute\", \"lock_duration\": \"6 seconds\"}')" >/dev/null
 t0=$(psql_admin "SELECT clock_timestamp()")
 psql_admin "SELECT pass_policy.shmem_reload()" >/dev/null
@@ -239,8 +241,15 @@ sleep 7 # le premier verrou expire ; role_state le porte encore (le worker dort)
 out=$(psql_admin "SELECT locked_until < now() FROM pass_policy.role_state WHERE role_name = 'regress_lock'")
 check_eq "F4 : role_state porte un verrou expiré" "t" "$out"
 for i in 1 2 3 4 5; do psql_as regress_lock "$BAD" >/dev/null || true; done
-out=$(psql_admin "SELECT action FROM pass_policy.run_maintenance() WHERE role_name = 'regress_lock'")
-check_contains "F4 : run_maintenance() lève le verrou expiré de role_state" "role_unlocked" "$out"
+n0=$(psql_admin "SELECT count(*) FROM pass_policy.audit_log WHERE event_type = 'role_unlocked' AND role_name = 'regress_lock'")
+out=$(psql_admin "SELECT count(*) FROM pass_policy.run_maintenance() WHERE role_name = 'regress_lock' AND action = 'role_unlocked'")
+check_eq "F4 : run_maintenance() ne renvoie pas role_unlocked (déverrouillage refusé en shmem)" "0" "$out"
+n1=$(psql_admin "SELECT count(*) FROM pass_policy.audit_log WHERE event_type = 'role_unlocked' AND role_name = 'regress_lock'")
+check_eq "F4 : aucun audit role_unlocked pour le déverrouillage refusé" "$n0" "$n1"
+# le shmem_reload() de fin de passe réveille le worker, qui peut déjà avoir
+# recopié le nouveau verrou : NULL ou verrou actif, jamais le verrou expiré
+out=$(psql_admin "SELECT locked_until IS NULL OR locked_until > now() FROM pass_policy.role_state WHERE role_name = 'regress_lock'")
+check_eq "F4 : le verrou expiré est effacé de role_state" "t" "$out"
 out=$(psql_as regress_lock "$GOOD") || true
 check_contains "F4 : le nouveau verrou automatique survit à run_maintenance()" "is locked by pg_pass_policy" "$out"
 out=$(psql_admin "SELECT locked_until > now() FROM pass_policy.failed_attempts() WHERE role_name = 'regress_lock'")
@@ -266,6 +275,26 @@ out=$(psql_as regress_exempt "$GOOD" "SELECT current_user") || true
 check_eq "rôle exempté : jamais verrouillé" "regress_exempt" "$out"
 out=$(psql_admin "SELECT count(*) FROM pass_policy.failed_attempts() WHERE role_name = 'regress_exempt' AND locked_until IS NOT NULL")
 check_eq "rôle exempté : aucun verrou en shmem" "0" "$out"
+# (clôture) liste découpée par le check hook (GUC extra) : nom entre guillemets
+# (casse conservée), syntaxe invalide refusée sans toucher la valeur en place
+psql_admin "CREATE ROLE \"Regress_Q\" LOGIN PASSWORD '$GOOD'"
+out=$(psql_admin "ALTER SYSTEM SET pg_pass_policy.exempt_roles = 'regress_exempt,,x'" 2>&1) || true
+check_contains "exempt_roles : liste invalide refusée par le check hook" "invalid value|List syntax" "$out"
+psql_admin "ALTER SYSTEM SET pg_pass_policy.exempt_roles = 'regress_exempt, \"Regress_Q\"'"
+psql_admin "SELECT pg_reload_conf()" >/dev/null
+sleep 1
+out=$(psql_admin "SELECT pass_policy._is_exempt('regress_exempt'), pass_policy._is_exempt('Regress_Q'), pass_policy._is_exempt('regress_q')")
+check_eq "exempt_roles : noms simple et entre guillemets" "t|t|f" "$out"
+# (clôture) rotate_password() d'un rôle exempté : le hook ne tourne pas,
+# _ensure_recorded() enregistre le changement (_record_done() faux)
+h0=$(psql_admin "SELECT count(*) FROM pass_policy.password_history WHERE role_name = 'regress_exempt'")
+out=$(psql_admin "SELECT length(pass_policy.rotate_password('regress_exempt')) >= 24")
+check_eq "rôle exempté : rotate_password() réussit" "t" "$out"
+h1=$(psql_admin "SELECT count(*) FROM pass_policy.password_history WHERE role_name = 'regress_exempt'")
+check_eq "rôle exempté : changement enregistré par _ensure_recorded()" "$((h0 + 1))" "$h1"
+out=$(psql_admin "SELECT password_changed_at > now() - interval '1 minute' FROM pass_policy.role_state WHERE role_name = 'regress_exempt'")
+check_eq "rôle exempté : role_state mis à jour" "t" "$out"
+psql_admin "ALTER ROLE regress_exempt PASSWORD '$GOOD'" # utilisé plus loin
 
 # --- rôle inexistant : pas de plantage ---------------------------------------
 for i in 1 2 3 4 5 6; do psql_as regress_nobody "$BAD" >/dev/null || true; done

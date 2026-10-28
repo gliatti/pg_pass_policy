@@ -90,7 +90,7 @@ def pair_create(
 def pair_switch(
     request: Request,
     pair: str,
-    length: int = Form(default=24, ge=8, le=128),
+    length: int | None = Form(default=None, ge=8, le=128),
     conn: Connection = db.CONN,
 ):
     # run_action() commits before anything is shown: a password is displayed

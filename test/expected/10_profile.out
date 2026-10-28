@@ -308,6 +308,46 @@ SELECT pass_policy.drop_profile('p_strict');
  
 (1 row)
 
+-- (clôture) drop_profile() ne compte pas les lignes role_profile des rôles
+-- supprimés (purgées sur place) : le profil d'un rôle disparu se supprime
+CREATE ROLE regress_ghost LOGIN;
+SELECT pass_policy.create_profile('p_ghost', '{}') > 0 AS created;
+ created 
+---------
+ t
+(1 row)
+
+SELECT pass_policy.assign_profile('regress_ghost', 'p_ghost');
+ assign_profile 
+----------------
+ 
+(1 row)
+
+DROP ROLE regress_ghost;
+SELECT count(*) AS stale_rows FROM pass_policy.role_profile WHERE role_name = 'regress_ghost';
+ stale_rows 
+------------
+          1
+(1 row)
+
+SELECT pass_policy.drop_profile('p_ghost');
+ drop_profile 
+--------------
+ 
+(1 row)
+
+SELECT count(*) AS stale_rows_after FROM pass_policy.role_profile WHERE role_name = 'regress_ghost';
+ stale_rows_after 
+------------------
+                0
+(1 row)
+
+SELECT count(*) AS dropped FROM pass_policy.profile WHERE name = 'p_ghost';
+ dropped 
+---------
+       0
+(1 row)
+
 -- Nom de profil avec guillemets : refusé proprement (contrainte sur le nom)
 -- ou accepté et manipulable ; dans les deux cas aucune erreur de syntaxe SQL
 -- (42601) ne doit remonter, ce qui trahirait une concaténation non protégée.

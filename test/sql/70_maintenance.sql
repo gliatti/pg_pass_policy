@@ -187,7 +187,7 @@ SELECT pg_sleep(3.5);
 CREATE TEMP TABLE m_unlock AS SELECT * FROM pass_policy.run_maintenance();
 SELECT action, role_name FROM m_unlock
  WHERE action = 'role_unlocked' AND role_name IN ('regress_carol', 'regress_dave');
-SELECT role_name, details->>'by' AS by FROM pass_policy.audit_log
+SELECT role_name, details->>'unlocked_by' AS unlocked_by FROM pass_policy.audit_log
  WHERE event_type = 'role_unlocked' AND role_name IN ('regress_carol', 'regress_dave');
 SELECT count(*) AS dave_lock_left FROM pass_policy.failed_attempts()
  WHERE role_name = 'regress_dave' AND locked_until IS NOT NULL;

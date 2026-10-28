@@ -43,6 +43,18 @@ check_contains "PPP-017 : nom de rôle en majuscules non ASCII" "PPP-017" "$out"
 out=$(psql_admin "SELECT pass_policy.check_password('regress_été', 'Xx-ÉTÉ_SSERGER-2024#')")
 check_contains "PPP-017 : nom de rôle inversé" "PPP-017" "$out"
 
+# (clôture) PPP-020 : caractères Unicode de contrôle, de format ou d'espace
+# invisible refusés (base UTF8) ; une lettre accentuée reste acceptée
+for cp in 200B 0085 00A0 2028 FEFF 3000; do
+	ch=$(printf "\\u$cp")
+	out=$(psql_admin "SELECT pass_policy.check_password('regress_été', 'Xx-Pass${ch}word-2024#')")
+	check_contains "PPP-020 : U+$cp refusé" "PPP-020" "$out"
+done
+out=$(psql_admin "SELECT coalesce(pass_policy.check_password('regress_été', 'Xx-Pässwörd-2024#'), 'NULL')")
+check_eq "lettres accentuées acceptées" "NULL" "$out"
+out=$(psql_admin "ALTER ROLE \"regress_été\" PASSWORD 'Xx-Pass$(printf '​')word-2024#'" 2>&1) || true
+check_contains "ALTER ROLE avec U+200B refusé (hook)" "PPP-020" "$out"
+
 # Et par un vrai ALTER ROLE (hook)
 out=$(psql_admin "ALTER ROLE \"regress_été\" PASSWORD 'ÉtéSoleil2024!'" 2>&1) && rc=0 || rc=$?
 check_eq "ALTER ROLE refusé par le dictionnaire" "1" "$( [ "$rc" -ne 0 ] && echo 1 || echo 0)"
