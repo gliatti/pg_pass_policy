@@ -65,7 +65,7 @@ Tout passe par des variables d'environnement préfixées `PGPP_WEB_`.
 | `PGPP_WEB_DATABASE_URL` | *(vide)* | chaîne de connexion libpq (`postgresql://pgpp_web@hôte:5432/postgres`). Vide : les variables `PGHOST`, `PGPORT`, `PGUSER`, `PGDATABASE`, `PGPASSFILE`… de libpq s'appliquent |
 | `PGPP_WEB_SECRET` | **obligatoire** | clé de signature du cookie de session (jeton CSRF), 32 caractères minimum : `python3 -c 'import secrets; print(secrets.token_urlsafe(48))'` |
 | `PGPP_WEB_AUTH` | `basic` | `basic` (HTTP basic) ou `proxy` (en-tête posé par un reverse proxy) |
-| `PGPP_WEB_BASIC_USERS` | *(vide)* | mode `basic` : `user:hash-bcrypt,user2:hash-bcrypt`, toutes les empreintes du même coût bcrypt |
+| `PGPP_WEB_BASIC_USERS` | *(vide)* | mode `basic` : `user:hash-bcrypt,user2:hash-bcrypt`, toutes les empreintes du même coût bcrypt ; un utilisateur cité deux fois empêche le démarrage |
 | `PGPP_WEB_PROXY_HEADER` | `X-Remote-User` | mode `proxy` : en-tête portant l'utilisateur authentifié (`REMOTE_USER` est accepté et correspond à `Remote-User`) |
 | `PGPP_WEB_TRUSTED_PROXIES` | `127.0.0.1,::1` | mode `proxy` : adresses ou réseaux (CIDR) autorisés à poser l'en-tête ; `unix` pour un socket Unix ; `*` pour tout accepter (déconseillé) |
 | `PGPP_WEB_SESSION_HTTPS_ONLY` | `false` | marque le cookie de session `Secure` et le nomme `__Host-pgpp_session` : **obligatoire derrière HTTPS** (voir Sécurité) |
@@ -206,7 +206,12 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
   Un jeton absent ou périmé (session perdue : cookie expiré ou effacé,
   `PGPP_WEB_SECRET` changé) donne un 403 « reload the page » ; pour une
   requête htmx, la réponse porte `HX-Refresh: true` et la page est rechargée
-  avec un jeton neuf. Le jeton n'est publié que dans `hx-headers` (pas de
+  avec un jeton neuf. Si la requête ne porte aucun cookie de session (cookie
+  `Secure` de `PGPP_WEB_SESSION_HTTPS_ONLY=true` servi en HTTP clair, cookies
+  bloqués par le navigateur, ou cookie expiré), il n'y a pas de rechargement
+  automatique, qui tournerait en boucle : une alerte « Session cookie not
+  stored (or expired) » invite à recharger la page puis, si l'erreur persiste,
+  à vérifier `PGPP_WEB_SESSION_HTTPS_ONLY` et les cookies. Le jeton n'est publié que dans `hx-headers` (pas de
   balise `<meta>`).
 - **En-têtes** : `Content-Security-Policy` sans script inline (nonce par
   requête, `script-src 'self'`, `frame-ancestors 'none'`, `form-action 'self'`),
@@ -311,17 +316,17 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
   donne la même page.
 - **Noms dans les URL** : un nom de rôle ou de paire peut contenir `/` ; il est
   encodé (`%2F`), le serveur le décode avant le routage et les routes
-  `/{role:path}/action` le reconstituent. Les routes des profils gardent un
-  segment simple (`/profiles/{name}`) : la contrainte `CHECK (name ~
+  `/{role:path}/action` le reconstituent. Les routes d'un profil sont rangées sous
+  `/profiles/p/{name}` (édition, mise à jour, `/profiles/p/{name}/delete`),
+  à l'écart des routes fixes `/profiles/new`, `/profiles/assign` et
+  `/profiles/unassign` : un profil nommé `new` ou `assign` se gère donc comme
+  les autres. Elles gardent un segment simple : la contrainte `CHECK (name ~
   '^[A-Za-z0-9_.-]{1,63}$')` de `pass_policy.profile` interdit `/` (un profil
-  `x/delete` ne peut pas exister, ce que vérifie un test d'intégration). Les
-  noms `new`, `assign` et `unassign` (routes fixes) ainsi que `.` et `..`
-  (segments supprimés de l'URL par le navigateur) sont acceptés par
-  l'extension mais injoignables par ces routes : l'interface refuse de créer ou
-  de modifier un profil portant l'un d'eux (422, message explicite) et n'en
-  affiche pas le formulaire d'édition (`GET /profiles/assign` répond 404 avec
-  le même message, sans quoi le formulaire posterait vers la route
-  d'assignation) ; un tel profil se gère en SQL.
+  `x/delete` ne peut pas exister, ce que vérifie un test d'intégration). Seuls
+  `.` et `..` (segments supprimés de l'URL par le navigateur), acceptés par
+  l'extension, restent injoignables : l'interface refuse de créer ou de
+  modifier un profil portant l'un d'eux (422, message explicite) et n'en
+  affiche pas le formulaire d'édition (404) ; un tel profil se gère en SQL.
 - **Droits** : le rôle de service est seulement membre de `pass_policy_admin` ;
   les fonctions `SECURITY DEFINER` qui visent un rôle (rotation, expiration,
   verrouillage, paires, `assign_profile()` et `unassign_profile()`) refusent

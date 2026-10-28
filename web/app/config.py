@@ -105,6 +105,9 @@ class Settings(BaseSettings):
                 raise ValueError("PGPP_WEB_BASIC_USERS entries must be user:bcrypt-hash")
             if not digest.isascii():
                 raise ValueError(_malformed_hash(user, digest))
+            if user in users:
+                # the last entry would silently replace the first one
+                raise ValueError(f"PGPP_WEB_BASIC_USERS: user {user!r} is listed more than once")
             users[user] = digest.encode("ascii")
         # one cost for every hash: an unknown user is checked against a dummy
         # hash of that cost (auth.dummy_hash()), a user whose hash had another

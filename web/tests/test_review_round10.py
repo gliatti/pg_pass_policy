@@ -168,7 +168,7 @@ def _profiles_page(monkeypatch, client):
 def test_profile_delete_form_works_without_javascript(app, monkeypatch):  # noqa: F811
     client, _ = _client(app)
     page = _profiles_page(monkeypatch, client)
-    form_re = r'<form method="post" action="/profiles/p1/delete"[^>]*>(.*?)</form>'
+    form_re = r'<form method="post" action="/profiles/p/p1/delete"[^>]*>(.*?)</form>'
     form = re.search(form_re, page, re.S)
     assert form, page
     token = re.search(r'<input type="hidden" name="csrf_token" value="([^"]+)">', form.group(1))
@@ -176,7 +176,7 @@ def test_profile_delete_form_works_without_javascript(app, monkeypatch):  # noqa
     dropped = []
     monkeypatch.setattr(db, "drop_profile", lambda conn, name: dropped.append(name))
     # what the browser sends without htmx: the form field, no header
-    response = client.post("/profiles/p1/delete", data={"csrf_token": token.group(1)})
+    response = client.post("/profiles/p/p1/delete", data={"csrf_token": token.group(1)})
     assert response.status_code == 303
     assert response.headers["location"] == "/profiles"
     assert dropped == ["p1"]
@@ -188,7 +188,7 @@ def test_profile_delete_refused_without_javascript_is_a_page(app, monkeypatch): 
     token = CSRF_HX_HEADERS.search(page).group(1)
     exc = psycopg.errors.ObjectInUse('pg_pass_policy: profile "p1" is assigned')
     monkeypatch.setattr(db, "drop_profile", _raise(exc))
-    response = client.post("/profiles/p1/delete", data={"csrf_token": token})
+    response = client.post("/profiles/p/p1/delete", data={"csrf_token": token})
     assert response.status_code == 422
     assert "<h1>Error 422</h1>" in response.text and "<nav>" in response.text
 

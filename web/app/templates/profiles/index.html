@@ -30,5 +30,16 @@
 <div id="profile-alerts"></div>
 
 <h2>Assignments</h2>
+<form class="inline" hx-post="{{ path_for('profile_assign') }}" hx-target="#assignments" hx-swap="innerHTML">
+  <label>Role
+    <select name="role" required>
+      {% for name in login_roles %}<option value="{{ name }}">{{ name }}</option>{% endfor %}
+    </select></label>
+  <label>Profile
+    <select name="profile" required>
+      {% for name in profile_names %}<option value="{{ name }}">{{ name }}</option>{% endfor %}
+    </select></label>
+  <button class="btn">Assign</button>
+</form>
 <div id="assignments">{% include "profiles/_assignments.html" %}</div>
 {% endblock %}

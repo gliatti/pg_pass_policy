@@ -224,11 +224,11 @@ def test_profiles_crud_and_assignment(client, super_conn):
     response = client.post("/profiles", data=bad, headers=headers)
     assert response.status_code == 422 and "not an integer" in response.text
 
-    edit = client.get("/profiles/web_t_created")
+    edit = client.get("/profiles/p/web_t_created")
     assert edit.status_code == 200
     assert 'value="14"' in edit.text
     response = client.post(
-        "/profiles/web_t_created",
+        "/profiles/p/web_t_created",
         data={**data, "min_length": "16", "max_age": "30 days"},
         headers=headers,
     )
@@ -248,7 +248,7 @@ def test_profiles_crud_and_assignment(client, super_conn):
     assert "web_t_created" in listing.text
 
     # assigned profiles cannot be dropped
-    response = client.post("/profiles/web_t_created/delete", headers=headers)
+    response = client.post("/profiles/p/web_t_created/delete", headers=headers)
     assert response.status_code == 422 and "assigned" in response.text
 
     response = client.post("/profiles/unassign", data={"role": "web_t_beta"}, headers=headers)
@@ -259,7 +259,7 @@ def test_profiles_crud_and_assignment(client, super_conn):
         "/profiles/assign", data={"role": "web_t_beta", "profile": T_PROFILE}, headers=headers
     )
 
-    response = client.post("/profiles/web_t_created/delete", headers=headers)
+    response = client.post("/profiles/p/web_t_created/delete", headers=headers)
     assert response.status_code == 204
     assert (
         super_conn.execute(
@@ -268,7 +268,7 @@ def test_profiles_crud_and_assignment(client, super_conn):
         == 0
     )
 
-    response = client.post("/profiles/default/delete", headers=headers)
+    response = client.post("/profiles/p/default/delete", headers=headers)
     assert response.status_code == 422 and "cannot be dropped" in response.text
 
 
@@ -653,16 +653,16 @@ def test_unexpected_action_error_is_a_logged_500(client, monkeypatch, caplog):
     assert "no_such_table" in caplog.text
 
 
-def test_reserved_name_profile_created_in_sql(client, super_conn):
+def test_profile_named_like_a_fixed_route(client, super_conn):
     """A profile named "assign" (accepted by the extension, created in SQL)
-    is not offered for edition: GET /profiles/assign is refused, the
-    assignment route of the same path keeps working."""
+    is edited at /profiles/p/assign: no collision with the assignment route
+    of /profiles/assign, which keeps working."""
     super_conn.execute("SELECT pass_policy.create_profile('assign', '{}'::jsonb)")
     try:
-        response = client.get("/profiles/assign")
-        assert response.status_code == 404, response.text
-        assert "is reserved by the web interface" in response.text
-        assert 'id="profile-form"' not in response.text
+        response = client.get("/profiles/p/assign")
+        assert response.status_code == 200, response.text
+        assert 'id="profile-form"' in response.text
+        assert 'action="/profiles/p/assign"' in response.text
         token = csrf_token(client, "/profiles")
         headers = {"X-CSRF-Token": token, "HX-Request": "true"}
         response = client.post(
@@ -670,7 +670,13 @@ def test_reserved_name_profile_created_in_sql(client, super_conn):
         )
         assert response.status_code == 200, response.text
         assert f"Profile {T_PROFILE} assigned to web_t_beta" in response.text
-        assert client.get("/profiles/web_t_no_such_profile").status_code == 404
+        assert client.get("/profiles/p/web_t_no_such_profile").status_code == 404
+        # "assign" is an ordinary profile: it can be deleted from the page
+        response = client.post("/profiles/p/assign/delete", headers=headers)
+        assert response.status_code == 204, response.text
+        assert super_conn.execute(
+            "SELECT count(*) FROM pass_policy.profile WHERE name = 'assign'"
+        ).fetchone() == (0,)
     finally:
         super_conn.execute("DELETE FROM pass_policy.profile WHERE name = 'assign'")
 
@@ -696,13 +702,17 @@ def test_validation_errors_are_html(client):
 
 
 def test_audit_page_past_the_end_keeps_the_total(client):
+    """A page past the end shows the last page (with its events), not an
+    empty table numbered beyond the page count."""
     first = client.get("/audit/table", params={"role": "web_t_alpha"})
     far = client.get("/audit/table", params={"role": "web_t_alpha", "page": 99999})
     assert far.status_code == 200
-    assert "No event matches." in far.text
+    assert "No event matches." not in far.text
     total = first.text.split(" event", 1)[0].rsplit(">", 1)[1]
     assert int(total) > 0
+    pages = first.text.split(" — page 1 / ", 1)[1].split("<", 1)[0]
     assert f"{total} event" in far.text
+    assert f"page {pages} / {pages}" in far.text
 
 
 def test_profile_name_cannot_contain_a_slash(client, super_conn):
@@ -810,13 +820,13 @@ def test_profile_created_is_listed_immediately(client, super_conn):
             )
             assert response.status_code in (204, 303), response.text
             listing = client.get("/profiles")
-            assert f'href="/profiles/{name}"' in listing.text or name in listing.text
+            assert f'href="/profiles/p/{name}"' in listing.text or name in listing.text
             assert super_conn.execute(
                 "SELECT count(*) FROM pass_policy.profile WHERE name = %s", (name,)
             ).fetchone() == (1,)
         # plain form post: the redirect is followed to the listing
         response = client.post(
-            "/profiles/web_t_now1/delete", data={"csrf_token": token}, follow_redirects=True
+            "/profiles/p/web_t_now1/delete", data={"csrf_token": token}, follow_redirects=True
         )
         assert response.status_code == 200 and "web_t_now1" not in response.text
     finally:
@@ -824,16 +834,27 @@ def test_profile_created_is_listed_immediately(client, super_conn):
 
 
 def test_reserved_profile_names_are_refused(client, super_conn):
+    """Only "." and ".." (dot segments, rewritten by the browser) are
+    refused; "new", "assign" and "unassign" are ordinary names since the
+    routes of a profile live under /profiles/p/."""
     token = csrf_token(client, "/profiles")
     headers = {"X-CSRF-Token": token, "HX-Request": "true"}
-    for name in ("new", "assign", "unassign", ".", ".."):
+    for name in (".", ".."):
         response = client.post("/profiles", data={"name": name, **PROFILE_FORM}, headers=headers)
         assert response.status_code == 422, (name, response.text)
         assert "is reserved by the web interface" in response.text
     assert super_conn.execute(
-        "SELECT count(*) FROM pass_policy.profile"
-        " WHERE name IN ('new', 'assign', 'unassign', '.', '..')"
+        "SELECT count(*) FROM pass_policy.profile WHERE name IN ('.', '..')"
     ).fetchone() == (0,)
+    try:
+        response = client.post("/profiles", data={"name": "new", **PROFILE_FORM}, headers=headers)
+        assert response.status_code == 204, response.text
+        edit = client.get("/profiles/p/new")
+        assert edit.status_code == 200 and 'action="/profiles/p/new"' in edit.text
+        response = client.post("/profiles/p/new", data=PROFILE_FORM, headers=headers)
+        assert response.status_code == 200 and "Profile updated" in response.text
+    finally:
+        super_conn.execute("DELETE FROM pass_policy.profile WHERE name = 'new'")
 
 
 PRIV_ROLES = {

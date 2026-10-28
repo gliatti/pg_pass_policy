@@ -245,7 +245,7 @@ def test_extension_action_error_is_a_422_fragment(app, monkeypatch):
     )
     monkeypatch.setattr(db, "drop_profile", _raise(exc))
     client, token = _client(app)
-    response = client.post("/profiles/p1/delete", headers={"X-CSRF-Token": token})
+    response = client.post("/profiles/p/p1/delete", headers={"X-CSRF-Token": token})
     assert response.status_code == 422
     assert "only a superuser can manage privileged role" in response.text
 
@@ -253,13 +253,27 @@ def test_extension_action_error_is_a_422_fragment(app, monkeypatch):
 # --- 4 / 5: profile_edit: reserved names, one 404 path, one form context --------------
 
 
-# ("." and "..": removed from the URL by the client before routing)
-@pytest.mark.parametrize("name", ["assign", "unassign"])
-def test_profile_edit_refuses_reserved_names(app, monkeypatch, name):
+# the item routes live under /profiles/p/{name}: "new", "assign" and
+# "unassign" are ordinary names; "." and ".." only arrive encoded (%2E),
+# a client removes the plain dot segments before sending the request
+@pytest.mark.parametrize("name", ["new", "assign", "unassign"])
+def test_profile_edit_of_former_reserved_names(app, monkeypatch, name):
     looked_up = []
     monkeypatch.setattr(db, "get_profile", lambda conn, n: looked_up.append(n) or {"name": n})
     client, _ = _client(app)
-    response = client.get(f"/profiles/{name}")
+    response = client.get(f"/profiles/p/{name}")
+    assert response.status_code == 200, response.text
+    assert 'id="profile-form"' in response.text
+    assert f'action="/profiles/p/{name}"' in response.text
+    assert looked_up == [name]
+
+
+@pytest.mark.parametrize("encoded", ["%2E", "%2E%2E"])
+def test_profile_edit_refuses_dot_names(app, monkeypatch, encoded):
+    looked_up = []
+    monkeypatch.setattr(db, "get_profile", lambda conn, n: looked_up.append(n) or {"name": n})
+    client, _ = _client(app)
+    response = client.get(f"/profiles/p/{encoded}")
     assert response.status_code == 404
     assert "is reserved by the web interface" in response.text
     assert 'id="profile-form"' not in response.text
@@ -269,10 +283,10 @@ def test_profile_edit_refuses_reserved_names(app, monkeypatch, name):
 def test_profile_edit_unknown_is_the_generic_404(app, monkeypatch):
     monkeypatch.setattr(db, "get_profile", lambda conn, n: None)
     client, _ = _client(app)
-    response = client.get("/profiles/ghost")
+    response = client.get("/profiles/p/ghost")
     assert response.status_code == 404
     assert "<nav>" in response.text and "Profile not found" in response.text
-    response = client.get("/profiles/ghost", headers={"HX-Request": "true"})
+    response = client.get("/profiles/p/ghost", headers={"HX-Request": "true"})
     assert response.status_code == 404 and response.headers["HX-Retarget"] == "#alerts"
 
 
@@ -289,7 +303,7 @@ def test_profile_form_context_is_built_once(app, monkeypatch):
     monkeypatch.setattr(profiles, "_form_response", spy)
     monkeypatch.setattr(db, "get_profile", lambda conn, n: {"name": n, "min_length": 9})
     client, _ = _client(app)
-    response = client.get("/profiles/p1")
+    response = client.get("/profiles/p/p1")
     assert response.status_code == 200 and "Profile p1</h1>" in response.text
     response = client.get("/profiles/new")
     assert response.status_code == 200 and "New profile</h1>" in response.text

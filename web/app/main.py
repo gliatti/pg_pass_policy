@@ -22,7 +22,7 @@ from app.db import ExtensionUnavailable, extension_unavailable, make_pool
 from app.logfilter import get_logger, install_log_masking
 from app.routers import audit, dashboard, maintenance, pairs, profiles, roles
 from app.security import SecurityHeadersMiddleware
-from app.templating import STATIC_DIR, is_hx, render
+from app.templating import STATIC_DIR, alert_response, is_hx, render
 
 log = get_logger("main")
 
@@ -59,9 +59,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.add_middleware(
         SessionMiddleware,
         secret_key=settings.secret.get_secret_value(),
-        # the __Host- prefix (Secure, Path=/, no Domain) stops a same-site
-        # origin from planting its own session cookie on the host
-        session_cookie="__Host-pgpp_session" if settings.session_https_only else "pgpp_session",
+        session_cookie=session_cookie_name(settings),
         same_site="strict",
         https_only=settings.session_https_only,
         max_age=8 * 3600,
@@ -85,10 +83,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.exception_handler(StarletteHTTPException)
     async def http_exception(request: Request, exc: StarletteHTTPException) -> Any:
         headers = exc.headers
-        if isinstance(exc, InvalidCsrfToken) and is_hx(request):
-            # a stale token (lost session): reload the page for a fresh one
-            headers = {**(headers or {}), "HX-Refresh": "true"}
-        return _error_response(request, exc.status_code, str(exc.detail), headers)
+        detail = str(exc.detail)
+        if isinstance(exc, InvalidCsrfToken):
+            if session_cookie_name(settings) not in request.cookies:
+                # the browser never sent the session cookie back (Secure
+                # cookie over plain HTTP, cookies blocked): a reload would
+                # fail the same way, in a loop
+                detail = SESSION_NOT_STORED
+            elif is_hx(request):
+                # a stale token (lost session): reload the page for a fresh one
+                headers = {**(headers or {}), "HX-Refresh": "true"}
+        return _error_response(request, exc.status_code, detail, headers)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, exc: RequestValidationError) -> Any:
@@ -135,6 +140,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return _error_response(request, 500, "Database error, see the server log")
 
     return app
+
+
+# no automatic reload then: a cookie the browser does not keep would make
+# HX-Refresh loop.  The request alone cannot tell a cookie never stored from
+# one expired (max_age) while the page stayed open: the message covers both.
+SESSION_NOT_STORED = (
+    "Session cookie not stored (or expired): reload the page; if this persists,"
+    " check PGPP_WEB_SESSION_HTTPS_ONLY / cookies (a Secure cookie is not kept"
+    " over plain HTTP, the browser may block cookies)"
+)
+
+
+def session_cookie_name(settings: Settings) -> str:
+    """The session cookie: the __Host- prefix (Secure, Path=/, no Domain)
+    stops a same-site origin from planting its own session cookie on the
+    host, it requires a Secure cookie."""
+    return "__Host-pgpp_session" if settings.session_https_only else "pgpp_session"
 
 
 def validation_detail(exc: RequestValidationError) -> str:
@@ -185,12 +207,7 @@ def _error_response(
         if status_code == 401:
             # htmx cannot answer a basic-auth challenge: ask for a full reload
             headers["HX-Refresh"] = "true"
-        return render(
-            request, "_alert.html", {"error": detail}, status_code=status_code, headers=headers
-        )
-    if "session" not in request.scope:
-        # outside the middleware stack (should not happen): plain text
-        return PlainTextResponse(detail, status_code=status_code, headers=headers)
+        return alert_response(request, detail, status_code, headers)
     # no navigation for an unidentified client: the router's 404 / 405 and
     # the 401 / 403 of the authentication are raised before (or instead of)
     # require_user, request.state.user is then unset

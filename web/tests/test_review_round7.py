@@ -211,7 +211,7 @@ def test_profile_delete_error_page_or_fragment(app, monkeypatch, htmx):  # noqa:
     headers = {"X-CSRF-Token": token}
     if htmx:
         headers["HX-Request"] = "true"
-    response = client.post("/profiles/p1/delete", headers=headers)
+    response = client.post("/profiles/p/p1/delete", headers=headers)
     assert response.status_code == 422
     assert 'profile "p1" does not exist' in response.text.replace("&#34;", '"')
     if htmx:

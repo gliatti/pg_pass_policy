@@ -6,7 +6,7 @@ from fastapi import APIRouter, Request
 from psycopg import Connection
 
 from app import db
-from app.templating import render
+from app.templating import alert_response, render
 
 router = APIRouter(prefix="/maintenance")
 
@@ -20,7 +20,7 @@ def maintenance_page(request: Request, conn: Connection = db.CONN):
 def maintenance_run(request: Request, conn: Connection = db.CONN):
     actions, error = db.run_action(conn, db.run_maintenance)
     if error is not None:
-        return render(request, "_alert.html", {"error": error}, 422)
+        return alert_response(request, error)
     return render(
         request,
         "maintenance/_result.html",

@@ -125,7 +125,7 @@ def test_no_router_reimplements_the_savepoint_and_commit():
             {"pair_name": "p", "role_a": "a", "role_b": "b", "group_role": "g"},
         ),
         ("/profiles/unassign", "unassign_profile", {"role": "r"}),
-        ("/profiles/p1", "alter_profile", None),
+        ("/profiles/p/p1", "alter_profile", None),
     ],
 )
 def test_more_write_actions_commit_before_response(monkeypatch, path, patch, data):
@@ -163,16 +163,24 @@ def test_assignments_fragment_and_page_share_the_context(monkeypatch):
     monkeypatch.setattr(db, "unassign_profile", lambda conn, role: None)
     client, token = _client(app, events)
 
-    assert client.get("/profiles").status_code == 200
+    page = client.get("/profiles")
+    assert page.status_code == 200
     # the page derives the names from the profiles: no profile_names() query
     assert calls == ["profiles", "assignments", "login_roles False"]
+    # the form is outside the block that assign / unassign replace
+    form = page.text.index('<form class="inline" hx-post="/profiles/assign"')
+    assert '<option value="r1">' in page.text
+    assert form < page.text.index('<div id="assignments">')
     calls.clear()
     response = client.post(
         "/profiles/unassign", data={"role": "r1"}, headers={"X-CSRF-Token": token}
     )
     assert response.status_code == 200
-    assert calls == ["assignments", "login_roles False", "names"]
-    assert '<option value="r1">' in response.text
+    # the fragment is the alert and the table only: the form (and its
+    # login_roles() query) stays outside the refreshed block
+    assert calls == ["assignments"]
+    assert "<select" not in response.text
+    assert "r1 is back on the default profile" in response.text
 
 
 # --- 8: audit pager links built from one query string -------------------------------------

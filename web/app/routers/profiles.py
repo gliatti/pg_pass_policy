@@ -10,7 +10,7 @@ from psycopg import Connection
 from starlette.datastructures import FormData
 
 from app import db
-from app.templating import is_hx, redirect_to, render
+from app.templating import alert_response, is_hx, redirect_to, render
 
 router = APIRouter(prefix="/profiles")
 
@@ -38,15 +38,16 @@ LABELS = {
 }
 
 
-# names that the profile routes cannot reach: /profiles/new, /profiles/assign
-# and /profiles/unassign are fixed routes, "." and ".." are removed from the
-# URL by the browser (dot segments).  The extension accepts them (its CHECK
-# is ^[A-Za-z0-9_.-]{1,63}$): the web interface refuses to create or update
-# them, such a profile is managed with SQL.
-RESERVED_NAMES = frozenset({"new", "assign", "unassign", ".", ".."})
+# names that the profile routes cannot reach: "." and ".." are removed from
+# the URL by the browser (dot segments).  The extension accepts them (its
+# CHECK is ^[A-Za-z0-9_.-]{1,63}$): the web interface refuses to create or
+# update them, such a profile is managed with SQL.  The routes of one profile
+# live under /profiles/p/{name}, apart from the fixed routes (/profiles/new,
+# /profiles/assign, /profiles/unassign): every other name is reachable.
+RESERVED_NAMES = frozenset({".", ".."})
 RESERVED_MESSAGE = (
     'the profile name "{}" is reserved by the web interface'
-    " (new, assign, unassign, . and ..): choose another name or use SQL"
+    " (. and ..): choose another name or use SQL"
 )
 
 
@@ -84,29 +85,26 @@ async def _read_form(request: Request) -> FormData:
 FORM: Any = Depends(_read_form)
 
 
-def _assignment_context(
-    request: Request, conn: Connection, profile_names: list[str] | None = None
-) -> dict[str, Any]:
-    """The context of the assignments block, shared by the full page and the
-    fragment returned by assign / unassign."""
-    return {
-        "assignments": db.assignments(conn),
-        "login_roles": db.login_roles(conn, db.session_is_superuser(request, conn)),
-        "profile_names": db.profile_names(conn) if profile_names is None else profile_names,
-    }
-
-
 def _page(request: Request, conn: Connection) -> Response:
     profiles = db.list_profiles(conn)
-    # same order as profile_names(): derived, no second query
-    context = _assignment_context(request, conn, [p["name"] for p in profiles])
-    return render(request, "profiles/index.html", {"profiles": profiles, **context})
+    context = {
+        "profiles": profiles,
+        "assignments": db.assignments(conn),
+        # the assignment form sits outside the block refreshed by assign /
+        # unassign (#assignments): its lists are computed for the page only
+        "login_roles": db.login_roles(conn, db.session_is_superuser(request, conn)),
+        # same order as profile_names(): derived, no second query
+        "profile_names": [p["name"] for p in profiles],
+    }
+    return render(request, "profiles/index.html", context)
 
 
 def _assignments_fragment(
     request: Request, conn: Connection, error: str | None = None, notice: str | None = None
 ) -> Response:
-    context = {**_assignment_context(request, conn), "error": error, "notice": notice}
+    """The assignments block (#assignments) returned by assign / unassign:
+    the alert and the table, not the form (no login_roles() query)."""
+    context = {"assignments": db.assignments(conn), "error": error, "notice": notice}
     return render(request, "profiles/_assignments.html", context, 422 if error else 200)
 
 
@@ -172,7 +170,6 @@ def profile_create(request: Request, form: FormData = FORM, conn: Connection = d
     return redirect_to(request, "profiles")
 
 
-# declared before the /{name} routes so that they are not captured by them
 @router.post("/assign", name="profile_assign")
 def profile_assign(
     request: Request,
@@ -200,21 +197,23 @@ def profile_unassign(
     return _assignments_fragment(request, conn, notice=f"{role} is back on the default profile")
 
 
-# {name} (not {name:path}): the CHECK constraint of pass_policy.profile
-# (name ~ '^[A-Za-z0-9_.-]{1,63}$') forbids '/', so a decoded profile name never
-# spans two segments and "x/delete" cannot be mistaken for the delete action
-# on "x" (tests/test_integration.py checks that such a name is refused)
-@router.get("/{name}", name="profile_edit")
+# /p/{name}: apart from the fixed routes above, so that no profile name
+# collides with them.  {name} (not {name:path}): the CHECK constraint of
+# pass_policy.profile (name ~ '^[A-Za-z0-9_.-]{1,63}$') forbids '/', so a
+# decoded profile name never spans two segments and "x/delete" cannot be
+# mistaken for the delete action on "x" (tests/test_integration.py checks
+# that such a name is refused)
+@router.get("/p/{name}", name="profile_edit")
 def profile_edit(request: Request, name: str, conn: Connection = db.CONN):
     if name in RESERVED_NAMES:
-        # GET /profiles/assign (or unassign) lands here, but the form would
-        # post to the fixed POST route of the same path: never offered
+        # only reachable with an encoded dot segment: the form would post to
+        # a URL that the browser rewrites
         raise HTTPException(status_code=404, detail=RESERVED_MESSAGE.format(name))
     profile = _profile_or_404(conn, name)
     return _form_response(request, profile, profile)
 
 
-@router.post("/{name}", name="profile_update")
+@router.post("/p/{name}", name="profile_update")
 def profile_update(request: Request, name: str, form: FormData = FORM, conn: Connection = db.CONN):
     profile = _profile_or_404(conn, name)
     values = {k: form.get(k) for k, _ in db.PROFILE_FIELDS}
@@ -233,13 +232,13 @@ def profile_update(request: Request, name: str, form: FormData = FORM, conn: Con
     return _form_response(request, profile, values, error=error, notice=notice)
 
 
-@router.post("/{name}/delete", name="profile_delete")
+@router.post("/p/{name}/delete", name="profile_delete")
 def profile_delete(request: Request, name: str, conn: Connection = db.CONN):
     _, error = db.run_action(conn, db.drop_profile, name)
     if error is not None:
         if is_hx(request):
             # swapped into the alert area of the profile list
-            return render(request, "_alert.html", {"error": error}, 422)
+            return alert_response(request, error)
         # a plain form post (no JavaScript): the full error page of main.py,
         # not a bare fragment (nothing was changed: the action rolled back)
         raise HTTPException(status_code=422, detail=error)

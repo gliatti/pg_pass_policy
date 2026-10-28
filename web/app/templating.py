@@ -15,7 +15,7 @@ from fastapi.templating import Jinja2Templates
 from starlette.responses import RedirectResponse, Response
 
 from app.csrf import get_csrf_token
-from app.db import INFINITY
+from app.db import INFINITY, NEG_INFINITY
 from app.security import route_path
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
@@ -67,7 +67,12 @@ def fmt_ts(value: Any) -> str:
     if value is None:
         return "—"
     if isinstance(value, str):
-        return "∞ (manual)" if value == INFINITY else value
+        # the special values that InfinityTimestamptzLoader keeps as text
+        if value == INFINITY:
+            return "∞ (manual)"
+        if value == NEG_INFINITY:
+            return "−∞"
+        return value
     if isinstance(value, datetime):
         return value.isoformat(sep=" ", timespec="minutes")
     return str(value)
@@ -132,6 +137,17 @@ def render(
     return templates.TemplateResponse(
         request, name, context or {}, status_code=status_code, headers=headers
     )
+
+
+def alert_response(
+    request: Request,
+    error: str,
+    status_code: int = 422,
+    headers: dict[str, str] | None = None,
+) -> Response:
+    """A bare alert fragment (_alert.html): a refused action, or an error
+    swapped into an alert area."""
+    return render(request, "_alert.html", {"error": error}, status_code, headers)
 
 
 NO_STORE = {"Cache-Control": "no-store", "Pragma": "no-cache"}

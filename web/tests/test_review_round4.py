@@ -129,14 +129,14 @@ def test_update_of_an_unknown_profile_is_a_retargeted_404(monkeypatch):
     monkeypatch.setattr(db, "alter_profile", lambda *a: events.append("alter"))
     client, token = _client(app, events)
     response = client.post(
-        "/profiles/ghost", data={}, headers={"X-CSRF-Token": token, "HX-Request": "true"}
+        "/profiles/p/ghost", data={}, headers={"X-CSRF-Token": token, "HX-Request": "true"}
     )
     assert response.status_code == 404
     assert response.headers["HX-Retarget"] == "#alerts"
     assert "Profile not found" in response.text
     assert "alter" not in events
 
-    response = client.post("/profiles/ghost", data={"csrf_token": token})
+    response = client.post("/profiles/p/ghost", data={"csrf_token": token})
     assert response.status_code == 404
     assert "<nav>" in response.text and "Profile not found" in response.text
 

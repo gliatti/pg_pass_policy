@@ -34,23 +34,39 @@ def _context(request: Request, conn: Connection, filters: dict[str, Any]) -> dic
     error = None
     rows: list[dict[str, Any]] = []
     total = 0
+    page = filters["page"]
     try:
         with conn.transaction():
+            since = db.parse_since(filters["since"])
             rows, total = db.list_audit(
                 conn,
                 role=filters["role"],
                 event_type=filters["type"],
-                since=db.parse_since(filters["since"]),
+                since=since,
                 limit=page_size,
-                offset=(filters["page"] - 1) * page_size,
+                offset=(page - 1) * page_size,
             )
+            last = max(1, math.ceil(total / page_size))
+            if page > last:
+                # a page past the end (stale link, hand-typed URL): the last
+                # page, not an empty table with a "page 7 / 2" footer
+                page = last
+                rows, total = db.list_audit(
+                    conn,
+                    role=filters["role"],
+                    event_type=filters["type"],
+                    since=since,
+                    limit=page_size,
+                    offset=(page - 1) * page_size,
+                )
     except psycopg.DataError as exc:
         error = f"Invalid filter: {db.error_message(exc)}"
-    pages = max(1, math.ceil(total / page_size)) if total else 1
+    pages = max(1, math.ceil(total / page_size))
+    page = min(page, pages)
     return {
         "events": rows,
         "total": total,
-        "page": filters["page"],
+        "page": page,
         "pages": pages,
         "filters": filters,
         "event_types": db.EVENT_TYPES,

@@ -68,6 +68,7 @@ PROFILE_FIELDS: tuple[tuple[str, str], ...] = (
 )
 MAX_ROLES = 500
 INFINITY = "infinity"
+NEG_INFINITY = "-infinity"
 
 
 class InfinityTimestamptzLoader(TimestamptzLoader):
@@ -75,7 +76,7 @@ class InfinityTimestamptzLoader(TimestamptzLoader):
 
     def load(self, data: Any) -> Any:  # type: ignore[override]
         raw = bytes(data)
-        if raw in (b"infinity", b"-infinity"):
+        if raw in (INFINITY.encode(), NEG_INFINITY.encode()):
             return raw.decode()
         return super().load(data)
 

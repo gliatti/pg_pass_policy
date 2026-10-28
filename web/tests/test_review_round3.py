@@ -131,7 +131,7 @@ def test_profile_create_commits_before_redirect(monkeypatch, htmx):
 @pytest.mark.parametrize(
     ("path", "patch"),
     [
-        ("/profiles/p1/delete", "drop_profile"),
+        ("/profiles/p/p1/delete", "drop_profile"),
         ("/maintenance/run", "run_maintenance"),
         ("/profiles/assign", "assign_profile"),
     ],
@@ -161,7 +161,7 @@ def test_commit_failure_is_an_error_not_a_redirect(monkeypatch, caplog):
     monkeypatch.setattr(db, "drop_profile", lambda conn, name: events.append("drop"))
     client, token = _client(app, events)
     response = client.post(
-        "/profiles/p1/delete", headers={"X-CSRF-Token": token, "HX-Request": "true"}
+        "/profiles/p/p1/delete", headers={"X-CSRF-Token": token, "HX-Request": "true"}
     )
     assert response.status_code == 500
     assert "HX-Redirect" not in response.headers
@@ -302,12 +302,16 @@ def test_reserved_name_refused_on_create(form_app, name):
 def test_reserved_name_refused_on_update(form_app):
     app, events = form_app
     client, token = _client(app, events)
-    # no POST /profiles/new route: this reaches profile_update("new")
-    response = client.post(
-        "/profiles/new", data={}, headers={"X-CSRF-Token": token, "HX-Request": "true"}
-    )
+    headers = {"X-CSRF-Token": token, "HX-Request": "true"}
+    # "." only arrives encoded (a client removes the plain dot segment)
+    response = client.post("/profiles/p/%2E", data={}, headers=headers)
     assert response.status_code == 422
     assert "is reserved by the web interface" in response.text
+    assert "alter" not in events
+    # "new" is an ordinary name under /profiles/p/: no collision with the
+    # fixed GET /profiles/new route
+    response = client.post("/profiles/new", data={}, headers=headers)
+    assert response.status_code == 405
     assert "alter" not in events
 
 
@@ -320,7 +324,7 @@ def test_form_error_without_htmx_is_a_full_page(form_app):
     assert "<nav>" in response.text and "New profile</h1>" in response.text
     assert "a profile name is required" in response.text
 
-    response = client.post("/profiles/p1", data={"min_length": "x", "csrf_token": token})
+    response = client.post("/profiles/p/p1", data={"min_length": "x", "csrf_token": token})
     assert response.status_code == 422
     assert "<nav>" in response.text and "Profile p1</h1>" in response.text
 
