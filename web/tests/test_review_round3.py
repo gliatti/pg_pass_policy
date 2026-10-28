@@ -377,9 +377,19 @@ def test_decode_basic(header, expected):
     assert auth._decode_basic(header) == expected
 
 
-def test_basic_user_name_uses_the_same_decoding():
-    assert auth.basic_user_name("Basic " + base64.b64encode(b"bob:pw").decode()) == "bob"
-    assert auth.basic_user_name("Basic " + base64.b64encode(b"bob").decode()) is None
+def test_the_claimed_basic_name_uses_the_same_decoding():
+    def claimed(credentials: bytes) -> str | None:
+        header = "Basic " + base64.b64encode(credentials).decode()
+        request = SimpleNamespace(headers={"authorization": header}, session={})
+        result = auth.authenticate_basic(request, make_settings())
+        assert result.user is None
+        return result.claimed
+
+    assert claimed(b"bob:pw") == "bob"
+    assert claimed(b"bob") is None
+    assert claimed("Émilie:pw".encode()) == "Émilie"
+    # not UTF-8: replaced for the log line, never authenticated
+    assert claimed(b"bad\xff:pw") == "bad\ufffd"
 
 
 def test_reread_after_commit(caplog):

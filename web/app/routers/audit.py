@@ -46,6 +46,7 @@ def _context(request: Request, conn: Connection, filters: dict[str, Any]) -> dic
     result = db.AuditPage([], 0)
     page = filters["page"]
     past_end = False
+    last_known_page = None
     try:
         with conn.transaction():
             since = db.parse_since(filters["since"])
@@ -66,11 +67,14 @@ def _context(request: Request, conn: Connection, filters: dict[str, Any]) -> dic
             # table with a "page 7 / 2" footer); no second query when
             # nothing matches (the last page is empty as well).  Total
             # capped: the last page is unknown (only "more than 10,000"),
-            # the requested page is shown empty with a link to the first
-            # page, never a page presented as the last one.
+            # the requested page is shown empty with links to the first
+            # page and to the last page known to exist (the one holding
+            # event AUDIT_COUNT_CAP + 1), never a page presented as the
+            # last one.
             if not result.rows and page > 1:
                 if result.capped:
                     past_end = True
+                    last_known_page = min(_page_count(db.AUDIT_COUNT_CAP + 1, page_size), page - 1)
                 else:
                     page = min(page, _page_count(result.total, page_size))
                     if result.total:
@@ -88,6 +92,7 @@ def _context(request: Request, conn: Connection, filters: dict[str, Any]) -> dic
         "total_label": total_label(result),
         "has_next": result.has_next,
         "past_end": past_end,
+        "last_known_page": last_known_page,
         "page": page,
         "pages": pages,
         "filters": filters,

@@ -8,7 +8,8 @@ import functools
 import hashlib
 import hmac
 import ipaddress
-import re
+import threading
+import time
 from dataclasses import dataclass
 
 import bcrypt
@@ -45,10 +46,23 @@ def dummy_hash(users: dict[str, bytes]) -> bytes:
     return _dummy_hash_of_cost(cost or DEFAULT_COST)
 
 
-# a user name: 1 to 128 characters, none of them a C0 or C1 control character
-# (U+0000-U+001F, U+007F-U+009F) or a line / paragraph separator (U+2028,
-# U+2029), which a log viewer or a terminal may render as a line break
-_USER_RE = re.compile(r"^[^\x00-\x1f\x7f-\x9f  ]{1,128}$")
+# longest accepted user name, in characters
+USER_MAX_LENGTH = 128
+
+
+def _valid_user(name: str) -> bool:
+    """A user name: 1 to USER_MAX_LENGTH printable characters, no leading or
+    trailing space.  str.isprintable() refuses the C0 and C1 control
+    characters (U+0000-U+001F, U+007F-U+009F, NEL U+0085 included), the
+    format characters (bidirectional overrides, zero-width joiners, soft
+    hyphen) and every space or separator but the ASCII space (no-break space
+    U+00A0, ideographic space U+3000, line / paragraph separators U+2028,
+    U+2029...): a log viewer or a terminal would render them as a line
+    break, as nothing, or as a plain space, so that two distinct names would
+    look alike.  Letters, marks and symbols of any script are accepted
+    ("Émilie", "日本")."""
+    return 0 < len(name) <= USER_MAX_LENGTH and name.isprintable() and name.strip(" ") == name
+
 
 # session key of the cached basic authentication (see _basic_fingerprint())
 SESSION_BASIC_KEY = "basic_auth"
@@ -77,22 +91,11 @@ def _decode_basic(authorization: str | None) -> tuple[bytes, bytes] | None:
     return user_b, password_b
 
 
-def basic_user_name(authorization: str | None) -> str | None:
-    """The user name claimed by a Basic header (for logging only, unverified)."""
-    decoded = _decode_basic(authorization)
-    return None if decoded is None else _claimed_name(decoded[0])
-
-
-def _claimed_name(user_b: bytes) -> str:
-    """The user name part of a decoded Basic header (unverified)."""
-    return user_b.decode("utf-8", "replace")
-
-
 def _loggable(user: str | None) -> str:
     """A user name safe for a log line: no control characters, bounded length."""
     if user is None:
         return "<none>"
-    return user if _USER_RE.match(user) else repr(user)[:128]
+    return user if _valid_user(user) else repr(user)[:128]
 
 
 def verify_basic(authorization: str | None, users: dict[str, bytes]) -> str | None:
@@ -185,7 +188,8 @@ def authenticate_basic(request: Request, settings: Settings) -> BasicResult:
         request.session.pop(SESSION_BASIC_KEY, None)
         return BasicResult(None, None)
     user_b, password_b = decoded
-    claimed = _claimed_name(user_b)
+    # unverified, for the cache check and the log line
+    claimed = user_b.decode("utf-8", "replace")
     user = _cached_basic_user(request, settings, authorization, claimed)
     if user is not None:
         return BasicResult(user, claimed)
@@ -219,6 +223,39 @@ def _client_is_trusted(request: Request, settings: Settings) -> bool:
     return any(a in net for a in candidates for net in settings.trusted_networks())
 
 
+class _ThrottledWarning:
+    """A warning logged at most once per `interval` seconds; the next line
+    logged tells how many were suppressed in between (a flood of bad
+    requests must not flood the log)."""
+
+    def __init__(self, interval: float = 60.0):
+        self.interval = interval
+        self._lock = threading.Lock()
+        self._last: float | None = None
+        self._suppressed = 0
+
+    def reset(self) -> None:
+        with self._lock:
+            self._last, self._suppressed = None, 0
+
+    def warning(self, message: str, *args: object) -> None:
+        now = time.monotonic()
+        with self._lock:
+            if self._last is not None and now - self._last < self.interval:
+                self._suppressed += 1
+                return
+            suppressed, self._last, self._suppressed = self._suppressed, now, 0
+        if suppressed:
+            message += " (%d similar warnings suppressed in the last %d s)"
+            args = (*args, suppressed, int(self.interval))
+        log.warning(message, *args)
+
+
+# a proxy header that cannot be decoded: a misconfigured reverse proxy or
+# PGPP_WEB_PROXY_HEADER_ENCODING, worth a trace (never the header itself)
+_undecodable_proxy_header = _ThrottledWarning(60.0)
+
+
 def user_from_proxy(request: Request, settings: Settings) -> str:
     if not _client_is_trusted(request, settings):
         log.warning("proxy header refused from untrusted peer %s", request.client)
@@ -232,8 +269,11 @@ def user_from_proxy(request: Request, settings: Settings) -> str:
     # character): the original bytes are recovered and decoded strictly in
     # the configured encoding (PGPP_WEB_PROXY_HEADER_ENCODING), never in
     # another one, so that each name comes from a single byte sequence.
-    # Only ASCII blanks are stripped before decoding: str.strip() would also
-    # drop \xa0 or \x85, which are bytes of UTF-8 sequences ("à" is C3 A0).
+    # Only ASCII blanks are stripped, on the bytes, before decoding, and
+    # nothing after: str.strip() would also drop \xa0 or \x85 (bytes of
+    # UTF-8 sequences: "à" is C3 A0) or, after decoding, a no-break or an
+    # ideographic space, so that several byte sequences would give the same
+    # name.  A name holding such a space is refused by _valid_user().
     raw = (request.headers.get(header) or "").strip(" \t")
     if not raw:
         raise HTTPException(
@@ -241,13 +281,20 @@ def user_from_proxy(request: Request, settings: Settings) -> str:
             detail="Not authenticated (proxy header missing)",
         )
     try:
-        user = raw.encode("latin-1").decode(encoding).strip()
+        user = raw.encode("latin-1").decode(encoding)
     except UnicodeError:
+        _undecodable_proxy_header.warning(
+            "proxy header %s not valid %s (%d bytes) from %s",
+            header,
+            encoding,
+            len(raw),
+            request.client.host if request.client and request.client.host else "unix",
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"Not authenticated (proxy header not valid {encoding})",
         ) from None
-    if not user or not _USER_RE.match(user):
+    if not _valid_user(user):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Not authenticated (proxy header not a valid user name)",

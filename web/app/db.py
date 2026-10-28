@@ -678,21 +678,23 @@ def parse_since(text: str | None) -> datetime | str | None:
 
 def _audit_where(
     role: str | None, event_type: str | None, since: datetime | str | None
-) -> tuple[str, list[Any]]:
+) -> tuple[str, dict[str, Any]]:
+    """WHERE clause of the audit filters, with named parameters (it appears
+    twice in list_audit(): the page and the bounded count)."""
     where = ["true"]
-    params: list[Any] = []
+    params: dict[str, Any] = {}
     if role:
-        where.append("role_name = %s")
-        params.append(role)
+        where.append("role_name = %(role)s")
+        params["role"] = role
     if event_type:
-        where.append("event_type = %s")
-        params.append(event_type)
+        where.append("event_type = %(event_type)s")
+        params["event_type"] = event_type
     if isinstance(since, datetime):
-        where.append("event_time >= %s")
-        params.append(since)
+        where.append("event_time >= %(since)s")
+        params["since"] = since
     elif since:
-        where.append("event_time >= now() - %s::interval")
-        params.append(since)
+        where.append("event_time >= now() - %(since)s::interval")
+        params["since"] = since
     return " AND ".join(where), params
 
 
@@ -744,22 +746,30 @@ def list_audit(
 
     A single statement reads the page and, when needed, the count, so that
     they come from the same snapshot (a page and a total that disagree
-    would show a wrong pager).  The count is an uncorrelated subquery in a
-    CASE branch: PostgreSQL runs such an InitPlan only when the branch is
-    taken.  count(*) OVER () would instead compute the whole match before
-    LIMIT, on every page."""
+    would show a wrong pager).  The rows of the page are counted once (CTE
+    k, a single row, so that an empty page still yields one row).  The
+    count of the matches is an uncorrelated subquery in a CASE branch:
+    PostgreSQL runs such an InitPlan only when the branch is taken.
+    count(*) OVER () would instead compute the whole match before LIMIT, on
+    every page."""
     where, params = _audit_where(role, event_type, since)
     result = conn.execute(
         f"WITH p AS (SELECT {_AUDIT_COLUMNS} FROM pass_policy.audit_log"
-        f"           WHERE {where} ORDER BY id DESC LIMIT %s OFFSET %s)"
-        " SELECT CASE WHEN (SELECT count(*) FROM p) > %s"
-        "               OR ((SELECT count(*) FROM p) = 0 AND %s > 0)"
+        f"           WHERE {where} ORDER BY id DESC LIMIT %(limit1)s OFFSET %(offset)s),"
+        "      k AS (SELECT count(*) AS n FROM p)"
+        " SELECT CASE WHEN k.n > %(limit)s OR (k.n = 0 AND %(offset)s > 0)"
         "             THEN (SELECT count(*) FROM (SELECT 1 FROM pass_policy.audit_log"
-        f"                     WHERE {where} LIMIT %s) AS m)"
+        f"                     WHERE {where} LIMIT %(cap)s) AS m)"
         "        END AS matching, p.*"
-        "   FROM (VALUES (1)) AS one LEFT JOIN p ON true"
+        "   FROM k LEFT JOIN p ON true"
         "  ORDER BY p.id DESC",
-        [*params, limit + 1, offset, limit, offset, *params, AUDIT_COUNT_CAP + 1],
+        {
+            **params,
+            "limit1": limit + 1,
+            "limit": limit,
+            "offset": offset,
+            "cap": AUDIT_COUNT_CAP + 1,
+        },
     ).fetchall()
     # no event on this page: a single row whose page columns are NULL (id is
     # the primary key, never NULL otherwise)

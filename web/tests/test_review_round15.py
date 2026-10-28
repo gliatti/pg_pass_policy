@@ -59,18 +59,44 @@ def _proxy_request(raw: bytes) -> Request:
 # --- 9: C1 controls and line separators are refused in a user name -------------------------
 
 
-@pytest.mark.parametrize("name", ["a\x85b", "a\x9bb", "a\x80", "a b", "a b", "a\x7fb"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "a\x85b",
+        "a\x9bb",
+        "a\x80",
+        "a\u2028b",
+        "a\u2029b",
+        "a\x7fb",
+        # Unicode spaces and format characters, inside or at the end
+        "a\xa0b",
+        "bob\xa0",
+        "bob\u3000",
+        "\u3000bob",
+        "bob\x85",
+        "a\u200bb",
+        "a\u202eb",
+        "a\xadb",
+        # ASCII space at either end
+        " bob",
+        "bob ",
+        "",
+    ],
+)
 def test_c1_controls_and_separators_are_refused(name):
-    assert not auth._USER_RE.match(name)
+    assert not auth._valid_user(name)
     assert auth._loggable(name) == repr(name)[:128]
-    response = _proxy_client().get("/_whoami", headers={"X-Remote-User": name.encode()})
-    assert response.status_code == 401
+    # (ASCII blanks around a proxy header are stripped, on the bytes)
+    if name and name.strip(" ") == name:
+        response = _proxy_client().get("/_whoami", headers={"X-Remote-User": name.encode()})
+        assert response.status_code == 401
 
 
-@pytest.mark.parametrize("name", ["Émilie", "zoë", "a\xa0b", "日本", "x" * 128])
+@pytest.mark.parametrize("name", ["Émilie", "zoë", "E\u0301milie", "a b", "日本", "x" * 128])
 def test_printable_names_are_accepted(name):
-    assert auth._USER_RE.match(name)
-    assert not auth._USER_RE.match("x" * 129)
+    assert auth._valid_user(name)
+    assert auth._loggable(name) == name
+    assert not auth._valid_user("x" * 129)
 
 
 # --- 10: audit pagination ------------------------------------------------------------------
@@ -84,20 +110,18 @@ class _AuditConn:
 
     def __init__(self, matching: int):
         self.matching = matching
-        self.queries: list[tuple[str, list]] = []
+        self.queries: list[tuple[str, dict]] = []
         self.counted = 0
 
     def execute(self, sql, params):
         self.queries.append((sql, params))
-        n_where = (len(params) - 5) // 2
-        limit1, offset, limit, offset2 = params[n_where : n_where + 4]
-        cap = params[-1]
-        assert limit1 == limit + 1 and offset2 == offset
-        page = list(range(offset, min(self.matching, offset + limit1)))
+        limit, offset = params["limit"], params["offset"]
+        assert params["limit1"] == limit + 1
+        page = list(range(offset, min(self.matching, offset + limit + 1)))
         n = None
         if len(page) > limit or (not page and offset > 0):
             self.counted += 1
-            n = min(self.matching, cap)
+            n = min(self.matching, params["cap"])
         rows = [{"matching": n, "id": i} for i in page] or [{"matching": n, "id": None}]
         return SimpleNamespace(fetchall=lambda: rows)
 
@@ -106,7 +130,7 @@ def test_audit_queries_one_row_more_and_never_counts_over():
     conn = _AuditConn(30)
     page = db.list_audit(conn, limit=50, offset=0)
     sql, params = conn.queries[0]
-    assert "OVER" not in sql and params[:2] == [51, 0]
+    assert "OVER" not in sql and (params["limit1"], params["offset"]) == (51, 0)
     # last page: one statement, the total without a count
     assert page == db.AuditPage(page.rows, 30)
     assert len(page.rows) == 30 and len(conn.queries) == 1 and conn.counted == 0
@@ -125,8 +149,16 @@ def test_audit_page_and_count_are_one_statement_up_to_the_cap():
     assert len(page.rows) == 50 and page.has_next and page.total == 120 and not page.capped
     assert len(conn.queries) == 1 and conn.counted == 1
     sql, params = conn.queries[0]
-    assert sql.count("LIMIT %s") == 2
-    assert params == ["r", 51, 50, 50, 50, "r", db.AUDIT_COUNT_CAP + 1]
+    assert "LIMIT %(limit1)s" in sql and "LIMIT %(cap)s" in sql
+    # the rows of the page are counted once, the filter appears twice
+    assert sql.count("FROM p)") == 1 and sql.count("role_name = %(role)s") == 2
+    assert params == {
+        "role": "r",
+        "limit1": 51,
+        "limit": 50,
+        "offset": 50,
+        "cap": db.AUDIT_COUNT_CAP + 1,
+    }
 
     conn = _AuditConn(25_000)
     page = db.list_audit(conn, limit=50, offset=0)
@@ -267,7 +299,9 @@ def test_the_basic_cache_follows_the_configured_hash():
 
     def cached_user(cached, **kw):
         req, authorization, s = request(cached, **kw)
-        return auth._cached_basic_user(req, s, authorization, auth.basic_user_name(authorization))
+        return auth._cached_basic_user(
+            req, s, authorization, auth._decode_basic(authorization)[0].decode()
+        )
 
     assert cached_user({"user": TEST_USER, "fp": fp}) == TEST_USER
     # a user no longer configured, a forged user name, a malformed entry

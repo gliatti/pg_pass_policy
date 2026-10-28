@@ -47,13 +47,87 @@ def _refused(raw: bytes, settings) -> HTTPException:
     return refused.value
 
 
+@pytest.fixture(autouse=True)
+def _reset_throttle():
+    auth._undecodable_proxy_header.reset()
+    yield
+    auth._undecodable_proxy_header.reset()
+
+
 @pytest.mark.parametrize("raw", [b"\xc9milie", b"bad\xff", b"\xe2\x82"])
 def test_a_proxy_header_not_valid_utf8_is_refused(raw, caplog):
     caplog.set_level(logging.DEBUG)
     error = _refused(raw, _proxy_settings())
     assert error.detail == "Not authenticated (proxy header not valid utf-8)"
-    # no fallback to another encoding, no warning per request
-    assert "latin-1" not in caplog.text and not caplog.records
+    # no fallback to another encoding; one warning, without the header content
+    assert "latin-1" not in caplog.text
+    [record] = caplog.records
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == (
+        f"proxy header x-remote-user not valid utf-8 ({len(raw)} bytes) from 127.0.0.1"
+    )
+    assert raw.decode("latin-1") not in caplog.text and repr(raw) not in caplog.text
+
+
+def test_undecodable_proxy_headers_are_logged_once_per_minute(monkeypatch, caplog):
+    caplog.set_level(logging.WARNING)
+    clock = [1000.0]
+    monkeypatch.setattr(auth.time, "monotonic", lambda: clock[0])
+    settings = _proxy_settings()
+    for _ in range(5):
+        _refused(b"bad\xff", settings)
+        clock[0] += 10
+    # the first one only, within 60 s
+    assert len(caplog.records) == 1
+    caplog.clear()
+    clock[0] = 1000.0 + 60
+    _refused(b"\xc9milie", settings)
+    [record] = caplog.records
+    assert record.getMessage() == (
+        "proxy header x-remote-user not valid utf-8 (6 bytes) from 127.0.0.1"
+        " (4 similar warnings suppressed in the last 60 s)"
+    )
+    # a valid header is not affected and does not log
+    caplog.clear()
+    assert auth.user_from_proxy(_proxy_request(b"carol"), settings) == "carol"
+    assert not caplog.records
+
+
+# Unicode spaces and NEL: neither stripped nor accepted, in either encoding,
+# so that "bob" comes from the byte sequence b"bob" only
+_UNICODE_BLANKS = {
+    "utf-8": [
+        ("bob\xa0".encode(), "not a valid user name"),
+        ("\xa0bob".encode(), "not a valid user name"),
+        ("bob\u3000".encode(), "not a valid user name"),
+        ("\u3000bob".encode(), "not a valid user name"),
+        ("bob\x85".encode(), "not a valid user name"),
+        ("b\u3000ob".encode(), "not a valid user name"),
+        # the latin-1 bytes of NBSP and NEL are not UTF-8
+        (b"bob\xa0", "not valid utf-8"),
+        (b"bob\x85", "not valid utf-8"),
+    ],
+    "latin-1": [
+        (b"bob\xa0", "not a valid user name"),
+        (b"\xa0bob", "not a valid user name"),
+        (b"bob\x85", "not a valid user name"),
+        (b"\x85bob", "not a valid user name"),
+        # U+3000 has no latin-1 form: its UTF-8 bytes read as latin-1 end
+        # with C1 controls
+        ("bob\u3000".encode(), "not a valid user name"),
+        ("bob\xa0".encode(), "not a valid user name"),
+    ],
+}
+
+
+@pytest.mark.parametrize(
+    ("encoding", "raw", "reason"),
+    [(enc, raw, reason) for enc, cases in _UNICODE_BLANKS.items() for raw, reason in cases],
+)
+def test_unicode_blanks_are_not_stripped_but_refused(encoding, raw, reason):
+    settings = _proxy_settings(proxy_header_encoding=encoding)
+    assert _refused(raw, settings).detail == f"Not authenticated (proxy header {reason})"
+    assert auth.user_from_proxy(_proxy_request(b" bob\t"), settings) == "bob"
 
 
 def test_utf8_names_are_decoded_strictly():
@@ -103,9 +177,16 @@ def test_a_stale_link_past_a_capped_audit_is_shown_empty(app, monkeypatch):  # n
     assert "Page 700 is past the end of the matching events" in response.text
     assert "the last page is not known" in response.text
     assert "&page=1" in response.text and "First page" in response.text
+    # and a link to the last page known to exist: the one holding event
+    # AUDIT_COUNT_CAP + 1 (50 events per page)
+    assert "page 201 is the last one known to hold events" in response.text
+    assert "&page=201" in response.text and "Last known page (201)" in response.text
     # no pager (its "previous" would lead to another empty page)
     assert 'class="pager"' not in response.text
     assert "&page=699" not in response.text and "&page=701" not in response.text
+    # the link leads to a page with events
+    response = client.get("/audit/table", params={"page": "201"})
+    assert seen[-1] == 200 * 50 and "past the end" not in response.text
 
     # a page beyond the cap that has events is shown as such
     response = client.get("/audit/table", params={"page": "400"})
