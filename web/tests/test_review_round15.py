@@ -42,11 +42,14 @@ def test_a_utf8_proxy_user_is_decoded():
     assert client.get("/_whoami", headers={"X-Remote-User": "carol"}).json() == {"user": "carol"}
 
 
-def _proxy_request(raw: bytes) -> Request:
+def _proxy_request(raw: bytes, warnings: auth.AuthWarnings | None = None) -> Request:
     """A request carrying these exact header bytes (the test client would
     re-encode a non-UTF-8 value: httpx decodes it as latin-1, then the
-    transport encodes it as UTF-8)."""
+    transport encodes it as UTF-8), for an application whose throttled
+    warnings are `warnings` (fresh ones by default)."""
+    state = SimpleNamespace(auth_warnings=warnings or auth.AuthWarnings())
     scope = {
+        "app": SimpleNamespace(state=state),
         "type": "http",
         "method": "GET",
         "path": "/_whoami",
@@ -88,7 +91,7 @@ def _proxy_request(raw: bytes) -> Request:
 )
 def test_c1_controls_and_separators_are_refused(name):
     assert not auth._valid_user(name)
-    assert auth._loggable(name) == repr(name)[:128]
+    assert auth._loggable(name) == ascii(name)[:128]
     # (ASCII blanks around a proxy header are stripped, on the bytes)
     if name and name.strip(" ") == name:
         response = _proxy_client().get("/_whoami", headers={"X-Remote-User": name.encode()})

@@ -10,6 +10,7 @@ import hmac
 import ipaddress
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -82,10 +83,13 @@ def _decode_basic(authorization: str | None) -> tuple[bytes, bytes] | None:
 
 
 def _loggable(user: str | None) -> str:
-    """A user name safe for a log line: no control characters, bounded length."""
+    """A user name safe for a log line: a valid name as is, a refused one
+    escaped to ASCII (ascii(): every non-ASCII character as \\x, \\u or
+    \\U, so that no invisible or look-alike character reaches the log),
+    bounded length."""
     if user is None:
         return "<none>"
-    return user if _valid_user(user) else repr(user)[:128]
+    return user if _valid_user(user) else ascii(user)[:128]
 
 
 def verify_basic(authorization: str | None, users: dict[str, bytes]) -> str | None:
@@ -224,78 +228,126 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
-class _ThrottledWarning:
-    """A warning logged at most once per `interval` seconds (a flood of bad
-    requests must not flood the log).  The next line logged tells how many
-    were suppressed since the first suppressed one; flush() (at shutdown)
-    logs a count still pending."""
+@dataclass
+class _Window:
+    """The throttling state of one key of a _ThrottledWarning."""
 
-    def __init__(self, label: str, interval: float = 60.0):
+    last: float | None = None
+    suppressed: int = 0
+    since: datetime | None = None
+
+    def take(self) -> tuple[int, datetime | None]:
+        taken = self.suppressed, self.since
+        self.suppressed, self.since = 0, None
+        return taken
+
+
+class _ThrottledWarning:
+    """A warning logged at most once per `interval` seconds and per key (a
+    flood of bad requests must not flood the log).  The next line logged
+    for a key tells how many were suppressed since the first suppressed
+    one; flush() (at shutdown) logs the counts still pending.
+
+    The key (the peer address, say) keeps one source from hiding another:
+    each key has its own window.  At most `max_keys` keys are tracked, the
+    least recently seen one is dropped beyond (its pending count is logged
+    then), so that a scan from many addresses cannot grow the state."""
+
+    def __init__(self, label: str, interval: float = 60.0, max_keys: int = 256):
         self.label = label
         self.interval = interval
+        self.max_keys = max_keys
         self._lock = threading.Lock()
-        self._last: float | None = None
-        self._suppressed = 0
-        self._since: datetime | None = None
+        self._windows: OrderedDict[str, _Window] = OrderedDict()
 
     def reset(self) -> None:
         with self._lock:
-            self._last, self._suppressed, self._since = None, 0, None
+            self._windows.clear()
 
-    def _take(self) -> tuple[int, datetime | None]:
-        # caller holds the lock
-        taken = self._suppressed, self._since
-        self._suppressed, self._since = 0, None
-        return taken
+    def _subject(self, key: str) -> str:
+        return f"{self.label} {key}" if key else self.label
 
-    def warning(self, message: str, *args: object) -> None:
+    def _log_pending(self, key: str, suppressed: int, since: datetime | None) -> None:
+        if suppressed and since is not None:
+            log.warning(
+                "%s: %d similar warnings suppressed since %s",
+                self._subject(key),
+                suppressed,
+                since.isoformat(timespec="seconds"),
+            )
+
+    def warning(self, message: str, *args: object, key: str = "") -> None:
         now = time.monotonic()
+        evicted: tuple[str, int, datetime | None] | None = None
         with self._lock:
-            if self._last is not None and now - self._last < self.interval:
-                if not self._suppressed:
-                    self._since = _utcnow()
-                self._suppressed += 1
+            window = self._windows.get(key)
+            if window is None:
+                window = self._windows[key] = _Window()
+                if len(self._windows) > self.max_keys:
+                    old_key, old = self._windows.popitem(last=False)
+                    evicted = (old_key, *old.take())
+            else:
+                self._windows.move_to_end(key)
+            if window.last is not None and now - window.last < self.interval:
+                if not window.suppressed:
+                    window.since = _utcnow()
+                window.suppressed += 1
                 return
-            self._last = now
-            suppressed, since = self._take()
+            window.last = now
+            suppressed, since = window.take()
+        if evicted is not None:
+            self._log_pending(*evicted)
         if suppressed and since is not None:
             message += " (%d similar warnings suppressed since %s)"
             args = (*args, suppressed, since.isoformat(timespec="seconds"))
         log.warning(message, *args)
 
     def flush(self) -> None:
-        """Log the count of warnings suppressed and not reported yet, if any."""
+        """Log the counts of warnings suppressed and not reported yet, if any."""
         with self._lock:
-            suppressed, since = self._take()
-        if suppressed and since is not None:
-            log.warning(
-                "%s: %d similar warnings suppressed since %s",
-                self.label,
-                suppressed,
-                since.isoformat(timespec="seconds"),
-            )
+            pending = [(key, *window.take()) for key, window in self._windows.items()]
+        for key, suppressed, since in pending:
+            self._log_pending(key, suppressed, since)
 
 
-# a proxy header that cannot be decoded: a misconfigured reverse proxy or
-# PGPP_WEB_PROXY_HEADER_ENCODING, worth a trace (never the header itself)
-_undecodable_proxy_header = _ThrottledWarning("proxy header not decodable")
-# a proxy header sent by a peer outside PGPP_WEB_TRUSTED_PROXIES: logged
-# once per minute at most, a scan or a misrouted client would send one per
-# request
-_untrusted_proxy_peer = _ThrottledWarning("proxy header refused from untrusted peer")
-
-THROTTLED_WARNINGS = (_undecodable_proxy_header, _untrusted_proxy_peer)
+# peers tracked by the untrusted peer warning (least recently seen dropped)
+UNTRUSTED_PEERS_TRACKED = 256
 
 
-def flush_throttled_warnings() -> None:
-    """At shutdown: report the warnings suppressed since the last one logged."""
-    for throttled in THROTTLED_WARNINGS:
-        throttled.flush()
+class AuthWarnings:
+    """The throttled warnings of one application (app.state.auth_warnings,
+    set by create_app(), flushed by its lifespan): two applications in one
+    process (tests, a reload) never share nor flush each other's counts."""
+
+    def __init__(self) -> None:
+        # a proxy header that cannot be decoded: a misconfigured reverse
+        # proxy or PGPP_WEB_PROXY_HEADER_ENCODING, worth a trace (never the
+        # header itself)
+        self.undecodable_proxy_header = _ThrottledWarning("proxy header not decodable")
+        # a proxy header sent by a peer outside PGPP_WEB_TRUSTED_PROXIES:
+        # once per minute and per peer at most, a scan or a misrouted client
+        # would send one per request; per peer, so that one noisy address
+        # does not hide the others
+        self.untrusted_proxy_peer = _ThrottledWarning(
+            "proxy header refused from untrusted peer", max_keys=UNTRUSTED_PEERS_TRACKED
+        )
+
+    def all(self) -> tuple[_ThrottledWarning, ...]:
+        return (self.undecodable_proxy_header, self.untrusted_proxy_peer)
+
+    def flush(self) -> None:
+        """At shutdown: report the warnings suppressed since the last one logged."""
+        for throttled in self.all():
+            throttled.flush()
 
 
 def user_from_proxy(request: Request, settings: Settings) -> str:
+    warnings: AuthWarnings = request.app.state.auth_warnings
     if not _client_is_trusted(request, settings):
-        _untrusted_proxy_peer.warning("proxy header refused from untrusted peer %s", _peer(request))
+        peer = _peer(request)
+        warnings.untrusted_proxy_peer.warning(
+            "proxy header refused from untrusted peer %s", peer, key=peer
+        )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Requests must come through the trusted reverse proxy",
@@ -320,7 +372,7 @@ def user_from_proxy(request: Request, settings: Settings) -> str:
     try:
         user = raw.encode("latin-1").decode(encoding)
     except UnicodeError:
-        _undecodable_proxy_header.warning(
+        warnings.undecodable_proxy_header.warning(
             "proxy header %s not valid %s (%d bytes) from %s",
             header,
             encoding,

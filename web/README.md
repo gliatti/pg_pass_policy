@@ -138,9 +138,25 @@ changement de `PGPP_WEB_SECRET` invalident ce cache : bcrypt est alors
 rejoué. Un échec efface le cache.
 
 Nom d'utilisateur (HTTP basic ou en-tête du proxy) : 1 à 128 caractères,
-sans caractère de contrôle C0 ou C1 (U+0000 à U+001F, U+007F à U+009F) ni
-séparateur de ligne ou de paragraphe (U+2028, U+2029), qu'un journal ou un
-terminal afficherait comme un saut de ligne.
+sous la règle commune de `app/usernames.py` détaillée plus bas (mode
+`proxy`) : ni contrôle, ni séparateur, ni caractère invisible, formes
+Unicode NFC et NFKC.
+
+**Mise à jour : noms de `PGPP_WEB_BASIC_USERS` refusés au démarrage.** À
+partir de cette version, chaque nom de `PGPP_WEB_BASIC_USERS` doit suivre
+cette règle, et un seul nom qui ne la suit pas empêche le démarrage
+(l'identité reste stricte : le nom n'est jamais normalisé ni corrigé). Un
+nom accepté par une version précédente peut donc être refusé : accent
+décomposé, espace insécable, caractère de largeur nulle, sélecteur de
+variante, forme pleine chasse ou ligature… Le message d'erreur cite le nom
+échappé en ASCII (`'bob\u200b'`), le motif et la règle :
+
+```text
+PGPP_WEB_BASIC_USERS: user name 'bob\u200b' refused: character U+200B not allowed (category Cf); a user name must be 1 to 128 characters, …
+```
+
+Avant la mise à jour, vérifier les noms configurés, et renommer l'entrée
+concernée (le nouveau nom est celui qu'enregistrera `application_name`).
 
 Le nom de l'utilisateur web est enregistré dans `pass_policy.audit_log`
 (colonne `application_name`, valeur `pgpp-web:alice`) : chaque action reste
@@ -236,11 +252,26 @@ sous sa forme précomposée U+00C9, `E` suivi de l'accent combinant U+0301
 donne un 401. Normaliser ferait de deux suites d'octets distinctes un même
 nom, indiscernable dans le journal.
 
+Les formes de compatibilité sont refusées de même (le nom doit aussi être
+en forme NFKC) : caractères pleine chasse (`ａｌｉｃｅ`), ligatures (`ﬁ`),
+alphanumériques mathématiques (`𝐚𝐥𝐢𝐜𝐞`), exposants (`²`), chiffres romains
+(`Ⅰ`)… Sont aussi refusés, un à un, des caractères invisibles hors des
+catégories ci-dessus (propriété Unicode `Default_Ignorable_Code_Point` pour
+référence) : sélecteurs de variante U+FE00 à U+FE0F et U+E0100 à U+E01EF,
+U+034F (liant de graphèmes), U+180B à U+180F (sélecteurs mongols), U+115F,
+U+1160, U+3164 et U+FFA0 (remplissages hangûl), U+17B4 et U+17B5 (voyelles
+inhérentes khmères), U+2800 (motif braille vide). Un nom refusé est
+journalisé échappé en ASCII (`\u200b`), jamais tel quel.
+
 Les avertissements répétitifs (en-tête indécodable, en-tête reçu d'un pair
 hors de `PGPP_WEB_TRUSTED_PROXIES`) sont écrits au plus une fois par
 minute ; la ligne suivante indique combien ont été omis depuis quand
 (`3 similar warnings suppressed since 2026-10-28T09:30:05+00:00`), et un
-compte encore en attente est écrit à l'arrêt de l'application.
+compte encore en attente est écrit à l'arrêt de l'application. Celui du
+pair non autorisé est limité par adresse du pair : une ligne par pair et
+par minute, avec le compte omis de ce pair, si bien qu'une source bruyante
+ne masque pas les autres. Les 256 derniers pairs vus sont suivis ; au-delà,
+le plus anciennement vu est oublié (son compte en attente est alors écrit).
 
 Derrière HTTPS, `PGPP_WEB_SESSION_HTTPS_ONLY=true` est requis : le cookie de
 session devient `__Host-pgpp_session` (`Secure`, `Path=/`, sans `Domain`),

@@ -22,16 +22,6 @@ from app import auth, main, usernames
 from tests.conftest import add_probe_routes, make_settings
 from tests.test_review_round15 import _proxy_client, _proxy_request
 
-
-@pytest.fixture(autouse=True)
-def _reset_throttles():
-    for throttled in auth.THROTTLED_WARNINGS:
-        throttled.reset()
-    yield
-    for throttled in auth.THROTTLED_WARNINGS:
-        throttled.reset()
-
-
 # --- 1: NFC form, no leading combining mark ------------------------------------------------
 
 
@@ -98,7 +88,7 @@ def test_invalid_basic_user_names_are_refused_at_startup(user, reason):
     with pytest.raises(ValueError) as refused:
         make_settings(basic_users=f"{user}:{_HASH}")
     message = str(refused.value)
-    assert f"PGPP_WEB_BASIC_USERS: user name {user!r} refused" in message
+    assert f"PGPP_WEB_BASIC_USERS: user name {ascii(user)} refused" in message
     assert reason in message
 
 
@@ -219,7 +209,7 @@ def test_suppressed_warnings_are_flushed_at_shutdown(monkeypatch, caplog):
     assert pool.closed
     assert [r.getMessage() for r in caplog.records] == [
         "proxy header refused from untrusted peer 192.168.1.9",
-        "proxy header refused from untrusted peer: 2 similar warnings suppressed"
+        "proxy header refused from untrusted peer 192.168.1.9: 2 similar warnings suppressed"
         " since 2026-05-06T07:08:09+00:00",
     ]
 
@@ -239,7 +229,8 @@ def test_the_untrusted_peer_warning_is_throttled(monkeypatch, caplog):
         "proxy header refused from untrusted peer 192.168.1.9"
     ]
     # distinct from the undecodable header throttle
-    assert auth._untrusted_proxy_peer is not auth._undecodable_proxy_header
+    warnings = app.state.auth_warnings
+    assert warnings.untrusted_proxy_peer is not warnings.undecodable_proxy_header
 
 
 # --- 6: a single peer expression -------------------------------------------------------------

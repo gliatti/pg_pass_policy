@@ -15,7 +15,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.sessions import SessionMiddleware
 
 from app import __version__
-from app.auth import dummy_hash, flush_throttled_warnings, require_user
+from app.auth import AuthWarnings, dummy_hash, require_user
 from app.config import Settings
 from app.csrf import InvalidCsrfToken, verify_csrf
 from app.db import ExtensionUnavailable, extension_unavailable, make_pool
@@ -41,7 +41,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             yield
         finally:
             # suppressed warnings not reported yet (no later line to carry them)
-            flush_throttled_warnings()
+            app.state.auth_warnings.flush()
             pool.close()
 
     app = FastAPI(
@@ -54,6 +54,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         openapi_url=None,
     )
     app.state.settings = settings
+    # throttled warnings of this application only (flushed by its lifespan)
+    app.state.auth_warnings = AuthWarnings()
     if settings.auth == "basic":
         # computed now rather than on the first unknown user (one bcrypt run)
         dummy_hash(settings.basic_user_hashes())

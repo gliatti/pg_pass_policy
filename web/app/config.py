@@ -9,7 +9,7 @@ from typing import Literal
 from pydantic import PrivateAttr, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from app.usernames import user_name_problem
+from app.usernames import USER_NAME_RULE, user_name_problem
 
 _BCRYPT_PREFIXES = ("$2a$", "$2b$", "$2y$")
 _BCRYPT_COST_RE = re.compile(rb"^\$2[aby]\$([0-9]{2})\$")
@@ -144,7 +144,12 @@ class Settings(BaseSettings):
             # could never be told apart from another one in a log line
             problem = user_name_problem(user)
             if problem is not None:
-                raise ValueError(f"PGPP_WEB_BASIC_USERS: user name {user!r} refused: {problem}")
+                # ascii(): the name escaped (\u...), the offending character
+                # visible in the message whatever the terminal shows
+                raise ValueError(
+                    f"PGPP_WEB_BASIC_USERS: user name {ascii(user)} refused: {problem};"
+                    f" a user name must be {USER_NAME_RULE} (see app/usernames.py)"
+                )
             if not digest.isascii():
                 raise ValueError(_malformed_hash(user, digest))
             if user in users:

@@ -41,18 +41,24 @@ def test_an_unknown_proxy_header_encoding_is_refused(value):
         _proxy_settings(proxy_header_encoding=value)
 
 
+# the throttled warnings of one application, shared by the requests of a test
+_WARNINGS = auth.AuthWarnings()
+
+
 def _refused(raw: bytes, settings) -> HTTPException:
     with pytest.raises(HTTPException) as refused:
-        auth.user_from_proxy(_proxy_request(raw), settings)
+        auth.user_from_proxy(_proxy_request(raw, _WARNINGS), settings)
     assert refused.value.status_code == 401
     return refused.value
 
 
 @pytest.fixture(autouse=True)
 def _reset_throttle():
-    auth._undecodable_proxy_header.reset()
+    for throttled in _WARNINGS.all():
+        throttled.reset()
     yield
-    auth._undecodable_proxy_header.reset()
+    for throttled in _WARNINGS.all():
+        throttled.reset()
 
 
 @pytest.mark.parametrize("raw", [b"\xc9milie", b"bad\xff", b"\xe2\x82"])
