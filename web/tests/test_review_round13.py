@@ -1,7 +1,7 @@
-"""Unit tests, thirteenth review round: the Secure-cookie-over-HTTP alert
-only without a session cookie, its message composed with the CSRF
-refusal, the 404 of the routes of a "." / ".." profile (delete included),
-no edit link nor delete form for such a profile in the listing."""
+"""Unit tests, thirteenth review round: the CSRF refusals (stale token,
+no token, with or without the session cookie, htmx or not), the 404 of the
+routes of a "." / ".." profile (delete included), no edit link nor delete
+form for such a profile in the listing."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import db, main
+from app.csrf import TOKEN_MISSING
 from app.routers import profiles
 from tests.conftest import TEST_PASSWORD, TEST_USER, make_settings
 from tests.test_review_round3 import FakePool
@@ -22,54 +23,63 @@ def _secure_app():
     return app
 
 
-def _https_client_with_cookie(app) -> TestClient:
-    """A client that got the Secure session cookie (page loaded over HTTPS)."""
-    client = TestClient(app, base_url="https://testserver", follow_redirects=False)
+def _csrf_client(app, setup: str) -> tuple[TestClient, str, dict[str, str], bool]:
+    """(client, URL, extra headers, whether the session cookie is sent) of a
+    client that loaded a page or not, over plain HTTP or HTTPS."""
+    if setup == "page loaded":
+        client, _ = _client(app)
+        return client, "/roles/r1/lock", {}, True
+    if setup == "no page loaded":
+        client = TestClient(app, follow_redirects=False)
+        client.auth = (TEST_USER, TEST_PASSWORD)
+        return client, "/roles/r1/lock", {}, False
+    https = setup == "Secure cookie over https"
+    base = "https://testserver" if https else "http://testserver"
+    client = TestClient(_secure_app(), base_url=base, follow_redirects=False)
     client.auth = (TEST_USER, TEST_PASSWORD)
-    client.get("/maintenance")
-    assert "__Host-pgpp_session" in client.cookies
-    return client
+    page = client.get("/maintenance")
+    assert "__Host-pgpp_session" in page.headers.get("set-cookie", "")
+    # over http:// the Secure cookie stays in the jar but is never sent back
+    return client, "/maintenance/run", {"Origin": base}, https
 
 
-# --- 1: a stale token with the session cookie present always reloads ------------------------
+# --- the CSRF refusals ------------------------------------------------------------------
 
 
-def test_a_stale_token_with_the_cookie_reloads_despite_an_http_origin():
-    """Origin in http:// (a proxy rewriting the scheme, a mixed setup) but the
-    cookie did arrive: the token is merely stale, htmx reloads the page."""
-    client = _https_client_with_cookie(_secure_app())
-    headers = {"X-CSRF-Token": "stale", "HX-Request": "true", "Origin": "http://testserver"}
-    response = client.post("/maintenance/run", headers=headers)
-    assert response.status_code == 403
-    assert response.headers["HX-Refresh"] == "true"
-    assert "CSRF token invalid: reload the page" in response.text
-    assert "Session cookie not stored" not in response.text
-
-
-def test_a_stale_token_without_the_cookie_over_http_is_reported():
-    client = TestClient(_secure_app(), base_url="http://testserver", follow_redirects=False)
-    client.auth = (TEST_USER, TEST_PASSWORD)
-    headers = {"X-CSRF-Token": "stale", "HX-Request": "true", "Origin": "http://testserver"}
-    response = client.post("/maintenance/run", headers=headers)
-    assert response.status_code == 403
-    assert "HX-Refresh" not in response.headers
-    assert "Session cookie not stored" in response.text
-
-
-# --- 5: the CSRF refusal kept, completed by the cookie alert -------------------------------
-
-
+@pytest.mark.parametrize(
+    "setup",
+    ["page loaded", "no page loaded", "Secure cookie over https", "Secure cookie over http"],
+)
+@pytest.mark.parametrize("supplied", [True, False])
 @pytest.mark.parametrize("htmx", [False, True])
-def test_the_csrf_message_is_kept_with_the_cookie_alert(htmx):
-    client = TestClient(_secure_app(), base_url="http://testserver", follow_redirects=False)
-    client.auth = (TEST_USER, TEST_PASSWORD)
-    headers = {"X-CSRF-Token": "stale", "Origin": "http://testserver"}
+def test_csrf_refusals(app, setup, supplied, htmx):  # noqa: F811
+    """A token supplied (taken from a page, no longer valid): htmx reloads
+    the page (HX-Refresh), a plain form gets "reload the page", completed by
+    the cookie alert when no session cookie came with it.  No token at all
+    (the client loaded no page): TOKEN_MISSING alone, never the cookie
+    alert."""
+    client, url, headers, cookie_sent = _csrf_client(app, setup)
+    if supplied:
+        headers["X-CSRF-Token"] = "stale"
     if htmx:
         headers["HX-Request"] = "true"
-    response = client.post("/maintenance/run", headers=headers)
+    response = client.post(url, headers=headers)
     assert response.status_code == 403
-    assert "HX-Refresh" not in response.headers
-    assert "CSRF token invalid: reload the page. Session cookie not stored" in response.text
+    if htmx:
+        assert response.headers["HX-Retarget"] == "#alerts"
+    if supplied and htmx:
+        assert response.headers["HX-Refresh"] == "true"
+    else:
+        assert "HX-Refresh" not in response.headers
+    if supplied:
+        assert "CSRF token invalid: reload the page" in response.text
+    else:
+        assert TOKEN_MISSING in response.text
+    alert = supplied and not htmx and not cookie_sent
+    assert ("Session cookie not stored" in response.text) is alert
+    if alert:
+        assert "CSRF token invalid: reload the page. Session cookie not stored" in response.text
+        assert "PGPP_WEB_SESSION_HTTPS_ONLY" in response.text
 
 
 # --- 3: the 404 of the routes of a reserved profile ----------------------------------------
@@ -78,7 +88,10 @@ def test_the_csrf_message_is_kept_with_the_cookie_alert(htmx):
 @pytest.mark.parametrize("encoded", ["%2E", "%2E%2E"])
 @pytest.mark.parametrize("method", ["get", "post"])
 def test_reserved_profile_routes_say_sql_only(app, monkeypatch, encoded, method):  # noqa: F811
+    """GET (edit page) and POST (update) of /profiles/p/%2E and %2E%2E: one
+    guard, the same 404 before any query."""
     monkeypatch.setattr(db, "get_profile", lambda *a: pytest.fail("get_profile called"))
+    monkeypatch.setattr(db, "alter_profile", lambda *a: pytest.fail("alter_profile called"))
     client, token = _client(app)
     kwargs = {"headers": {"X-CSRF-Token": token}, "data": {}} if method == "post" else {}
     response = getattr(client, method)(f"/profiles/p/{encoded}", **kwargs)
@@ -87,6 +100,8 @@ def test_reserved_profile_routes_say_sql_only(app, monkeypatch, encoded, method)
     # autoescaped quotes
     assert f"profile &#34;{name}&#34; cannot be managed from this interface" in response.text
     assert "is reserved by the web interface" not in response.text
+    assert 'id="profile-form"' not in response.text
+    assert profiles.RESERVED_NAMES == {".", ".."}
     assert profiles.SQL_ONLY_MESSAGE != profiles.RESERVED_MESSAGE
 
 

@@ -203,20 +203,18 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
   n'est émis sur les pages 401/403 affichées avant l'authentification. Une
   requête marquée `Sec-Fetch-Site: cross-site` ou `same-site` est refusée : le
   back-office n'a pas d'appelant légitime sur un autre sous-domaine ou port.
-  Un refus CSRF suit deux règles. Sans cookie de session (client qui n'a
-  chargé aucune page, cookies bloqués par le navigateur, cookie `Secure`
-  écarté d'une page servie en HTTP clair avec
-  `PGPP_WEB_SESSION_HTTPS_ONLY=true`, session expirée), le jeton ne peut pas
-  correspondre et un rechargement échouerait à chaque action : le message
-  (« CSRF token invalid: reload the page » ou « CSRF token missing: fetch a
-  page first ») est complété d'une alerte « Session cookie not stored (or
-  expired) » qui invite à vérifier `PGPP_WEB_SESSION_HTTPS_ONLY` et les
-  cookies, sans rechargement automatique. Avec le cookie, un jeton fourni
-  mais périmé (session renouvelée pendant que la page restait ouverte :
-  `PGPP_WEB_SECRET` changé, autre identité) donne un 403 « CSRF token
-  invalid: reload the page » ; pour une requête htmx, la réponse porte
-  `HX-Refresh: true` et la page est rechargée avec un jeton neuf. Une requête
-  sans aucun jeton mais avec le cookie reçoit seulement « CSRF token missing:
+  Un refus CSRF suit trois règles. Un jeton fourni mais périmé (page restée
+  ouverte pendant que la session expirait ou était renouvelée :
+  `PGPP_WEB_SECRET` changé, autre identité) donne, pour une requête htmx,
+  une réponse portant `HX-Refresh: true` : la page est rechargée
+  automatiquement avec un jeton neuf. Pour un formulaire classique, le
+  même cas donne un 403 « CSRF token invalid: reload the page », complété,
+  si la requête n'a apporté aucun cookie de session, d'une alerte « Session
+  cookie not stored (or expired) » qui invite à vérifier
+  `PGPP_WEB_SESSION_HTTPS_ONLY` et les cookies (cookies bloqués par le
+  navigateur, cookie `Secure` écarté d'une page servie en HTTP clair avec
+  `PGPP_WEB_SESSION_HTTPS_ONLY=true`). Une requête sans aucun jeton (client
+  qui n'a chargé aucune page) reçoit seulement « CSRF token missing:
   fetch a page first ». Le jeton n'est publié que dans `hx-headers` (pas de
   balise `<meta>`).
 - **En-têtes** : `Content-Security-Policy` sans script inline (nonce par

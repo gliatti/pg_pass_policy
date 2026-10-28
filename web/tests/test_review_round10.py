@@ -62,23 +62,7 @@ def test_pool_checks_its_connections(monkeypatch):
     assert seen["open"] is False
 
 
-# --- W3: a refused CSRF token reloads an htmx page ---------------------------------------
-
-
-@pytest.mark.parametrize("htmx", [False, True])
-def test_a_stale_csrf_token_asks_htmx_to_reload(app, htmx):  # noqa: F811
-    client, _ = _client(app)
-    headers = {"X-CSRF-Token": "stale"}
-    if htmx:
-        headers["HX-Request"] = "true"
-    response = client.post("/roles/r1/lock", headers=headers)
-    assert response.status_code == 403
-    assert "reload the page" in response.text
-    if htmx:
-        assert response.headers["HX-Refresh"] == "true"
-        assert response.headers["HX-Retarget"] == "#alerts"
-    else:
-        assert "HX-Refresh" not in response.headers
+# --- W3: a cross-site request is refused without reload --------------------------------
 
 
 def test_a_cross_site_request_does_not_reload(app):  # noqa: F811

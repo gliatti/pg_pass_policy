@@ -84,18 +84,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def http_exception(request: Request, exc: StarletteHTTPException) -> Any:
         headers = exc.headers
         detail = str(exc.detail)
-        if isinstance(exc, InvalidCsrfToken):
-            # no session cookie: the token can never match (a client that
-            # never fetched a page, cookies blocked, a Secure cookie dropped
-            # over plain HTTP, an expired session).  A reload would fail the
-            # same way on every action: explain instead
-            if session_cookie_name(settings) not in request.cookies:
-                detail = f"{detail}. {SESSION_NOT_STORED}"
-            elif exc.supplied and is_hx(request):
-                # the cookie is there, the token is merely stale (session
-                # lost or renewed while the page stayed open): reload the
-                # page for a fresh one
+        if isinstance(exc, InvalidCsrfToken) and exc.supplied:
+            # a token taken from a page, no longer valid (session expired or
+            # renewed while the page stayed open, PGPP_WEB_SECRET changed,
+            # another identity)
+            if is_hx(request):
+                # reload the page: it issues a fresh token
                 headers = {**(headers or {}), "HX-Refresh": "true"}
+            elif session_cookie_name(settings) not in request.cookies:
+                # no session cookie came with it: say why, in case the
+                # browser does not keep the cookie
+                detail = f"{detail}. {SESSION_NOT_STORED}"
+        # no token at all (InvalidCsrfToken without supplied): the client
+        # never loaded a page, TOKEN_MISSING alone says so
         return _error_response(request, exc.status_code, detail, headers)
 
     @app.exception_handler(RequestValidationError)
@@ -145,8 +146,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     return app
 
 
-# shown without automatic reload: a cookie the browser does not keep would
-# make HX-Refresh fail again on every action
+# added to the refusal of a supplied token sent without the session cookie
+# (non-htmx request)
 SESSION_NOT_STORED = (
     "Session cookie not stored (or expired): reload the page; if this persists,"
     " check PGPP_WEB_SESSION_HTTPS_ONLY / cookies (a Secure cookie is not kept"

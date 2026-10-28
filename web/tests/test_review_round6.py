@@ -268,18 +268,6 @@ def test_profile_edit_of_former_reserved_names(app, monkeypatch, name):
     assert looked_up == [name]
 
 
-@pytest.mark.parametrize("encoded", ["%2E", "%2E%2E"])
-def test_profile_edit_refuses_dot_names(app, monkeypatch, encoded):
-    looked_up = []
-    monkeypatch.setattr(db, "get_profile", lambda conn, n: looked_up.append(n) or {"name": n})
-    client, _ = _client(app)
-    response = client.get(f"/profiles/p/{encoded}")
-    assert response.status_code == 404
-    assert "cannot be managed from this interface" in response.text
-    assert 'id="profile-form"' not in response.text
-    assert looked_up == []
-
-
 def test_profile_edit_unknown_is_the_generic_404(app, monkeypatch):
     monkeypatch.setattr(db, "get_profile", lambda conn, n: None)
     client, _ = _client(app)
