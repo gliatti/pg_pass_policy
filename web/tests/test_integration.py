@@ -1227,6 +1227,47 @@ def test_list_audit_pages_without_count_over(client, test_url):
         assert ids == sorted(ids, reverse=True)
 
 
+def test_list_audit_counts_only_when_the_page_is_full(client, test_url):
+    """The bounded count of db.list_audit() is an InitPlan run only when
+    needed: never executed on a page that is not full (EXPLAIN ANALYZE of
+    the very statement list_audit() sends)."""
+    from psycopg.rows import dict_row
+
+    token = csrf_token(client, "/roles")
+    for _ in range(3):
+        client.post("/roles/web_t_alpha/rotate", headers={"X-CSRF-Token": token})
+
+    class Explaining:
+        def __init__(self, conn):
+            self.conn, self.plans = conn, []
+
+        def execute(self, sql, params):
+            plan = self.conn.execute("EXPLAIN (ANALYZE, TIMING OFF, COSTS OFF) " + sql, params)
+            self.plans.append("\n".join(r["QUERY PLAN"] for r in plan.fetchall()))
+            return self.conn.execute(sql, params)
+
+    def count_scan(plan: str) -> str:
+        # the scan of the bounded count: the second reference to audit_log
+        return next(line for line in plan.splitlines() if "audit_log audit_log_1" in line)
+
+    with psycopg.connect(test_url, row_factory=dict_row) as conn:
+        total = conn.execute(
+            "SELECT count(*) AS n FROM pass_policy.audit_log WHERE role_name = 'web_t_alpha'"
+        ).fetchone()["n"]
+        assert total >= 3
+        explaining = Explaining(conn)
+        last = db.list_audit(explaining, role="web_t_alpha", limit=total + 5, offset=0)
+        assert last.total == total and not last.has_next
+        full = db.list_audit(explaining, role="web_t_alpha", limit=1, offset=0)
+        assert full.total == total and full.has_next
+        past = db.list_audit(explaining, role="web_t_alpha", limit=1, offset=total + 3)
+        assert past == db.AuditPage([], total)
+        not_full, counted, past_plan = explaining.plans
+        assert "never executed" in count_scan(not_full), not_full
+        assert "never executed" not in count_scan(counted), counted
+        assert "never executed" not in count_scan(past_plan), past_plan
+
+
 def test_audit_since_is_checked_before_the_query(client):
     for since, message in [
         ("2026-13-45", "invalid date"),

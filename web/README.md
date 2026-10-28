@@ -30,13 +30,16 @@ lirait comme des secondes : l'unité est exigée. La pagination lit une ligne
 de plus que la page pour savoir s'il existe une page suivante, sans compter
 toute la sélection à chaque page (pas de `count(*) OVER ()`). La page et le
 total viennent d'une seule requête, donc du même instantané : ils ne peuvent
-pas se contredire. Le total est un comptage borné qui s'arrête à 10 001
-lignes : exact jusqu'à 10 000 événements, il s'affiche « 10,000+ » au-delà,
-sur toutes les pages (la dernière comprise), sans nombre de pages (lien
-« next » seul). Une page au-delà de la fin (lien périmé) ramène à la
-dernière page connue de ce comptage borné : la vraie dernière page sous le
-plafond, la page du 10 001ᵉ événement au-delà (jamais de comptage exact non
-borné).
+pas se contredire. Sur une page incomplète (la dernière), le total se déduit
+de la page elle-même, sans comptage. Sinon, le total est un comptage borné
+qui s'arrête à 10 001 lignes, exécuté dans la même requête seulement quand
+il est nécessaire : exact jusqu'à 10 000 événements, il s'affiche
+« 10,000+ » au-delà, sur toutes les pages (la dernière comprise), sans
+nombre de pages (lien « next » seul). Une page au-delà de la fin (lien
+périmé) ramène à la vraie dernière page sous le plafond. Au-delà du plafond,
+la dernière page n'est pas connue (jamais de comptage exact non borné) : la
+page demandée s'affiche vide, avec un message qui le dit et un lien vers la
+première page.
 
 Statut et état du mot de passe : la colonne `status` de `v_role_status`
 montre d'abord le verrou (`locked`) puis l'exemption (`exempt`) ; l'état du
@@ -93,7 +96,8 @@ Tout passe par des variables d'environnement préfixées `PGPP_WEB_`.
 | `PGPP_WEB_SECRET` | **obligatoire** | clé de signature du cookie de session (jeton CSRF), 32 caractères minimum : `python3 -c 'import secrets; print(secrets.token_urlsafe(48))'` |
 | `PGPP_WEB_AUTH` | `basic` | `basic` (HTTP basic) ou `proxy` (en-tête posé par un reverse proxy) |
 | `PGPP_WEB_BASIC_USERS` | *(vide)* | mode `basic` : `user:hash-bcrypt,user2:hash-bcrypt`, toutes les empreintes du même coût bcrypt ; un utilisateur cité deux fois empêche le démarrage |
-| `PGPP_WEB_PROXY_HEADER` | `X-Remote-User` | mode `proxy` : en-tête portant l'utilisateur authentifié (`REMOTE_USER` est accepté et correspond à `Remote-User`), en UTF-8 (voir « Reverse proxy ») |
+| `PGPP_WEB_PROXY_HEADER` | `X-Remote-User` | mode `proxy` : en-tête portant l'utilisateur authentifié (`REMOTE_USER` est accepté et correspond à `Remote-User`) |
+| `PGPP_WEB_PROXY_HEADER_ENCODING` | `utf-8` | mode `proxy` : encodage de la valeur de l'en-tête, `utf-8` ou `latin-1` (voir « Reverse proxy ») |
 | `PGPP_WEB_TRUSTED_PROXIES` | `127.0.0.1,::1` | mode `proxy` : adresses ou réseaux (CIDR) autorisés à poser l'en-tête ; `unix` pour un socket Unix ; `*` pour tout accepter (déconseillé) |
 | `PGPP_WEB_SESSION_HTTPS_ONLY` | `false` | marque le cookie de session `Secure` et le nomme `__Host-pgpp_session` : **obligatoire derrière HTTPS** (voir Sécurité) |
 | `PGPP_WEB_REALM` | `pg_pass_policy` | realm HTTP basic |
@@ -198,17 +202,19 @@ réseaux des clients à `PGPP_WEB_TRUSTED_PROXIES` en connaissance de cause.
 Les liens générés sont relatifs (chemin seul) : un préfixe de chemin se
 déclare avec `--root-path /pgpp`.
 
-En mode `proxy`, la valeur de l'en-tête est lue en UTF-8 (`Émilie` arrive
-sous la forme des octets `C3 89 6D…`). Changement de comportement pour les
-noms non ASCII : auparavant, la valeur était toujours lue en latin-1 et un nom
+En mode `proxy`, la valeur de l'en-tête est décodée dans l'encodage fixé par
+`PGPP_WEB_PROXY_HEADER_ENCODING` : `utf-8` par défaut (`Émilie` arrive sous
+la forme des octets `C3 89 6D…`), ou `latin-1` pour un mandataire qui envoie
+du latin-1 (`É` est alors l'octet `C9`). Le décodage est strict : une valeur
+qui n'est pas valide dans cet encodage est refusée (401, `proxy header not
+valid utf-8`), jamais relue dans un autre encodage. Un nom donné provient
+ainsi d'une seule suite d'octets. Changement de comportement pour les noms
+non ASCII : auparavant, la valeur était toujours lue en latin-1 et un nom
 envoyé en UTF-8 arrivait déformé (`Émilie` devenait `Ã\x89milie`) ; avec
-un mandataire qui envoie de l'UTF-8, le nom réel est désormais lu, ce qui change le nom enregistré dans
-`application_name` et donc dans le journal d'audit. Une valeur qui n'est pas
-de l'UTF-8 valide garde sa lecture latin-1 (comportement antérieur, pour un
-mandataire qui envoie du latin-1) et produit un avertissement dans le
-journal (`not valid UTF-8: read as latin-1`). Dans ce cas, un même nom peut
-venir de deux en-têtes différents (`É` en UTF-8 `C3 89` ou en latin-1 `C9`) :
-le mandataire doit envoyer un seul encodage.
+l'encodage par défaut, le nom réel est désormais lu, ce qui change le nom
+enregistré dans `application_name` et donc dans le journal d'audit. Un
+mandataire qui envoie du latin-1 doit déclarer
+`PGPP_WEB_PROXY_HEADER_ENCODING=latin-1`.
 
 Derrière HTTPS, `PGPP_WEB_SESSION_HTTPS_ONLY=true` est requis : le cookie de
 session devient `__Host-pgpp_session` (`Secure`, `Path=/`, sans `Domain`),

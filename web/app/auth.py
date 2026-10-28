@@ -9,6 +9,7 @@ import hashlib
 import hmac
 import ipaddress
 import re
+from dataclasses import dataclass
 
 import bcrypt
 from fastapi import HTTPException, Request, status
@@ -79,9 +80,12 @@ def _decode_basic(authorization: str | None) -> tuple[bytes, bytes] | None:
 def basic_user_name(authorization: str | None) -> str | None:
     """The user name claimed by a Basic header (for logging only, unverified)."""
     decoded = _decode_basic(authorization)
-    if decoded is None:
-        return None
-    return decoded[0].decode("utf-8", "replace")
+    return None if decoded is None else _claimed_name(decoded[0])
+
+
+def _claimed_name(user_b: bytes) -> str:
+    """The user name part of a decoded Basic header (unverified)."""
+    return user_b.decode("utf-8", "replace")
 
 
 def _loggable(user: str | None) -> str:
@@ -141,15 +145,12 @@ def _basic_fingerprint(settings: Settings, authorization: str, digest: bytes) ->
 
 
 def _cached_basic_user(
-    request: Request,
-    settings: Settings,
-    authorization: str,
-    claimed: str | None = None,
+    request: Request, settings: Settings, authorization: str, claimed: str
 ) -> str | None:
     """The user of a session whose cached fingerprint matches this header.
 
-    claimed: the user name of the header, when the caller already decoded
-    it (authenticate_basic()); decoded here otherwise."""
+    claimed: the user name of the header, decoded by the caller
+    (authenticate_basic())."""
     cached = request.session.get(SESSION_BASIC_KEY)
     if not isinstance(cached, dict):
         return None
@@ -157,39 +158,47 @@ def _cached_basic_user(
     if not isinstance(user, str) or not isinstance(fingerprint, str):
         return None
     digest = settings.basic_user_hashes().get(user)
-    if claimed is None:
-        claimed = basic_user_name(authorization)
     if digest is None or claimed != user:
         return None
     expected = _basic_fingerprint(settings, authorization, digest)
     return user if hmac.compare_digest(fingerprint, expected) else None
 
 
-def authenticate_basic(request: Request, settings: Settings) -> str | None:
+@dataclass(frozen=True)
+class BasicResult:
+    """Outcome of authenticate_basic(): the authenticated user (None on
+    failure) and the user name claimed by the header (None when there is no
+    well-formed Basic header), decoded once for both."""
+
+    user: str | None
+    claimed: str | None
+
+
+def authenticate_basic(request: Request, settings: Settings) -> BasicResult:
     """verify_basic() on the Authorization header, skipped when the session
     holds the fingerprint of the same header (_basic_fingerprint()).  A
     failed check drops the cached fingerprint.  The header is decoded once,
-    for both steps."""
+    for both steps and for the caller's log line."""
     authorization = request.headers.get("authorization")
     decoded = _decode_basic(authorization)
-    if not authorization or decoded is None:
+    if decoded is None:
         request.session.pop(SESSION_BASIC_KEY, None)
-        return None
+        return BasicResult(None, None)
     user_b, password_b = decoded
-    claimed = user_b.decode("utf-8", "replace")
+    claimed = _claimed_name(user_b)
     user = _cached_basic_user(request, settings, authorization, claimed)
     if user is not None:
-        return user
+        return BasicResult(user, claimed)
     users = settings.basic_user_hashes()
     user = _verify_decoded(user_b, password_b, users)
     if user is None:
         request.session.pop(SESSION_BASIC_KEY, None)
-        return None
+        return BasicResult(None, claimed)
     request.session[SESSION_BASIC_KEY] = {
         "user": user,
         "fp": _basic_fingerprint(settings, authorization, users[user]),
     }
-    return user
+    return BasicResult(user, claimed)
 
 
 def _client_is_trusted(request: Request, settings: Settings) -> bool:
@@ -218,23 +227,30 @@ def user_from_proxy(request: Request, settings: Settings) -> str:
             detail="Requests must come through the trusted reverse proxy",
         )
     header = settings.proxy_header_name()
-    # Starlette decodes header values as latin-1 (the HTTP default): the
-    # reverse proxy sends the user name in UTF-8, so "Émilie" would arrive
-    # as "Ã\x89milie".  The original bytes are recovered (latin-1 maps each
-    # byte to one character) and decoded as UTF-8.  Bytes that are not valid
-    # UTF-8 keep their latin-1 reading (the behaviour before UTF-8 decoding,
-    # for a proxy that sends latin-1), with a warning: the same name may
-    # then come from two different headers ("É" as C3 89 or as C9).
-    raw = request.headers.get(header) or ""
-    try:
-        user = raw.encode("latin-1").decode("utf-8").strip()
-    except UnicodeError:
-        log.warning("proxy header %s is not valid UTF-8: read as latin-1", header)
-        user = raw.strip()
-    if not user or not _USER_RE.match(user):
+    encoding = settings.proxy_header_encoding
+    # Starlette decodes header values as latin-1 (each byte to one
+    # character): the original bytes are recovered and decoded strictly in
+    # the configured encoding (PGPP_WEB_PROXY_HEADER_ENCODING), never in
+    # another one, so that each name comes from a single byte sequence.
+    # Only ASCII blanks are stripped before decoding: str.strip() would also
+    # drop \xa0 or \x85, which are bytes of UTF-8 sequences ("à" is C3 A0).
+    raw = (request.headers.get(header) or "").strip(" \t")
+    if not raw:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Not authenticated (proxy header missing)",
+        )
+    try:
+        user = raw.encode("latin-1").decode(encoding).strip()
+    except UnicodeError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Not authenticated (proxy header not valid {encoding})",
+        ) from None
+    if not user or not _USER_RE.match(user):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Not authenticated (proxy header not a valid user name)",
         )
     return user
 
@@ -247,14 +263,15 @@ def require_user(request: Request) -> str:
         return ""
     if settings.auth == "basic":
         authorization = request.headers.get("authorization")
-        user = authenticate_basic(request, settings)
+        result = authenticate_basic(request, settings)
+        user = result.user
         if user is None:
             if authorization:
                 # one line per failure (user and peer, never the password) so
                 # that the reverse proxy or fail2ban can throttle the source
                 log.warning(
                     "basic authentication failed for user %s from %s",
-                    _loggable(basic_user_name(authorization)),
+                    _loggable(result.claimed),
                     request.client.host if request.client else "unix",
                 )
             raise _unauthorized(settings, "Not authenticated")

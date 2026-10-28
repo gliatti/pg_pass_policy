@@ -12,11 +12,15 @@
       <td>{{ e.client_addr or '' }}</td><td>{{ e.application_name or '' }}</td>
       <td><code class="details">{{ e.details|jsonc }}</code></td></tr>
   {% else %}
+  {% if past_end %}
+  <tr><td colspan="9" class="muted">Page {{ page }} is past the end of the matching events ({{ total_label }} events: the last page is not known). <a hx-get="{{ table_url }}&page=1" hx-target="#audit-table" href="{{ page_url }}&page=1">First page</a></td></tr>
+  {% else %}
   <tr><td colspan="9" class="muted">No event matches.</td></tr>
+  {% endif %}
   {% endfor %}
   </tbody>
 </table>
-{% if page > 1 or has_next %}
+{% if (page > 1 or has_next) and not past_end %}
 <nav class="pager">
   {% if page > 1 %}<a hx-get="{{ table_url }}&page={{ page - 1 }}" hx-target="#audit-table" href="{{ page_url }}&page={{ page - 1 }}">← previous</a>{% endif %}
   <span>page {{ page }}{% if pages %} / {{ pages }}{% endif %}</span>

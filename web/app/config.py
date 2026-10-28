@@ -32,6 +32,10 @@ def _malformed_hash(user: str, digest: str) -> str:
     )
 
 
+# accepted values of PGPP_WEB_PROXY_HEADER_ENCODING (case-insensitive)
+PROXY_HEADER_ENCODINGS = ("utf-8", "latin-1")
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="PGPP_WEB_", extra="ignore")
 
@@ -44,6 +48,9 @@ class Settings(BaseSettings):
     # header carrying the authenticated user in proxy mode (REMOTE_USER is
     # accepted and mapped to Remote-User)
     proxy_header: str = "X-Remote-User"
+    # encoding of the proxy header value: "utf-8" or "latin-1"; a value not
+    # valid in this encoding is refused (401), never read in another one
+    proxy_header_encoding: str = "utf-8"
     # comma separated IP addresses / networks allowed to set the proxy header;
     # "*" trusts every peer (not recommended), "unix" trusts Unix socket peers
     trusted_proxies: str = "127.0.0.1,::1"
@@ -75,6 +82,13 @@ class Settings(BaseSettings):
             raise ValueError("PGPP_WEB_BASIC_USERS must list at least one user:bcrypt-hash")
         self._networks = self._parse_trusted_networks()  # also validates the syntax
         self._proxy_tokens = frozenset(t.strip() for t in self.trusted_proxies.split(","))
+        encoding = self.proxy_header_encoding.strip().lower()
+        if encoding not in PROXY_HEADER_ENCODINGS:
+            raise ValueError(
+                "PGPP_WEB_PROXY_HEADER_ENCODING must be utf-8 or latin-1"
+                f" (got {self.proxy_header_encoding!r})"
+            )
+        self.proxy_header_encoding = encoding
         if self.page_size < 1 or self.page_size > 1000:
             raise ValueError("PGPP_WEB_PAGE_SIZE must be between 1 and 1000")
         self._check_pool()

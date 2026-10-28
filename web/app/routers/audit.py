@@ -45,6 +45,7 @@ def _context(request: Request, conn: Connection, filters: dict[str, Any]) -> dic
     error = None
     result = db.AuditPage([], 0)
     page = filters["page"]
+    past_end = False
     try:
         with conn.transaction():
             since = db.parse_since(filters["since"])
@@ -60,15 +61,20 @@ def _context(request: Request, conn: Connection, filters: dict[str, Any]) -> dic
                 )
 
             result = fetch(page)
-            # a page past the end (stale link, hand-typed URL): the last
-            # page known from the bounded count (the real last page when it
-            # is not capped), not an empty table with a "page 7 / 2" footer;
-            # no second query when nothing matches (the last page is empty
-            # as well).
+            # a page past the end (stale link, hand-typed URL).  Total not
+            # capped: it is exact, the real last page is shown (not an empty
+            # table with a "page 7 / 2" footer); no second query when
+            # nothing matches (the last page is empty as well).  Total
+            # capped: the last page is unknown (only "more than 10,000"),
+            # the requested page is shown empty with a link to the first
+            # page, never a page presented as the last one.
             if not result.rows and page > 1:
-                page = min(page, _page_count(result.total, page_size))
-                if result.total:
-                    result = fetch(page)
+                if result.capped:
+                    past_end = True
+                else:
+                    page = min(page, _page_count(result.total, page_size))
+                    if result.total:
+                        result = fetch(page)
     except (psycopg.DataError, db.InvalidFilter) as exc:
         error = f"Invalid filter: {db.error_message(exc)}"
     # more than AUDIT_COUNT_CAP events: the page count is unknown, the
@@ -81,6 +87,7 @@ def _context(request: Request, conn: Connection, filters: dict[str, Any]) -> dic
         "total": result.total,
         "total_label": total_label(result),
         "has_next": result.has_next,
+        "past_end": past_end,
         "page": page,
         "pages": pages,
         "filters": filters,

@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import psycopg
 import pytest
-from fastapi import HTTPException, Request
+from fastapi import Request
 from fastapi.testclient import TestClient
 
 from app import auth, db
@@ -56,24 +56,6 @@ def _proxy_request(raw: bytes) -> Request:
     return Request(scope)
 
 
-@pytest.mark.parametrize(
-    ("raw", "user"), [(b"\xc9milie", "Émilie"), (b"bad\xff", "bad\xff"), (b"\xe2\x82", None)]
-)
-def test_a_proxy_user_that_is_not_utf8_is_read_as_latin1(raw, user, caplog):
-    caplog.set_level(logging.WARNING)
-    settings = make_settings(auth="proxy", basic_users="", proxy_header="X-Remote-User")
-    if user is None:
-        # latin-1 gives a C1 control (\x82): refused as any such name
-        with pytest.raises(HTTPException) as refused:
-            auth.user_from_proxy(_proxy_request(raw), settings)
-        assert refused.value.status_code == 401
-    else:
-        assert auth.user_from_proxy(_proxy_request(raw), settings) == user
-    assert "not valid UTF-8: read as latin-1" in caplog.text
-    # the same function on the UTF-8 bytes of the name
-    assert auth.user_from_proxy(_proxy_request("Émilie".encode()), settings) == "Émilie"
-
-
 # --- 9: C1 controls and line separators are refused in a user name -------------------------
 
 
@@ -95,22 +77,28 @@ def test_printable_names_are_accepted(name):
 
 
 class _AuditConn:
-    """Answers the single audit query with `matching` events: the bounded
-    count min(matching, cap) and the rows past `offset` (at most LIMIT), or
-    one row with NULL page columns when the page is empty."""
+    """Answers the single audit query with `matching` events, as PostgreSQL
+    would: the rows past `offset` (at most LIMIT), or one row with NULL page
+    columns when the page is empty, and the bounded count min(matching, cap)
+    only when the page is full or past the end (NULL otherwise)."""
 
     def __init__(self, matching: int):
         self.matching = matching
         self.queries: list[tuple[str, list]] = []
+        self.counted = 0
 
     def execute(self, sql, params):
         self.queries.append((sql, params))
-        n_where = (len(params) - 3) // 2
-        cap, limit, offset = params[n_where], params[-2], params[-1]
-        n = min(self.matching, cap)
-        rows = [
-            {"matching": n, "id": i} for i in range(offset, min(self.matching, offset + limit))
-        ] or [{"matching": n, "id": None}]
+        n_where = (len(params) - 5) // 2
+        limit1, offset, limit, offset2 = params[n_where : n_where + 4]
+        cap = params[-1]
+        assert limit1 == limit + 1 and offset2 == offset
+        page = list(range(offset, min(self.matching, offset + limit1)))
+        n = None
+        if len(page) > limit or (not page and offset > 0):
+            self.counted += 1
+            n = min(self.matching, cap)
+        rows = [{"matching": n, "id": i} for i in page] or [{"matching": n, "id": None}]
         return SimpleNamespace(fetchall=lambda: rows)
 
 
@@ -118,27 +106,27 @@ def test_audit_queries_one_row_more_and_never_counts_over():
     conn = _AuditConn(30)
     page = db.list_audit(conn, limit=50, offset=0)
     sql, params = conn.queries[0]
-    assert "OVER" not in sql and params[-2:] == [51, 0]
-    # last page: one statement for the page and the count
+    assert "OVER" not in sql and params[:2] == [51, 0]
+    # last page: one statement, the total without a count
     assert page == db.AuditPage(page.rows, 30)
-    assert len(page.rows) == 30 and len(conn.queries) == 1
+    assert len(page.rows) == 30 and len(conn.queries) == 1 and conn.counted == 0
     assert "matching" not in page.rows[0]
 
 
 def test_audit_nothing_matches_is_one_query():
     conn = _AuditConn(0)
     assert db.list_audit(conn, limit=50, offset=0) == db.AuditPage([], 0)
-    assert len(conn.queries) == 1
+    assert len(conn.queries) == 1 and conn.counted == 0
 
 
 def test_audit_page_and_count_are_one_statement_up_to_the_cap():
     conn = _AuditConn(120)
     page = db.list_audit(conn, role="r", limit=50, offset=50)
     assert len(page.rows) == 50 and page.has_next and page.total == 120 and not page.capped
-    assert len(conn.queries) == 1
+    assert len(conn.queries) == 1 and conn.counted == 1
     sql, params = conn.queries[0]
     assert sql.count("LIMIT %s") == 2
-    assert params == ["r", db.AUDIT_COUNT_CAP + 1, "r", 51, 50]
+    assert params == ["r", 51, 50, 50, 50, "r", db.AUDIT_COUNT_CAP + 1]
 
     conn = _AuditConn(25_000)
     page = db.list_audit(conn, limit=50, offset=0)
@@ -151,6 +139,8 @@ def test_the_last_page_beyond_the_cap_is_shown_capped_too():
     page = db.list_audit(conn, limit=50, offset=24_950)
     assert len(page.rows) == 50 and not page.has_next
     assert page.capped and audit.total_label(page) == "10,000+"
+    # not full: no count, the total is bounded as a count would be
+    assert page.total == db.AUDIT_COUNT_CAP + 1 and conn.counted == 0
 
 
 def test_audit_page_past_the_end_is_counted_up_to_the_cap_only():
@@ -158,25 +148,6 @@ def test_audit_page_past_the_end_is_counted_up_to_the_cap_only():
     page = db.list_audit(conn, limit=50, offset=30_000)
     assert page == db.AuditPage([], db.AUDIT_COUNT_CAP + 1, capped=True)
     assert len(conn.queries) == 1
-
-
-def test_a_stale_link_past_a_capped_audit_is_clamped(app, monkeypatch):  # noqa: F811
-    seen: list[int] = []
-
-    def list_audit(conn, *, offset, limit, **kw):
-        # 25,000 events, counted up to the cap
-        seen.append(offset)
-        rows = [{"id": 1, "event_type": "auth_failed"}] if offset < 25_000 else []
-        return db.AuditPage(rows, db.AUDIT_COUNT_CAP + 1, capped=True, has_next=bool(rows))
-
-    monkeypatch.setattr(db, "list_audit", list_audit)
-    client, _ = _client(app)
-    response = client.get("/audit/table", params={"page": "700"})
-    assert response.status_code == 200
-    # 10,001 events known: page 201 (offset 10,000), never an exact count
-    assert seen == [699 * 50, 200 * 50]
-    assert "10,000+ events — page 201</p>" in response.text
-    assert "&page=202" in response.text
 
 
 def test_a_capped_audit_is_paged_with_next_only(app, monkeypatch):  # noqa: F811
@@ -296,7 +267,7 @@ def test_the_basic_cache_follows_the_configured_hash():
 
     def cached_user(cached, **kw):
         req, authorization, s = request(cached, **kw)
-        return auth._cached_basic_user(req, s, authorization)
+        return auth._cached_basic_user(req, s, authorization, auth.basic_user_name(authorization))
 
     assert cached_user({"user": TEST_USER, "fp": fp}) == TEST_USER
     # a user no longer configured, a forged user name, a malformed entry

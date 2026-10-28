@@ -732,29 +732,35 @@ def list_audit(
 ) -> AuditPage:
     """One page of events, newest first, and how many events match.
 
-    A single statement reads both, so that they come from the same snapshot
-    (a page and a total that disagree would show a wrong pager):
+    The page is read with one row more than shown (LIMIT limit + 1), which
+    tells whether a next page exists.  The total then costs:
 
-    - the page, with one row more than shown (LIMIT limit + 1), which tells
-      whether a next page exists;
-    - a bounded count, which stops after AUDIT_COUNT_CAP + 1 rows, so that a
-      large audit_log is never scanned whole to display "10,000+".  Also
-      for a page past the end (stale link, hand-typed URL): the caller
-      clamps to the last page this count knows of, never to an exact count.
+    - nothing when the page is not full (the last page: offset + rows
+      shown) or when nothing matches at all (first page empty);
+    - a bounded count otherwise (a next page exists, or a page past the
+      end: stale link, hand-typed URL), which stops after
+      AUDIT_COUNT_CAP + 1 rows, so that a large audit_log is never scanned
+      whole to display "10,000+".
 
-    count(*) OVER () would instead compute the whole match before LIMIT, on
-    every page."""
+    A single statement reads the page and, when needed, the count, so that
+    they come from the same snapshot (a page and a total that disagree
+    would show a wrong pager).  The count is an uncorrelated subquery in a
+    CASE branch: PostgreSQL runs such an InitPlan only when the branch is
+    taken.  count(*) OVER () would instead compute the whole match before
+    LIMIT, on every page."""
     where, params = _audit_where(role, event_type, since)
     result = conn.execute(
-        "SELECT c.n AS matching, p.*"
-        "  FROM (SELECT count(*) AS n FROM (SELECT 1 FROM pass_policy.audit_log"
-        f"         WHERE {where} LIMIT %s) AS m) AS c"
-        f"  LEFT JOIN LATERAL (SELECT {_AUDIT_COLUMNS} FROM pass_policy.audit_log"
-        f"         WHERE {where} ORDER BY id DESC LIMIT %s OFFSET %s) AS p ON true"
-        " ORDER BY p.id DESC",
-        [*params, AUDIT_COUNT_CAP + 1, *params, limit + 1, offset],
+        f"WITH p AS (SELECT {_AUDIT_COLUMNS} FROM pass_policy.audit_log"
+        f"           WHERE {where} ORDER BY id DESC LIMIT %s OFFSET %s)"
+        " SELECT CASE WHEN (SELECT count(*) FROM p) > %s"
+        "               OR ((SELECT count(*) FROM p) = 0 AND %s > 0)"
+        "             THEN (SELECT count(*) FROM (SELECT 1 FROM pass_policy.audit_log"
+        f"                     WHERE {where} LIMIT %s) AS m)"
+        "        END AS matching, p.*"
+        "   FROM (VALUES (1)) AS one LEFT JOIN p ON true"
+        "  ORDER BY p.id DESC",
+        [*params, limit + 1, offset, limit, offset, *params, AUDIT_COUNT_CAP + 1],
     ).fetchall()
-    n = result[0]["matching"] if result else 0
     # no event on this page: a single row whose page columns are NULL (id is
     # the primary key, never NULL otherwise)
     rows = [
@@ -762,6 +768,11 @@ def list_audit(
     ]
     has_next = len(rows) > limit
     del rows[limit:]
+    counted = result[0]["matching"] if result else None
+    # not counted: the page is not full, the total is the rows up to its
+    # end, bounded as the count would be (a last page beyond the cap is
+    # shown capped as every other page)
+    n = min(offset + len(rows), AUDIT_COUNT_CAP + 1) if counted is None else counted
     return AuditPage(rows, n, capped=n > AUDIT_COUNT_CAP, has_next=has_next)
 
 
