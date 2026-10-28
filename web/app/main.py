@@ -91,10 +91,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 # session cookie either, say that it must be kept as well
                 if not has_cookie:
                     detail = f"{detail}. {SESSION_NOT_STORED}"
-            elif secure_cookie_over_http(request, settings):
+            elif not has_cookie and secure_cookie_over_http(request, settings):
                 # a Secure cookie the browser drops (page served over plain
-                # HTTP): a reload would fail the same way on every action
-                detail = SESSION_NOT_STORED
+                # HTTP): a reload would fail the same way on every action.
+                # With the cookie present, the token is merely stale: the
+                # reload below applies
+                detail = f"{detail}. {SESSION_NOT_STORED}"
             elif is_hx(request):
                 # a stale token (session expired or lost while the page
                 # stayed open): reload the page for a fresh one
@@ -159,11 +161,13 @@ SESSION_NOT_STORED = (
 
 def secure_cookie_over_http(request: Request, settings: Settings) -> bool:
     """A Secure session cookie (PGPP_WEB_SESSION_HTTPS_ONLY) and a page the
-    browser loaded over plain HTTP (Origin, else Referer, as the browser
-    sees it, whatever the proxy in between): the cookie is never stored."""
+    browser loaded over plain HTTP (Origin as the browser sees it, whatever
+    the proxy in between): the cookie is never stored.  Origin only: the
+    pages are served with Referrer-Policy: no-referrer, the browser sends no
+    Referer, and htmx requests (POST) always carry Origin."""
     if not settings.session_https_only:
         return False
-    origin = request.headers.get("origin") or request.headers.get("referer") or ""
+    origin = request.headers.get("origin") or ""
     return origin.lower().startswith("http://")
 
 

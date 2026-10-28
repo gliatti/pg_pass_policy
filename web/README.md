@@ -208,10 +208,14 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
   invalid: reload the page » ; pour une requête htmx, la réponse porte
   `HX-Refresh: true` et la page est rechargée avec un jeton neuf. Exception :
   avec `PGPP_WEB_SESSION_HTTPS_ONLY=true` et une page chargée en HTTP clair
-  (en-tête `Origin` ou `Referer` en `http://`), le navigateur ne garde jamais
-  le cookie `Secure` ; au lieu d'un rechargement qui échouerait à chaque
-  action, une alerte « Session cookie not stored (or expired) » invite à
-  vérifier `PGPP_WEB_SESSION_HTTPS_ONLY` et les cookies. Une requête sans
+  (en-tête `Origin` en `http://` ; pas de `Referer`, absent avec
+  `Referrer-Policy: no-referrer`) et une requête arrivée sans cookie de
+  session, le navigateur ne garde jamais le cookie `Secure` ; au lieu d'un
+  rechargement qui échouerait à chaque action, le message « CSRF token
+  invalid » est complété d'une alerte « Session cookie not stored (or
+  expired) » qui invite à vérifier `PGPP_WEB_SESSION_HTTPS_ONLY` et les
+  cookies. Si le cookie est bien présent, le jeton est seulement périmé : la
+  page est rechargée comme ci-dessus. Une requête sans
   aucun jeton (client qui n'a chargé aucune page) reçoit « CSRF token
   missing: fetch a page first », complété par la même alerte si elle ne porte
   pas non plus de cookie de session. Le jeton n'est publié que dans `hx-headers` (pas de
@@ -329,7 +333,9 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
   `.` et `..` (segments supprimés de l'URL par le navigateur), acceptés par
   l'extension, restent injoignables : l'interface refuse de créer un profil
   portant l'un d'eux (422, message explicite) ; son formulaire d'édition et sa
-  modification répondent 404 (même garde, avant toute requête) ; un tel profil
+  modification répondent 404 « profile "…" is managed in SQL only » (même
+  garde, avant toute requête) ; dans la liste des profils, un tel profil
+  n'a ni lien d'édition ni bouton de suppression (mention « SQL only ») : il
   se gère en SQL.
 - **Droits** : le rôle de service est seulement membre de `pass_policy_admin` ;
   les fonctions `SECURITY DEFINER` qui visent un rôle (rotation, expiration,

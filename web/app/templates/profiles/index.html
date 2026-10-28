@@ -8,7 +8,8 @@
   <tbody>
   {% for p in profiles %}
   <tr>
-    <td><a href="{{ path_for('profile_edit', name=p.name) }}"><strong>{{ p.name }}</strong></a></td>
+    {% set sql_only = p.name in reserved_names %}
+    <td>{% if sql_only %}<strong>{{ p.name }}</strong> <small class="muted">(SQL only)</small>{% else %}<a href="{{ path_for('profile_edit', name=p.name) }}"><strong>{{ p.name }}</strong></a>{% endif %}</td>
     <td>{{ p.min_length }}–{{ p.max_length }}</td>
     <td>{{ p.min_classes }} (l{{ p.min_lower }} u{{ p.min_upper }} d{{ p.min_digit }} s{{ p.min_special }})</td>
     <td>{{ p.history_count }} / {{ p.history_days }} d</td>
@@ -18,7 +19,7 @@
     <td>{{ p.max_failures }} in {{ p.failure_window }}</td>
     <td>{{ p.lock_duration or 'manual unlock' }}</td>
     <td>{{ p.assigned_roles }}</td>
-    <td>{% if p.name != 'default' %}
+    <td>{% if p.name != 'default' and not sql_only %}
       <form method="post" action="{{ path_for('profile_delete', name=p.name) }}"
             hx-post="{{ path_for('profile_delete', name=p.name) }}" hx-target="#profile-alerts" hx-swap="innerHTML"
             hx-confirm="Delete profile {{ p.name }}?"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-warn">Delete</button></form>

@@ -90,6 +90,6 @@ def test_reserved_names_share_one_guard(app, monkeypatch, encoded, method):  # n
     kwargs = {"headers": {"X-CSRF-Token": token}, "data": {}} if method == "post" else {}
     response = getattr(client, method)(f"/profiles/p/{encoded}", **kwargs)
     assert response.status_code == 404
-    assert "is reserved by the web interface" in response.text
+    assert "is managed in SQL only" in response.text
     assert looked_up == []
     assert profiles.RESERVED_NAMES == {".", ".."}

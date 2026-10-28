@@ -49,6 +49,9 @@ RESERVED_MESSAGE = (
     'the profile name "{}" is reserved by the web interface'
     " (. and ..): choose another name or use SQL"
 )
+# the 404 of the routes of one profile (edit page, update): such a profile
+# may exist (created with SQL), it is not reachable from the web interface
+SQL_ONLY_MESSAGE = 'profile "{}" is managed in SQL only'
 
 
 def settings_from_form(form: Any) -> dict[str, Any]:
@@ -95,6 +98,10 @@ def _page(request: Request, conn: Connection) -> Response:
         "login_roles": db.login_roles(conn, db.session_is_superuser(request, conn)),
         # same order as profile_names(): derived, no second query
         "profile_names": [p["name"] for p in profiles],
+        # "." / "..": no edit link nor delete form (their URLs would be
+        # rewritten by the browser, /profiles/p/./delete reaching the update
+        # of a profile named "delete")
+        "reserved_names": RESERVED_NAMES,
     }
     return render(request, "profiles/index.html", context)
 
@@ -134,7 +141,7 @@ def _reserved_or_404(name: str) -> None:
     form would post to a URL that the browser rewrites.  Checked before any
     query, by both the edit page and the update."""
     if name in RESERVED_NAMES:
-        raise HTTPException(status_code=404, detail=RESERVED_MESSAGE.format(name))
+        raise HTTPException(status_code=404, detail=SQL_ONLY_MESSAGE.format(name))
 
 
 def _profile_or_404(conn: Connection, name: str) -> dict[str, Any]:
