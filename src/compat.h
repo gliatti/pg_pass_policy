@@ -155,8 +155,8 @@ ppp_get_extension_schema(Oid ext_oid)
  *   - pg_strong_random(void *buf, size_t len) in port.h;
  *   - SplitIdentifierString() in utils/varlena.h;
  *   - str_tolower(const char *, size_t, Oid) in utils/formatting.h;
- *   - hash_get_num_entries() returns "long" up to PG 17 and "int64" in PG 18:
- *     callers cast the result explicitly.
+ *   - hash_get_num_entries() returns "long" on PG 14 to 18 (checked in the
+ *     18.x utils/hsearch.h); callers cast the result explicitly anyway.
  * PG 18 only emits a deprecation WARNING when an MD5 password is set; the
  * extension computes SCRAM verifiers only, so nothing changes for us.
  */

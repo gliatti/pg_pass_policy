@@ -635,6 +635,43 @@ compte comme « spécial ».
 - **Historique** : `password_history.verifier` contient les vérificateurs SCRAM
   (matière à attaque hors ligne) ; la colonne n'est lisible que par le
   propriétaire de l'extension, pas par `pass_policy_viewer`.
+- **Historique et `pg_dump`** : la réconciliation de `run_maintenance()`
+  (étape b) recopie `pg_authid.rolpassword` de **tout** rôle LOGIN à mot de
+  passe dans `password_history`, et cette table est déclarée en
+  `pg_extension_config_dump` : un `pg_dump` de la base `pg_pass_policy.database`
+  emporte désormais les vérificateurs SCRAM de tous les rôles de la grappe,
+  que `pg_dump` ne sort jamais autrement (`pg_authid` n'est dans
+  `pg_dumpall --globals-only`). Protéger ces dumps comme les globals.
+- **Installation sur une instance existante** : au premier
+  `run_maintenance()`, chaque rôle LOGIN à mot de passe sans historique reçoit
+  `password_changed_at = now()`, et le profil `default` lui applique `max_age`
+  90 jours + `grace_period` 7 jours. Avec `manage_valid_until = on` (défaut),
+  le worker pose alors `VALID UNTIL` sur chacun : **97 jours après
+  l'installation, tout rôle applicatif dont le mot de passe n'a pas été changé
+  est refusé à la connexion.** Avant d'installer sur une instance vivante,
+  décider d'un profil (`max_age` NULL sur `default`, ou `assign_profile()` par
+  rôle), ou passer `manage_valid_until = off`.
+- **Rôles créés automatiquement** (gestionnaire de secrets à identifiants
+  dynamiques, outil d'infrastructure as code, orchestrateur, script de
+  provisionnement) : avec `enforce_database = on`, leurs
+  `CREATE ROLE … PASSWORD` sont refusés (`PPP-003`) dès que la connexion vise
+  une autre base que `pg_pass_policy.database` ; dans cette base, chaque
+  création passe par le hook (ligne `password_history`, ligne `audit_log`,
+  `NOTIFY`, ligne de log), puis par la réconciliation et la purge de la
+  maintenance : le volume d'audit suit le rythme de création. L'extension est
+  conçue pour des comptes durables.
+- **Verrouillage et déni de service** : tout client qui atteint une ligne
+  `pg_hba.conf` à secret peut verrouiller n'importe quel rôle par son seul nom
+  (`max_failures` essais dans `failure_window`), et le refus s'applique ensuite
+  à toutes les méthodes, `peer` et `cert` comprises. Inscrire dans
+  `exempt_roles` les comptes que l'exploitation ne doit jamais perdre (compte
+  d'administration, rôle de réplication, comptes techniques de supervision ou
+  de sauvegarde).
+- **pgaudit** : l'extension neutralise `log_statement`,
+  `pg_stat_statements.track_utility` et `auto_explain` autour de ses
+  `ALTER ROLE … PASSWORD`, mais ne fait rien pour pgaudit : vérifier ce que
+  `pgaudit.log = 'role'` écrit lors d'un `rotate_password()` avant de
+  l'activer sur une instance où pgaudit est chargé.
 
 ## Clients
 
