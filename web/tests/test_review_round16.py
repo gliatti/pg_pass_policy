@@ -242,7 +242,7 @@ def test_a_failed_basic_check_decodes_the_header_once(unit_app, monkeypatch, cap
     bad = {"Authorization": _basic(TEST_USER, "wrong-password")}
     assert client.get("/_whoami", headers=bad).status_code == 401
     assert len(decodes) == 1
-    assert f"basic authentication failed for user {TEST_USER} from" in caplog.text
+    assert f"basic authentication failed for user '{TEST_USER}' from" in caplog.text
     # a malformed header: logged without a user name, decoded once as well
     decodes.clear()
     assert client.get("/_whoami", headers={"Authorization": "Basic !!!"}).status_code == 401

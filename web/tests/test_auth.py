@@ -108,7 +108,7 @@ def test_basic_failure_is_logged_without_password(unit_client, caplog):
     caplog.set_level(logging.WARNING)
     secret = "nope-nope-nope"
     assert unit_client.get("/_whoami", headers=_basic(TEST_USER, secret)).status_code == 401
-    assert f"basic authentication failed for user {TEST_USER} from testclient" in caplog.text
+    assert f"basic authentication failed for user '{TEST_USER}' from testclient" in caplog.text
     assert secret not in caplog.text
     # a user name with control characters is logged escaped, on one line
     caplog.clear()

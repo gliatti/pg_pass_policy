@@ -1296,10 +1296,18 @@ def test_list_audit_prepared_with_since_and_offset(client, test_url):
     token = csrf_token(client, "/roles")
     for _ in range(3):
         client.post("/roles/web_t_alpha/rotate", headers={"X-CSRF-Token": token})
-    sinces = [datetime(2000, 1, 1, tzinfo=UTC), "1 hour"]
+    # both since types (timestamptz, interval string), with no boundary
+    # near a row: the interval is the age, on the server clock read once, of
+    # 2000-01-01, so that now() - interval falls on 2000-01-01 plus the few
+    # seconds between this read and the now() of each connection (each one
+    # runs a single transaction): no row lies there, both connections count
+    # the same rows, whatever earlier runs left on a reused database
+    origin = datetime(2000, 1, 1, tzinfo=UTC)
+    with psycopg.connect(test_url) as clock:
+        server_now = clock.execute("SELECT now()").fetchone()[0]
+    sinces = [origin, f"{int((server_now - origin).total_seconds())} seconds"]
     # the expected total of each since, counted on `plain` (one transaction:
-    # the same snapshot and the same now() as its list_audit() calls), so
-    # that the test holds on a reused database, whatever earlier runs left
+    # the same snapshot and the same now() as its list_audit() calls)
     count_since = {
         datetime: "event_time >= %(since)s",
         str: "event_time >= now() - %(since)s::interval",

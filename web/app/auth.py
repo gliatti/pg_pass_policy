@@ -21,7 +21,7 @@ from app.config import Settings, bcrypt_cost
 from app.hashpw import BCRYPT_MAX_BYTES
 from app.logfilter import get_logger
 from app.security import route_path
-from app.usernames import valid_user_name
+from app.usernames import USER_MAX_LENGTH, user_name_problem, valid_user_name
 
 log = get_logger("auth")
 
@@ -83,13 +83,16 @@ def _decode_basic(authorization: str | None) -> tuple[bytes, bytes] | None:
 
 
 def _loggable(user: str | None) -> str:
-    """A user name safe for a log line: a valid name as is, a refused one
-    escaped to ASCII (ascii(): every non-ASCII character as \\x, \\u or
-    \\U, so that no invisible or look-alike character reaches the log),
-    bounded length."""
+    """A claimed user name safe for a log line, valid or not: cut to
+    USER_MAX_LENGTH characters, then escaped and quoted by ascii() (every
+    non-ASCII character as \\x, \\u or \\U, a quote or a line break
+    escaped), followed by "…" when cut.  Always quoted, so that no name can
+    forge the " from <address>" that follows it in a log line, nor slip an
+    invisible or look-alike character into the log."""
     if user is None:
         return "<none>"
-    return user if _valid_user(user) else ascii(user)[:128]
+    cut = user[:USER_MAX_LENGTH]
+    return ascii(cut) + ("…" if len(user) > USER_MAX_LENGTH else "")
 
 
 def verify_basic(authorization: str | None, users: dict[str, bytes]) -> str | None:
@@ -199,6 +202,16 @@ def authenticate_basic(request: Request, settings: Settings) -> BasicResult:
     return BasicResult(user, claimed)
 
 
+def _ipv4_of_mapped(
+    addr: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> ipaddress.IPv4Address | None:
+    """The IPv4 form of an IPv4-mapped IPv6 address (uvicorn --host ::
+    reports an IPv4 peer as ::ffff:127.0.0.1), None for any other address."""
+    if isinstance(addr, ipaddress.IPv6Address):
+        return addr.ipv4_mapped
+    return None
+
+
 def _client_is_trusted(request: Request, settings: Settings) -> bool:
     if settings.trust_all_proxies():
         return True
@@ -209,11 +222,12 @@ def _client_is_trusted(request: Request, settings: Settings) -> bool:
         addr = ipaddress.ip_address(client.host)
     except ValueError:
         return False
-    # uvicorn --host :: reports an IPv4 peer as ::ffff:127.0.0.1: match its
-    # IPv4 form too (and the mapped form itself, if listed as such)
+    # an IPv4-mapped peer matches its IPv4 form too (and the mapped form
+    # itself, if listed as such)
     candidates = [addr]
-    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
-        candidates.append(addr.ipv4_mapped)
+    mapped = _ipv4_of_mapped(addr)
+    if mapped is not None:
+        candidates.append(mapped)
     return any(a in net for a in candidates for net in settings.trusted_networks())
 
 
@@ -222,6 +236,25 @@ def _peer(request: Request) -> str:
     Unix socket peer (no client, or an empty host)."""
     client = request.client
     return client.host if client is not None and client.host else "unix"
+
+
+def _peer_key(request: Request) -> str:
+    """The throttling key of a peer: its address normalised, so that one
+    source cannot open a window per address it can use.  An IPv4-mapped
+    address is its IPv4 form, an IPv6 address its /64 (the usual
+    allocation of a single site); "unix" or a host that is not an address
+    as is."""
+    peer = _peer(request)
+    try:
+        addr = ipaddress.ip_address(peer)
+    except ValueError:
+        return peer
+    mapped = _ipv4_of_mapped(addr)
+    if mapped is not None:
+        return str(mapped)
+    if isinstance(addr, ipaddress.IPv6Address):
+        return str(ipaddress.IPv6Network((addr, 64), strict=False))
+    return str(addr)
 
 
 def _utcnow() -> datetime:
@@ -236,10 +269,23 @@ class _Window:
     suppressed: int = 0
     since: datetime | None = None
 
+    def add(self, count: int, since: datetime | None) -> None:
+        """Count `count` suppressed warnings, the first one at `since` (now if
+        None, read only when no count is pending)."""
+        if not count:
+            return
+        if not self.suppressed:
+            self.since = since or _utcnow()
+        self.suppressed += count
+
     def take(self) -> tuple[int, datetime | None]:
         taken = self.suppressed, self.since
         self.suppressed, self.since = 0, None
         return taken
+
+
+# lines a _ThrottledWarning logs per interval, all keys together
+MAX_LINES_PER_INTERVAL = 20
 
 
 class _ThrottledWarning:
@@ -249,54 +295,82 @@ class _ThrottledWarning:
     one; flush() (at shutdown) logs the counts still pending.
 
     The key (the peer address, say) keeps one source from hiding another:
-    each key has its own window.  At most `max_keys` keys are tracked, the
-    least recently seen one is dropped beyond (its pending count is logged
-    then), so that a scan from many addresses cannot grow the state."""
+    each key has its own window.  At most `max_lines` lines are logged per
+    interval, all keys together: beyond, the warnings are added to a single
+    global count, logged in one line with the first warning of a later
+    interval, or by flush().  At most `max_keys` keys are tracked, the
+    least recently seen one is dropped beyond (its pending count goes to
+    the global count, no line of its own), so that a scan from many
+    addresses can neither grow the state nor flood the log."""
 
-    def __init__(self, label: str, interval: float = 60.0, max_keys: int = 256):
+    def __init__(
+        self,
+        label: str,
+        interval: float = 60.0,
+        max_keys: int = 256,
+        max_lines: int = MAX_LINES_PER_INTERVAL,
+    ):
         self.label = label
         self.interval = interval
         self.max_keys = max_keys
+        self.max_lines = max_lines
         self._lock = threading.Lock()
         self._windows: OrderedDict[str, _Window] = OrderedDict()
+        # the global window: its start, the lines logged in it, and the
+        # count suppressed beyond max_lines or dropped with a key
+        self._global_start: float | None = None
+        self._global_lines = 0
+        self._global = _Window()
 
     def reset(self) -> None:
         with self._lock:
             self._windows.clear()
+            self._global_start, self._global_lines = None, 0
+            self._global = _Window()
 
     def _subject(self, key: str) -> str:
         return f"{self.label} {key}" if key else self.label
 
-    def _log_pending(self, key: str, suppressed: int, since: datetime | None) -> None:
+    def _log_pending(self, subject: str, suppressed: int, since: datetime | None) -> None:
         if suppressed and since is not None:
             log.warning(
                 "%s: %d similar warnings suppressed since %s",
-                self._subject(key),
+                subject,
                 suppressed,
                 since.isoformat(timespec="seconds"),
             )
 
+    def _global_subject(self) -> str:
+        return f"{self.label} (all sources)"
+
     def warning(self, message: str, *args: object, key: str = "") -> None:
         now = time.monotonic()
-        evicted: tuple[str, int, datetime | None] | None = None
+        global_pending: tuple[int, datetime | None] = (0, None)
         with self._lock:
             window = self._windows.get(key)
             if window is None:
                 window = self._windows[key] = _Window()
                 if len(self._windows) > self.max_keys:
-                    old_key, old = self._windows.popitem(last=False)
-                    evicted = (old_key, *old.take())
+                    _, old = self._windows.popitem(last=False)
+                    self._global.add(*old.take())
             else:
                 self._windows.move_to_end(key)
             if window.last is not None and now - window.last < self.interval:
-                if not window.suppressed:
-                    window.since = _utcnow()
-                window.suppressed += 1
+                window.add(1, None)
                 return
             window.last = now
+            if self._global_start is None or now - self._global_start >= self.interval:
+                self._global_start, self._global_lines = now, 0
+                global_pending = self._global.take()
+            if self._global_lines >= self.max_lines:
+                # over the global cap: this warning and the count of its key
+                # go to the global count
+                self._global.add(*window.take())
+                self._global.add(1, None)
+                return
+            self._global_lines += 1
             suppressed, since = window.take()
-        if evicted is not None:
-            self._log_pending(*evicted)
+        self._log_pending(self._global_subject(), *global_pending)
         if suppressed and since is not None:
             message += " (%d similar warnings suppressed since %s)"
             args = (*args, suppressed, since.isoformat(timespec="seconds"))
@@ -306,8 +380,10 @@ class _ThrottledWarning:
         """Log the counts of warnings suppressed and not reported yet, if any."""
         with self._lock:
             pending = [(key, *window.take()) for key, window in self._windows.items()]
+            global_pending = self._global.take()
         for key, suppressed, since in pending:
-            self._log_pending(key, suppressed, since)
+            self._log_pending(self._subject(key), suppressed, since)
+        self._log_pending(self._global_subject(), *global_pending)
 
 
 # peers tracked by the untrusted peer warning (least recently seen dropped)
@@ -331,9 +407,15 @@ class AuthWarnings:
         self.untrusted_proxy_peer = _ThrottledWarning(
             "proxy header refused from untrusted peer", max_keys=UNTRUSTED_PEERS_TRACKED
         )
+        # a proxy header holding a name refused by app.usernames (NFKC,
+        # invisible character...): the reason and the escaped name, per
+        # peer as above
+        self.refused_proxy_user = _ThrottledWarning(
+            "proxy header user name refused from peer", max_keys=UNTRUSTED_PEERS_TRACKED
+        )
 
     def all(self) -> tuple[_ThrottledWarning, ...]:
-        return (self.undecodable_proxy_header, self.untrusted_proxy_peer)
+        return (self.undecodable_proxy_header, self.untrusted_proxy_peer, self.refused_proxy_user)
 
     def flush(self) -> None:
         """At shutdown: report the warnings suppressed since the last one logged."""
@@ -344,9 +426,8 @@ class AuthWarnings:
 def user_from_proxy(request: Request, settings: Settings) -> str:
     warnings: AuthWarnings = request.app.state.auth_warnings
     if not _client_is_trusted(request, settings):
-        peer = _peer(request)
         warnings.untrusted_proxy_peer.warning(
-            "proxy header refused from untrusted peer %s", peer, key=peer
+            "proxy header refused from untrusted peer %s", _peer(request), key=_peer_key(request)
         )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -383,7 +464,15 @@ def user_from_proxy(request: Request, settings: Settings) -> str:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"Not authenticated (proxy header not valid {encoding})",
         ) from None
-    if not _valid_user(user):
+    problem = user_name_problem(user)
+    if problem is not None:
+        warnings.refused_proxy_user.warning(
+            "proxy header user name %s refused from peer %s: %s",
+            _loggable(user),
+            _peer(request),
+            problem,
+            key=_peer_key(request),
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Not authenticated (proxy header not a valid user name)",

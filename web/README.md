@@ -158,6 +158,17 @@ PGPP_WEB_BASIC_USERS: user name 'bob\u200b' refused: character U+200B not allowe
 Avant la mise à jour, vérifier les noms configurés, et renommer l'entrée
 concernée (le nouveau nom est celui qu'enregistrera `application_name`).
 
+En mode `proxy`, la même règle s'applique à l'en-tête du proxy : un nom
+accepté par une version précédente peut désormais recevoir un 401, en
+particulier une forme de compatibilité (refusée par NFKC : pleine chasse,
+ligature, exposant…) ou un caractère invisible (sélecteur de variante,
+remplissage hangûl…). Chaque refus est journalisé en `WARNING`, au plus une
+ligne par minute et par pair, avec le nom échappé et le motif :
+
+```text
+proxy header user name 'bob\ufe0f' refused from peer 10.0.0.9: character U+FE0F not allowed (invisible)
+```
+
 Le nom de l'utilisateur web est enregistré dans `pass_policy.audit_log`
 (colonne `application_name`, valeur `pgpp-web:alice`) : chaque action reste
 attribuable à une personne même si tous passent par le même rôle PostgreSQL.
@@ -258,20 +269,30 @@ alphanumériques mathématiques (`𝐚𝐥𝐢𝐜𝐞`), exposants (`²`), chif
 (`Ⅰ`)… Sont aussi refusés, un à un, des caractères invisibles hors des
 catégories ci-dessus (propriété Unicode `Default_Ignorable_Code_Point` pour
 référence) : sélecteurs de variante U+FE00 à U+FE0F et U+E0100 à U+E01EF,
-U+034F (liant de graphèmes), U+180B à U+180F (sélecteurs mongols), U+115F,
-U+1160, U+3164 et U+FFA0 (remplissages hangûl), U+17B4 et U+17B5 (voyelles
-inhérentes khmères), U+2800 (motif braille vide). Un nom refusé est
-journalisé échappé en ASCII (`\u200b`), jamais tel quel.
+U+034F (liant de graphèmes), U+180B à U+180F (sélecteurs mongols), U+115F
+et U+1160 (remplissages hangûl), U+17B4 et U+17B5 (voyelles
+inhérentes khmères), U+2800 (motif braille vide) ; U+3164 et U+FFA0
+(remplissages hangûl) ne sont pas en forme NFKC et sont refusés à ce
+titre. Un nom revendiqué est toujours journalisé échappé en ASCII et entre
+guillemets (`'bob\u200b'`), qu'il soit valide ou non, jamais tel quel.
 
 Les avertissements répétitifs (en-tête indécodable, en-tête reçu d'un pair
-hors de `PGPP_WEB_TRUSTED_PROXIES`) sont écrits au plus une fois par
-minute ; la ligne suivante indique combien ont été omis depuis quand
-(`3 similar warnings suppressed since 2026-10-28T09:30:05+00:00`), et un
-compte encore en attente est écrit à l'arrêt de l'application. Celui du
-pair non autorisé est limité par adresse du pair : une ligne par pair et
-par minute, avec le compte omis de ce pair, si bien qu'une source bruyante
-ne masque pas les autres. Les 256 derniers pairs vus sont suivis ; au-delà,
-le plus anciennement vu est oublié (son compte en attente est alors écrit).
+hors de `PGPP_WEB_TRUSTED_PROXIES`, nom refusé dans l'en-tête du proxy)
+sont écrits au plus une fois par minute ; la ligne suivante indique combien
+ont été omis depuis quand (`3 similar warnings suppressed since
+2026-10-28T09:30:05+00:00`), et un compte encore en attente est écrit à
+l'arrêt de l'application. Ceux du pair non autorisé et du nom refusé sont
+limités par adresse du pair : une ligne par pair et par minute, avec le
+compte omis de ce pair, si bien qu'une source bruyante
+ne masque pas les autres ; le pair est pris sous sa forme normalisée (une
+adresse IPv4 mappée `::ffff:a.b.c.d` comme `a.b.c.d`, une adresse IPv6
+réduite à son /64). Les 256 derniers pairs vus sont suivis ; au-delà, le
+plus anciennement vu est oublié et son compte en attente s'ajoute à un
+compteur global. Toutes adresses confondues, chaque avertissement écrit au
+plus 20 lignes par minute : au-delà, les omissions s'ajoutent à ce même
+compteur global, écrit en une ligne (`… (all sources): 57 similar warnings
+suppressed since …`) avec le premier avertissement d'une minute suivante ou
+à l'arrêt de l'application.
 
 Derrière HTTPS, `PGPP_WEB_SESSION_HTTPS_ONLY=true` est requis : le cookie de
 session devient `__Host-pgpp_session` (`Secure`, `Path=/`, sans `Domain`),
@@ -281,8 +302,9 @@ en HTTP clair) ne peut écraser.
 Limitation de débit : l'application ne freine pas elle-même les tentatives
 HTTP basic (bcrypt, coût 12 avec `pgpp-web-hash`, ralentit chaque essai, mais rien n'arrête un
 dictionnaire patient). Chaque échec est journalisé en `WARNING` avec le nom
-d'utilisateur et l'adresse du pair (`basic authentication failed for user
-alice from 10.0.0.9`), jamais le mot de passe. Le reverse proxy doit limiter
+d'utilisateur revendiqué, échappé et entre guillemets, et l'adresse du pair
+(`basic authentication failed for user 'alice' from 10.0.0.9`), jamais le
+mot de passe. Le reverse proxy doit limiter
 le débit sur `/` et, idéalement, bannir les sources qui accumulent les 401 :
 
 ```nginx
@@ -294,8 +316,9 @@ location / {
 ```
 
 Avec fail2ban, un filtre sur les lignes `basic authentication failed for user
-… from <ip>` du journal d'uvicorn (ou sur les 401 du journal d'accès du proxy)
-complète le dispositif. Un verrouillage par compte dans l'application a été
+'…' from <ip>` du journal d'uvicorn (ou sur les 401 du journal d'accès du proxy)
+complète le dispositif ; l'adresse du pair est le dernier champ de la ligne,
+qu'aucun nom (toujours échappé et entre guillemets) ne peut imiter. Un verrouillage par compte dans l'application a été
 écarté : derrière le proxy l'adresse vue est celle du proxy, et un compteur
 par utilisateur serait un déni de service trivial sur l'unique compte admin.
 

@@ -43,23 +43,28 @@ REFUSED_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp", "Zs"})
 #                    vowel separator, is Cf and listed for completeness)
 #   U+2800           Braille pattern blank (So, not Default_Ignorable but
 #                    drawn as a space)
-#   U+3164           Hangul filler (Lo)
 #   U+FE00-U+FE0F    variation selectors 1-16 (Mn)
-#   U+FFA0           halfwidth Hangul filler (Lo)
 #   U+E0100-U+E01EF  variation selectors 17-256 (Mn)
+# Not listed: the Hangul filler U+3164 and the halfwidth Hangul filler
+# U+FFA0, not in NFKC form (both map to U+1160), refused by the NFKC check
+# of user_name_problem().  Each code point above was checked one by one
+# to be in NFKC form (unicodedata.is_normalized("NFKC", c)): the NFKC
+# check would not refuse it.
 INVISIBLE_CODE_POINTS = frozenset(
-    {0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x2800, 0x3164, 0xFFA0}
+    {0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x2800}
     | set(range(0x180B, 0x1810))
     | set(range(0xFE00, 0xFE10))
     | set(range(0xE0100, 0xE01F0))
 )
 
-# the rule in one line, quoted by the startup error on PGPP_WEB_BASIC_USERS
+# the rule in one line, quoted by the startup error on PGPP_WEB_BASIC_USERS,
+# built from the constants above so that it cannot drift from them
 USER_NAME_RULE = (
     f"1 to {USER_MAX_LENGTH} characters, in Unicode NFC and NFKC forms, no leading"
-    " combining mark, no control, format, private use, unassigned or separator"
-    " character (categories Cc Cf Cs Co Cn Zl Zp Zs) but the ASCII space inside the"
-    " name, no invisible character (variation selectors, fillers...)"
+    " combining mark, no character of categories"
+    f" {' '.join(sorted(REFUSED_CATEGORIES))} but the ASCII space inside the name,"
+    f" none of the {len(INVISIBLE_CODE_POINTS)} invisible code points of"
+    " app.usernames.INVISIBLE_CODE_POINTS (variation selectors, fillers...)"
 )
 
 
@@ -96,6 +101,8 @@ def user_name_problem(name: str) -> str | None:
             return f"character U+{ord(char):04X} not allowed (invisible)"
     if unicodedata.category(name[0]).startswith("M"):
         return f"starts with a combining mark U+{ord(name[0]):04X}"
+    # NFKC implies NFC: the NFC check refuses nothing more, it is kept for
+    # its more precise message (decomposed accents, not a compatibility form)
     if not unicodedata.is_normalized("NFC", name):
         return "not in Unicode NFC form (decomposed accents)"
     if not unicodedata.is_normalized("NFKC", name):

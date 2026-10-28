@@ -91,7 +91,7 @@ def _proxy_request(raw: bytes, warnings: auth.AuthWarnings | None = None) -> Req
 )
 def test_c1_controls_and_separators_are_refused(name):
     assert not auth._valid_user(name)
-    assert auth._loggable(name) == ascii(name)[:128]
+    assert auth._loggable(name) == ascii(name)
     # (ASCII blanks around a proxy header are stripped, on the bytes)
     if name and name.strip(" ") == name:
         response = _proxy_client().get("/_whoami", headers={"X-Remote-User": name.encode()})
@@ -101,7 +101,7 @@ def test_c1_controls_and_separators_are_refused(name):
 @pytest.mark.parametrize("name", ["\xc9milie", "zo\xeb", "a b", "日本", "x" * 128])
 def test_printable_names_are_accepted(name):
     assert auth._valid_user(name)
-    assert auth._loggable(name) == name
+    assert auth._loggable(name) == ascii(name)
     assert not auth._valid_user("x" * 129)
 
 

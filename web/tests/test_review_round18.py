@@ -86,12 +86,15 @@ def test_the_peers_tracked_are_bounded_least_recently_seen_dropped(monkeypatch, 
     assert list(throttled._windows) == ["a", "c"]
     assert [r.getMessage() for r in caplog.records] == ["w c"]
     caplog.clear()
-    # a fourth key drops "a" and logs its pending count, not lost
+    # a fourth key drops "a": its pending count goes to the global count,
+    # not lost, without a line of its own
     throttled.warning("w %s", "d", key="d")
     assert list(throttled._windows) == ["c", "d"]
+    assert [r.getMessage() for r in caplog.records] == ["w d"]
+    caplog.clear()
+    throttled.flush()
     assert [r.getMessage() for r in caplog.records] == [
-        "probe a: 2 similar warnings suppressed since 2026-05-06T07:08:09+00:00",
-        "w d",
+        "probe (all sources): 2 similar warnings suppressed since 2026-05-06T07:08:09+00:00",
     ]
 
 
@@ -158,10 +161,8 @@ _INVISIBLE = [
     0x180C,
     0x180D,
     0x180F,
-    0x3164,
     0x115F,
     0x1160,
-    0xFFA0,
     0x2800,
     0x17B4,
     0x17B5,
@@ -185,7 +186,7 @@ def test_invisible_code_points_are_refused(code_point):
 
 def test_the_invisible_list_holds_the_ranges():
     expected = (
-        {0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x2800, 0x3164, 0xFFA0}
+        {0x034F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x2800}
         | set(range(0x180B, 0x1810))
         | set(range(0xFE00, 0xFE10))
         | set(range(0xE0100, 0xE01F0))
@@ -228,14 +229,12 @@ def test_plain_names_are_still_accepted(name):
 )
 def test_a_refused_name_is_logged_in_ascii(name):
     logged = auth._loggable(name)
-    assert logged.isascii()
-    assert logged == ascii(name)[:128]
-    assert len(logged) <= 128
-
-
-def test_a_valid_name_is_logged_as_is():
-    assert auth._loggable("\xc9milie") == "\xc9milie"
-    assert auth._loggable(None) == "<none>"
+    if len(name) > 128:
+        # cut before escaping, then marked as cut
+        assert logged == ascii(name[:128]) + "…"
+    else:
+        assert logged == ascii(name)
+        assert logged.isascii()
 
 
 # --- 4: the startup error names the escaped name, the reason and the rule ----------------

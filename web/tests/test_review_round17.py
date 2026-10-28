@@ -261,7 +261,7 @@ def test_basic_failure_from_a_unix_peer_with_an_empty_host_logs_unix(caplog):
     with pytest.raises(HTTPException) as refused:
         auth.require_user(request)
     assert refused.value.status_code == 401
-    assert "basic authentication failed for user x from unix" in caplog.text
+    assert "basic authentication failed for user 'x' from unix" in caplog.text
 
 
 # --- 8: last known audit page ------------------------------------------------------------
