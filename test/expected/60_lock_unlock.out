@@ -381,6 +381,19 @@ SELECT count(*) AS bad_oid_tracked FROM pass_policy.failed_attempts() WHERE role
                0
 (1 row)
 
+-- OID 0 (vérification 16) : refusé explicitement (22023 « invalid role OID »),
+-- sans clé de hash sans nom (le backend plantait avec 542b010)
+SELECT ppp_test.try($$SELECT pass_policy._shmem_unlock(0)$$) AS shmem_unlock_zero,
+       ppp_test.try($$SELECT pass_policy._shmem_reset(0)$$) AS shmem_reset_zero,
+       ppp_test.try($$SELECT pass_policy._shmem_is_locked(0)$$) AS shmem_is_locked_zero,
+       ppp_test.try($$SELECT pass_policy._shmem_lock(0)$$) AS shmem_lock_zero;
+ shmem_unlock_zero | shmem_reset_zero | shmem_is_locked_zero | shmem_lock_zero 
+-------------------+------------------+----------------------+-----------------
+ 22023             | 22023            | 22023                | 42704
+(1 row)
+
+SELECT pass_policy._shmem_is_locked(0);
+ERROR:  invalid role OID
 -- failed_attempts() : colonnes attendues (role_oid ajoutée, vérification 15)
 SELECT pg_get_function_result('pass_policy.failed_attempts()'::regprocedure) AS failed_attempts_columns;
                                                                                 failed_attempts_columns                                                                                

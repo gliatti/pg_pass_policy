@@ -1948,7 +1948,9 @@ typedef struct pppAttemptRow
  * role, unlike a placeholder name): sum of the counters, earliest first
  * failure, latest last failure and latest lock.  This is decided on the key
  * alone: a role created since under such a name has an entry of its own,
- * keyed by its OID, and the pseudo-entry is not its state.
+ * keyed by its OID, and the pseudo-entry is not its state.  The entry of a
+ * dropped role (OID no longer in pg_authid, role_dropped or not yet) is
+ * folded into the same row: its last name is not shown to them either.
  */
 Datum
 ppp_failed_attempts(PG_FUNCTION_ARGS)
@@ -2012,9 +2014,11 @@ ppp_failed_attempts(PG_FUNCTION_ARGS)
 					NAMEDATALEN);
 			ReleaseSysCache(tup);
 		}
+		else if (!show_missing)
+			rows[i].roleid = InvalidOid;	/* dropped role: folded below */
 	}
 
-	/* fold the pseudo-entries (see above) */
+	/* fold the pseudo-entries and the entries of dropped roles (see above) */
 	if (!show_missing)
 	{
 		int			kept = 0;
@@ -2160,6 +2164,23 @@ ppp_oid_dispname(Oid roleid, char *buf, bool missing_ok)
 	strlcpy(buf, NameStr(((Form_pg_authid) GETSTRUCT(tup))->rolname),
 			NAMEDATALEN);
 	ReleaseSysCache(tup);
+}
+
+/*
+ * Role OID argument of _shmem_unlock(), _shmem_reset() and
+ * _shmem_is_locked() (STRICT): InvalidOid would build a pseudo-key without
+ * name (ppp_make_key), hence the explicit refusal.
+ */
+static Oid
+ppp_arg_roleid(FunctionCallInfo fcinfo)
+{
+	Oid			roleid = PG_GETARG_OID(0);
+
+	if (!OidIsValid(roleid))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid role OID")));
+	return roleid;
 }
 
 /* end of a lock: argument argno, NULL or 'infinity' = until manual unlock */
@@ -2319,11 +2340,12 @@ Datum
 ppp_shmem_unlock_oid(PG_FUNCTION_ARGS)
 {
 	char		dispname[NAMEDATALEN];
-	Oid			roleid = PG_GETARG_OID(0);
+	Oid			roleid;
 	pppRoleKey	key;
 
 	ppp_require_superuser("_shmem_unlock");
 	ppp_check_shmem();
+	roleid = ppp_arg_roleid(fcinfo);
 
 	ppp_oid_dispname(roleid, dispname, true);
 	ppp_make_key(&key, roleid, NULL);
@@ -2350,7 +2372,7 @@ ppp_shmem_is_locked(PG_FUNCTION_ARGS)
 	ppp_require_superuser("_shmem_is_locked");
 	ppp_check_shmem();
 
-	ppp_make_key(&key, PG_GETARG_OID(0), NULL);
+	ppp_make_key(&key, ppp_arg_roleid(fcinfo), NULL);
 	LWLockAcquire(ppp_shared->lock, LW_SHARED);
 	entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key, HASH_FIND, NULL);
 	if (entry != NULL)
@@ -2389,11 +2411,12 @@ Datum
 ppp_shmem_reset_oid(PG_FUNCTION_ARGS)
 {
 	char		dispname[NAMEDATALEN];
-	Oid			roleid = PG_GETARG_OID(0);
+	Oid			roleid;
 	pppRoleKey	key;
 
 	ppp_require_superuser("_shmem_reset");
 	ppp_check_shmem();
+	roleid = ppp_arg_roleid(fcinfo);
 
 	ppp_oid_dispname(roleid, dispname, true);
 	ppp_make_key(&key, roleid, NULL);

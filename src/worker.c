@@ -125,10 +125,6 @@ typedef struct pppPendingRow
 	uint64		lock_seq;		/* entry->lock_seq when copied */
 	uint64		generation;		/* entry->generation when copied */
 	bool		state_written;	/* role_state upserted with locked_until */
-	bool		lock_kept;		/* lock neither persisted nor audited: the
-								 * role_state row of its OID is a restored
-								 * row of another cluster (see
-								 * ppp_sync_pending); stays pending */
 } pppPendingRow;
 
 /* lockout parameters of an existing role, read from the profiles */
@@ -409,7 +405,6 @@ ppp_sync_pending(void)
 		rows[nrows].lock_seq = entry->lock_seq;
 		rows[nrows].generation = entry->generation;
 		rows[nrows].state_written = false;
-		rows[nrows].lock_kept = false;
 		nrows++;
 	}
 	LWLockRelease(ppp_shared->lock);
@@ -424,7 +419,6 @@ ppp_sync_pending(void)
 		bool		replaced;
 		bool		dropped;
 		char	   *name;
-		bool		isnull;
 
 		/*
 		 * Pseudo-entries (user names without role): one aggregated
@@ -471,12 +465,11 @@ ppp_sync_pending(void)
 			 * audit row follows from the result, without any lookup that
 			 * could race with the write.  Its name is the current name of
 			 * the role (role_state has none for a dropped OID: no row
-			 * written, role_dropped).  A row of that OID restored from
-			 * another cluster and not remapped yet by run_maintenance()
-			 * (step a0; worker_interval = 0) is not overwritten: it may
-			 * hold the lock of another role (SPEC 6.3), so the lock stays
-			 * pending, neither persisted nor audited, and is written by a
-			 * later cycle once the row has been remapped (lock_kept).
+			 * written, role_dropped).  A row of that OID is the role's
+			 * own: the restored rows are rebound by every reload
+			 * (_rebind_foreign_rows()), and one restored under this OID
+			 * since would belong to this role all the same
+			 * (_resolve_role_oid(): the OID first).
 			 */
 			values[0] = ObjectIdGetDatum(r->key.roleid);
 			values[1] = TimestampTzGetDatum(r->audit_locked_until); /* DT_NOEND = infinity */
@@ -491,31 +484,15 @@ ppp_sync_pending(void)
 										"role_name = EXCLUDED.role_name, "
 										"locked_until = EXCLUDED.locked_until, "
 										"locked_by = EXCLUDED.locked_by, "
-										"lock_reason = EXCLUDED.lock_reason "
-										"WHERE s.cluster_id = pass_policy._system_identifier() "
-										"RETURNING 1) "
-										"SELECT (SELECT r.rolname::pg_catalog.text FROM r), "
-										"(SELECT pg_catalog.count(*) FROM u)",
+										"lock_reason = EXCLUDED.lock_reason) "
+										"SELECT (SELECT r.rolname::pg_catalog.text FROM r)",
 										2, argtypes, values, NULL, false, 1);
 			if (ret != SPI_OK_SELECT || SPI_processed != 1)
 				elog(ERROR, "role_state upsert of OID %u returned SPI code %d",
 					 r->key.roleid, ret);
 			name = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
 			dropped = (name == NULL);
-			if (!dropped &&
-				DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
-											SPI_tuptable->tupdesc, 2,
-											&isnull)) == 1)
-				r->state_written = true;
-			else if (!dropped)
-			{
-				r->lock_kept = true;
-				ereport(LOG,
-						(errmsg(PPP_LOG_PREFIX "automatic lock of role \"%s\" not written to role_state yet: its row is a restored row of another cluster",
-								name),
-						 errdetail("The role_state row of OID %u comes from another cluster and may describe another role; the lock stays enforced in shared memory and is written once run_maintenance() has remapped that row.",
-								   r->key.roleid)));
-			}
+			r->state_written = !dropped;
 		}
 		else
 		{
@@ -561,7 +538,7 @@ ppp_sync_pending(void)
 				elog(ERROR, "audit('auth_failed') returned SPI code %d", ret);
 		}
 
-		if (lock_to_audit && !r->lock_kept)
+		if (lock_to_audit)
 		{
 			Oid			argtypes[8] = {TEXTOID, TIMESTAMPTZOID, INT4OID, BOOLOID,
 				INT8OID, BOOLOID, BOOLOID, OIDOID};
@@ -723,10 +700,9 @@ ppp_ack_pending(void)
 		/*
 		 * A lock set again since (later episode) stays pending; the
 		 * episodes up to the one written are acknowledged, the pending flag
-		 * is only cleared for the very lock written.  A lock neither
-		 * persisted nor audited (lock_kept) stays pending as it is.
+		 * is only cleared for the very lock written.
 		 */
-		if (r->lock_pending_audit && !r->lock_kept)
+		if (r->lock_pending_audit)
 		{
 			if (entry->audit_lock_seq == r->audit_lock_seq)
 				entry->lock_pending_audit = false;
@@ -1008,6 +984,20 @@ ppp_sync_reload(void)
 	LWLockAcquire(ppp_shared->lock, LW_SHARED);
 	seq_snap = ppp_shared->lock_seq;
 	LWLockRelease(ppp_shared->lock);
+
+	/*
+	 * Rows restored from another cluster: rebound to their role (or
+	 * dropped and audited when they resolve to none) in this transaction,
+	 * before anything is read (SPEC 6.3, "Rechargement").  A standby cannot
+	 * write: the queries below resolve them in memory, the same way.
+	 */
+	if (!RecoveryInProgress())
+	{
+		ret = SPI_execute("SELECT FROM pass_policy._rebind_foreign_rows()", false, 0);
+		if (ret != SPI_OK_SELECT)
+			elog(ERROR, "_rebind_foreign_rows() returned SPI code %d", ret);
+	}
+
 	PushActiveSnapshot(GetLatestSnapshot());
 
 	/* profile "default" */
@@ -1031,22 +1021,23 @@ ppp_sync_reload(void)
 
 	/*
 	 * Roles with an assigned profile, by OID (current name for messages).
-	 * The OID of a row is resolved by _resolve_role_oid() (SPEC 6.3,
-	 * "Rechargement"): a row of this cluster by its OID only, a row
-	 * restored from another cluster and not remapped yet (step a0 of
-	 * run_maintenance()) by its name first.  A row whose OID does not
-	 * resolve (dropped role, purged by run_maintenance()) is left out: it
-	 * would otherwise give a from_profile entry (PPP_CLASS_KEEP, never
-	 * evicted) to nobody.  When a restored row and a row of this cluster
-	 * resolve to the same role, the latter wins.
+	 * The OID of a row is resolved by _resolve_role_oid(), once per row
+	 * (SPEC 6.3, "Rechargement"): outside recovery every row is a row of
+	 * this cluster by now, resolved by its OID; on a standby a restored row
+	 * not rebound yet goes to its OID if it exists, else to its name.  A
+	 * row that does not resolve (dropped role, purged by run_maintenance())
+	 * is left out: it would otherwise give a from_profile entry
+	 * (PPP_CLASS_KEEP, never evicted) to nobody.  When a restored row and a
+	 * row of this cluster resolve to the same role, the latter wins.
 	 */
 	ret = SPI_execute("SELECT DISTINCT ON (a.oid) a.oid, a.rolname::text, p.max_failures, "
 					  PPP_SQL_WINDOW_SECS ", "
 					  PPP_SQL_LOCK_SECS " "
 					  "FROM pass_policy.role_profile rp "
 					  "JOIN pass_policy.profile p USING (profile_id) "
-					  "JOIN pg_catalog.pg_authid a ON a.oid = "
-					  "pass_policy._resolve_role_oid(rp.role_oid, rp.role_name, rp.cluster_id) "
+					  "CROSS JOIN LATERAL (SELECT pass_policy._resolve_role_oid(rp.role_oid, "
+					  "rp.role_name, rp.cluster_id) AS oid OFFSET 0) x "
+					  "JOIN pg_catalog.pg_authid a ON a.oid = x.oid "
 					  "ORDER BY a.oid, rp.cluster_id = pass_policy._system_identifier() DESC",
 					  true, 0);
 	if (ret != SPI_OK_SELECT)
@@ -1078,14 +1069,14 @@ ppp_sync_reload(void)
 	 * Persisted active locks ('infinity' comes back as DT_NOEND), by OID,
 	 * resolved as the profiles above: a row of this cluster whose OID no
 	 * longer exists (dropped role, purged by run_maintenance()) is ignored,
-	 * whoever bears its name now; a restored row goes to the role that
-	 * bears its name, or else to its OID.  Several rows resolved to the same
-	 * role: the longest lock wins (fail-closed).
+	 * whoever bears its name now.  Several rows resolved to the same role
+	 * (standby): the longest lock wins (fail-closed).
 	 */
 	ret = SPI_execute("SELECT a.oid, a.rolname::text, pg_catalog.max(s.locked_until) "
 					  "FROM pass_policy.role_state s "
-					  "JOIN pg_catalog.pg_authid a ON a.oid = "
-					  "pass_policy._resolve_role_oid(s.role_oid, s.role_name, s.cluster_id) "
+					  "CROSS JOIN LATERAL (SELECT pass_policy._resolve_role_oid(s.role_oid, "
+					  "s.role_name, s.cluster_id) AS oid OFFSET 0) x "
+					  "JOIN pg_catalog.pg_authid a ON a.oid = x.oid "
 					  "WHERE s.locked_until IS NOT NULL AND s.locked_until > now() "
 					  "GROUP BY a.oid, a.rolname",
 					  true, 0);

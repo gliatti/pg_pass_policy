@@ -439,13 +439,16 @@ check_eq "constat 2 : fenêtre fermée, connexion acceptée" "regress_h3" "$out"
 
 # --- rechargement seul, sans maintenance préalable (vérifications 12 à 15) ---
 # worker_interval = 0 : le worker ne fait que synchroniser la mémoire partagée
-# (aucun run_maintenance(), donc ni remappage ni purge de role_state). Lignes
-# verrouillées écrites à la main, cluster_id = 42 pour simuler une
-# restauration depuis une autre grappe (SPEC §6.3, « Rechargement ») :
+# (aucun run_maintenance(), donc aucune purge de role_state), mais chaque
+# rechargement rattache d'abord les lignes restaurées (vérification 16,
+# _rebind_foreign_rows()). Lignes verrouillées écrites à la main, cluster_id
+# = 42 pour simuler une restauration depuis une autre grappe (SPEC §6.3,
+# « Rechargement ») :
 # - regress_orphan_x : ligne restaurée dont ni le nom ni l'OID n'existent,
-#   non résolue : ignorée, la fenêtre se ferme ;
+#   non résolue : journalisée ('unresolved') puis supprimée, la fenêtre se
+#   ferme ;
 # - regress_rest : ligne restaurée d'un OID inconnu au nom d'un rôle existant
-#   : réinjectée par le nom ;
+#   : rattachée par le nom dès le rechargement, verrou réinjecté ;
 # - regress_rest3 : ligne restaurée verrouillée et ligne de cette grappe non
 #   verrouillée pour le même rôle : verrouillé (le verrou le plus long
 #   l'emporte, fail-closed ; avec e590e35, la ligne propre l'emportait) ;
@@ -482,8 +485,13 @@ else
 fi
 check_eq "rechargement seul : aucune entrée pour la ligne non résolue" "0" \
 	"$(psql_admin "SELECT count(*) FROM pass_policy.failed_attempts() WHERE role_name = 'regress_orphan_x'")"
-check_eq "rechargement seul : role_state non remappé (aucune maintenance)" "4000000002|42" \
-	"$(psql_admin "SELECT role_oid || '|' || cluster_id FROM pass_policy.role_state WHERE role_name = 'regress_rest'")"
+check_eq "rechargement seul : ligne non résolue journalisée puis supprimée" "1|0" \
+	"$(psql_admin "SELECT (SELECT count(*) FROM pass_policy.audit_log WHERE event_type = 'maintenance'
+	                         AND details->>'action' = 'unresolved' AND role_name = 'regress_orphan_x')
+	                || '|' || (SELECT count(*) FROM pass_policy.role_state WHERE role_name = 'regress_orphan_x')")"
+check_eq "rechargement seul : ligne restaurée rattachée sans maintenance (OID du rôle, grappe courante)" "true|true" \
+	"$(psql_admin "SELECT (role_oid = 'regress_rest'::regrole::oid) || '|' || (cluster_id = pass_policy._system_identifier())
+	                FROM pass_policy.role_state WHERE role_name = 'regress_rest'")"
 out=$(psql_as regress_rest "$GOOD") || true
 check_contains "ligne restaurée, nom existant : verrou réinjecté par le nom" "is locked by pg_pass_policy" "$out"
 out=$(psql_as regress_rest3 "$GOOD") || true
@@ -494,14 +502,15 @@ out=$(psql_as regress_dc "$GOOD_DC" "SELECT current_user") || true
 check_eq "trou 3 : verrou persisté, DROP + CREATE puis redémarrage : le nouveau rôle se connecte" "regress_dc" "$out"
 out=$(psql_as regress_dcf "$GOOD") || true
 check_contains "trou 3, variante : ligne restaurée au nom du rôle : verrouillé" "is locked by pg_pass_policy" "$out"
-# Limite documentée (SPEC §12) : renommé avant la première maintenance, le
-# rôle d'une ligne restaurée encore non remappée la perd (elle ne se résout
-# plus ni par le nom ni par l'OID) ; aucun LOG de retrait au renommage.
+# Renommé après le rechargement, le rôle d'une ligne restaurée la garde :
+# elle a été rattachée à son OID (avec 542b010, elle n'était pas encore
+# remappée et ne se résolvait plus, limite levée par la vérification 16) ;
+# aucun LOG de retrait au renommage.
 psql_admin "ALTER ROLE regress_rest RENAME TO regress_rest2" 2>/dev/null
 kick || fail "pas de tour du worker après le renommage de regress_rest"
 check_eq "rôle renommé : aucun LOG « renamed to »" "0" "$(n_log 'renamed to')"
 out=$(psql_as regress_rest2 "$GOOD" "SELECT current_user") || true
-check_eq "rôle renommé avant la maintenance : ligne restaurée non résolue (limite)" "regress_rest2" "$out"
+check_contains "rôle renommé avant la maintenance : ligne restaurée rattachée, toujours verrouillé" "is locked by pg_pass_policy" "$out"
 
 check_eq "aucun échec de cycle du worker dans le log" "0" "$(n_log 'pg_pass_policy: worker .* failed')"
 

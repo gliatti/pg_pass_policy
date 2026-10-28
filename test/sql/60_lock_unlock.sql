@@ -123,6 +123,13 @@ DROP ROLE regress_lock_ren3;
 -- Fonctions internes par OID : un OID sans rôle est refusé (42704)
 SELECT ppp_test.try($$SELECT pass_policy._shmem_lock(4000000001, NULL)$$) AS shmem_lock_bad_oid;
 SELECT count(*) AS bad_oid_tracked FROM pass_policy.failed_attempts() WHERE role_oid = 4000000001;
+-- OID 0 (vérification 16) : refusé explicitement (22023 « invalid role OID »),
+-- sans clé de hash sans nom (le backend plantait avec 542b010)
+SELECT ppp_test.try($$SELECT pass_policy._shmem_unlock(0)$$) AS shmem_unlock_zero,
+       ppp_test.try($$SELECT pass_policy._shmem_reset(0)$$) AS shmem_reset_zero,
+       ppp_test.try($$SELECT pass_policy._shmem_is_locked(0)$$) AS shmem_is_locked_zero,
+       ppp_test.try($$SELECT pass_policy._shmem_lock(0)$$) AS shmem_lock_zero;
+SELECT pass_policy._shmem_is_locked(0);
 
 -- failed_attempts() : colonnes attendues (role_oid ajoutée, vérification 15)
 SELECT pg_get_function_result('pass_policy.failed_attempts()'::regprocedure) AS failed_attempts_columns;

@@ -368,16 +368,19 @@ SELECT pass_policy.unlock_role('regress_rx');
 SELECT pass_policy.unassign_profile(r) FROM unnest(ARRAY['regress_rx', 'regress_ry']) r;
 DROP TABLE rb_oids;
 
--- Étape a0 (vérification 15) : seules les lignes restaurées d'une autre
--- grappe (cluster_id différent du system_identifier courant, simulé ici par
--- 42) sont rattachées : par le nom (regress_fx), en fusionnant avec la ligne
--- de cette grappe qui existe déjà pour l'OID cible (regress_fy : le verrou le
--- plus long l'emporte), ou par leur OID s'il existe et que le nom n'est porté
--- par personne (regress_fw, cas de pg_upgrade) ; une ligne restaurée dont le
--- rôle est introuvable reste en place (ni appliquée ni purgée). Une ligne de
--- cette grappe dont l'OID a disparu n'est jamais rattachée par le nom, même
--- quand un rôle porte de nouveau ce nom (regress_fo supprimé puis recréé) :
--- elle est purgée, le nouveau rôle n'hérite pas du verrou.
+-- Étape a0 (vérifications 15 et 16) : seules les lignes restaurées d'une
+-- autre grappe (cluster_id différent du system_identifier courant, simulé ici
+-- par 42) sont rattachées (_rebind_foreign_rows()) : par leur OID s'il existe
+-- (regress_fw, cas de pg_upgrade), sinon par le nom (regress_fx), en
+-- fusionnant avec la ligne de cette grappe qui existe déjà pour le rôle
+-- (regress_fy : le verrou le plus long l'emporte) ; une ligne restaurée dont
+-- le rôle est introuvable est journalisée (action 'unresolved') puis
+-- supprimée (avec 542b010, elle restait en place). Une ligne de cette grappe
+-- dont l'OID a disparu n'est jamais rattachée par le nom, même quand un rôle
+-- porte de nouveau ce nom (regress_fo supprimé puis recréé) : elle est
+-- purgée, le nouveau rôle n'hérite pas du verrou. Insertion et passe dans une
+-- même transaction : un rechargement du worker (qui rattache lui aussi) ne
+-- peut pas passer entre les deux.
 CREATE ROLE regress_fx LOGIN;
 CREATE ROLE regress_fy LOGIN;
 CREATE ROLE regress_fw LOGIN;
@@ -386,6 +389,7 @@ SELECT pass_policy.lock_role('regress_fo', NULL, 'old fo') = 'infinity' AS locke
 DROP ROLE regress_fo;
 CREATE ROLE regress_fo LOGIN;
 SELECT pass_policy.unlock_role('regress_fy');
+BEGIN;
 INSERT INTO pass_policy.role_state (role_oid, role_name, locked_until, locked_by, lock_reason, cluster_id)
 VALUES (4000000011, 'regress_fx', 'infinity', 'manual', 'restored fx', 42),
        (4000000012, 'regress_fy', 'infinity', 'manual', 'restored fy', 42),
@@ -399,6 +403,7 @@ SELECT s.role_name, s.cluster_id = pass_policy._system_identifier() AS local
  WHERE s.role_name IN ('regress_fx', 'regress_fy', 'regress_fw_old', 'regress_fz_absent', 'regress_fo')
  ORDER BY 1, 2;
 CREATE TEMP TABLE m_a0 AS SELECT * FROM pass_policy.run_maintenance();
+COMMIT;
 SELECT action, role_name, details->>'table' AS tbl, coalesce(details->>'merged', 'false') AS merged
   FROM m_a0 WHERE role_name LIKE 'regress\_f%' ORDER BY 2, 3, 1;
 SELECT s.role_name, s.role_oid = s.role_name::regrole::oid AS oid_ok,
@@ -410,14 +415,62 @@ SELECT p.role_name, p.role_oid = p.role_name::regrole::oid AS oid_ok,
        p.cluster_id = pass_policy._system_identifier() AS local
   FROM pass_policy.role_profile p WHERE p.role_name = 'regress_fx';
 SELECT role_oid, cluster_id FROM pass_policy.role_state WHERE role_name = 'regress_fz_absent';
+SELECT role_name, details->>'action' AS action, details->>'table' AS tbl,
+       details->>'old_oid' AS old_oid, details->'row'->>'lock_reason' AS lock_reason
+  FROM pass_policy.audit_log
+ WHERE event_type = 'maintenance' AND details->>'action' = 'unresolved'
+   AND role_name = 'regress_fz_absent';
 SELECT count(*) AS fo_inherited FROM pass_policy.role_state
  WHERE role_oid = 'regress_fo'::regrole::oid AND locked_until IS NOT NULL;
 -- une seconde passe ne trouve plus rien à rattacher
 SELECT count(*) AS second_a0 FROM pass_policy.run_maintenance() WHERE action = 'remap';
 SELECT pass_policy.unlock_role(r) FROM unnest(ARRAY['regress_fx', 'regress_fy', 'regress_fw']) r;
 SELECT pass_policy.unassign_profile('regress_fx');
-DELETE FROM pass_policy.role_state WHERE role_name = 'regress_fz_absent';
 DROP TABLE m_a0;
+
+-- (vérification 16, b) ligne restaurée portant l'OID d'un rôle local
+-- (regress_gb) sous le nom d'un autre rôle (regress_ga), puis
+-- lock_role(regress_gb) : la ligne est rattachée à regress_gb (son OID)
+-- avant l'écriture, journalisée ('remap') et fusionnée, jamais réécrite en
+-- place sous un autre nom ; aucune ligne pour regress_ga (avec 542b010, la
+-- ligne restait restaurée, cluster_id 42, renommée en place)
+CREATE ROLE regress_ga LOGIN;
+CREATE ROLE regress_gb LOGIN;
+BEGIN;
+INSERT INTO pass_policy.role_state (role_oid, role_name, password_changed_at, must_change,
+                                    locked_until, locked_by, lock_reason, cluster_id)
+SELECT 'regress_gb'::regrole::oid, 'regress_ga', now() - interval '1 day', true,
+       'infinity', 'manual', 'restored ga', 42;
+SELECT pass_policy.lock_role('regress_gb', '1 hour', 'local gb') > now() AS locked;
+SELECT s.role_name, s.cluster_id = pass_policy._system_identifier() AS local,
+       s.must_change, s.lock_reason, s.password_changed_at < now() AS changed_kept
+  FROM pass_policy.role_state s WHERE s.role_oid = 'regress_gb'::regrole::oid;
+SELECT count(*) AS ga_rows FROM pass_policy.role_state WHERE role_name = 'regress_ga';
+SELECT role_name, details->>'action' AS action, details->>'table' AS tbl,
+       (details->>'old_oid')::oid = 'regress_gb'::regrole::oid AS same_oid, details->>'old_name' AS old_name
+  FROM pass_policy.audit_log
+ WHERE event_type = 'maintenance' AND details->>'action' = 'remap'
+   AND role_name IN ('regress_ga', 'regress_gb');
+COMMIT;
+SELECT pass_policy.unlock_role('regress_gb');
+
+-- (vérification 16, c) cas pg_upgrade : ligne restaurée dont l'OID existe
+-- sous un autre nom (regress_uc_new) et dont le nom est porté par un autre
+-- rôle (regress_uc_old) : rattachée par l'OID (avec 542b010, par le nom)
+CREATE ROLE regress_uc_new LOGIN;
+CREATE ROLE regress_uc_old LOGIN;
+BEGIN;
+INSERT INTO pass_policy.role_state (role_oid, role_name, locked_until, locked_by, lock_reason, cluster_id)
+SELECT 'regress_uc_new'::regrole::oid, 'regress_uc_old', 'infinity', 'manual', 'upgraded', 42;
+CREATE TEMP TABLE m_uc AS SELECT * FROM pass_policy.run_maintenance();
+SELECT action, role_name, details->>'table' AS tbl FROM m_uc WHERE role_name LIKE 'regress\_uc%';
+SELECT s.role_name, s.role_oid = s.role_name::regrole::oid AS oid_ok,
+       s.cluster_id = pass_policy._system_identifier() AS local,
+       s.locked_until = 'infinity' AS locked, s.lock_reason
+  FROM pass_policy.role_state s WHERE s.role_name LIKE 'regress\_uc%' ORDER BY 1;
+COMMIT;
+SELECT pass_policy.unlock_role('regress_uc_new');
+DROP TABLE m_uc;
 
 -- Étape a : une ligne d'historique encore sans OID dont le rôle existe n'est
 -- pas purgée (elle est rattachée par a0, ou à la passe suivante si le rôle

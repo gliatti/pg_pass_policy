@@ -361,7 +361,8 @@ inexistants que pour un superutilisateur : un nom saisi dans le champ
 utilisateur peut être un mot de passe. Les autres appelants
 (`pass_policy_viewer`, `pass_policy_admin`) en reçoivent une seule ligne de
 `role_name` et `role_oid` NULL (compteurs additionnés), y compris pour un nom
-qu'un rôle porte depuis (ses propres échecs ont leur ligne).
+qu'un rôle porte depuis (ses propres échecs ont leur ligne) ; les entrées
+des rôles supprimés y sont repliées aussi (ni dernier nom ni ancien OID).
 `lock_role()` refuse un rôle de `exempt_roles` (`22023`) : le hook ignore le
 verrou d'un rôle exempté, qui s'appliquerait par surprise à sa sortie de la
 liste.
@@ -498,10 +499,21 @@ compte comme « spécial ».
   l'ancien OID d'un rôle peut appartenir à un autre. Les lignes de
   `role_state` et `role_profile` portent la grappe qui les a écrites
   (`cluster_id`) : restaurées dans une grappe d'un autre `system_identifier`
-  (autre `initdb`, `pg_upgrade`), elles sont rattachées au rôle de leur nom,
-  sinon à leur OID s'il existe, par le rechargement du worker puis par
-  l'étape a0 de `run_maintenance()` ; une ligne dont le rôle est introuvable
-  reste en place sans s'appliquer. Une **grappe clonée** (`pg_basebackup`,
+  (autre `initdb`, `pg_upgrade`), elles sont rattachées à leur OID s'il
+  existe (`pg_upgrade` garde les OID), sinon au rôle de leur nom, et
+  deviennent des lignes de la grappe, fusionnées avec celles du rôle (le
+  verrou le plus long l'emporte). Ce rattachement est fait au début de
+  chaque rechargement du worker, à l'étape a0 de `run_maintenance()` et
+  avant toute écriture de `lock_role()`, `unlock_role()`, `expire_password()`,
+  `assign_profile()`, d'un changement de mot de passe… ; chaque ligne
+  rattachée est journalisée (`maintenance`, `details.action = 'remap'`, avec
+  l'ancien OID et l'ancien nom). Une ligne dont le rôle est introuvable est
+  journalisée (`details.action = 'unresolved'`, ligne complète) puis
+  supprimée : restaurer les rôles **avant** les données de l'extension.
+  Limite : restaurée par `pg_dump` / `pg_restore` dans une grappe où son OID
+  d'origine appartient à un autre rôle, une ligne va à ce rôle (son verrou
+  s'applique à lui, pas au rôle d'origine) ; un `remap` dont `old_name`
+  diffère du nom du rôle signale ce cas, à corriger à la main. Une **grappe clonée** (`pg_basebackup`,
   copie de fichiers) a le même `system_identifier` : ses lignes passent pour
   locales, rattachées par OID seulement, et `run_maintenance()` laissé seul
   réétiquetterait les verrous, profils et historiques d'un rôle au nom de
@@ -515,11 +527,12 @@ compte comme « spécial ».
   2. restaurer les rôles (`pg_dumpall --roles-only`) puis la base
      (`pg_restore`) ;
   3. en superutilisateur, `SELECT * FROM pass_policy.rebind_restored_roles();`
-     **avant** le premier `run_maintenance()` : chaque ligne de `role_state`,
-     `role_profile` et `password_history` dont le couple (OID, nom) ne
-     correspond à aucun rôle est rattachée au rôle de ce nom (`rebind`), ou
-     supprimée si aucun rôle ne porte ce nom (`purge`), et devient une ligne
-     de la grappe (`cluster_id`) ; une ligne `maintenance` est écrite dans
+     **avant** le premier `run_maintenance()` : les lignes restaurées d'une
+     autre grappe sont d'abord rattachées comme ci-dessus (`remap`,
+     `unresolved`) ; puis chaque ligne de `role_state`, `role_profile` et
+     `password_history` dont le couple (OID, nom) ne correspond à aucun rôle
+     est rattachée au rôle de ce nom (`rebind`), ou supprimée si aucun rôle
+     ne porte ce nom (`purge`) ; une ligne `maintenance` est écrite dans
      l'audit ;
   4. remettre `enabled` à `on` (et réactiver la planification éventuelle) :
      le premier tour du worker recharge la mémoire partagée depuis les
