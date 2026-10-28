@@ -96,22 +96,25 @@ d'administration sont `SECURITY DEFINER` et vérifient l'appartenance).
 
 ### 3.2 `role_profile`
 
-`role_oid oid PK, role_name text NOT NULL, profile_id int REFERENCES profile,
+`role_oid oid, role_name text NOT NULL, profile_id int REFERENCES profile,
 assigned_at timestamptz, assigned_by text, cluster_id bigint NOT NULL DEFAULT
-_system_identifier()`. Un rôle sans ligne utilise le profil
+_system_identifier()`, clé primaire `(role_oid, cluster_id)` (vérification
+17), index sur `cluster_id`. Un rôle sans ligne utilise le profil
 `default`. Pas de FK vers `pg_authid` : le worker purge les rôles disparus.
 `cluster_id` (vérification 15) : `system_identifier` de la grappe qui a écrit
 la ligne (`GetSystemIdentifier()`), emporté par `pg_dump` ; une ligne d'une
-autre valeur est une ligne restaurée, rattachée à son rôle par
-`_rebind_foreign_rows()` (vérification 16 : au début de chaque rechargement
-du worker hors standby, à l'étape a0 de `run_maintenance()` et avant toute
-écriture de l'API SQL, §6.3, « rechargement »).
+autre valeur est une ligne restaurée, **inerte** (vérification 17) : elle
+coexiste avec la ligne locale du même OID, n'est ni lue ni écrite par l'API,
+les vues, le hook et le worker (prédicat unique `cluster_id =
+_system_identifier()`, servi par la clé primaire), et n'est rattachée à son
+rôle par `_rebind_foreign_rows()` qu'à l'étape a0 de `run_maintenance()` et
+par `rebind_restored_roles()` (§6.3, « rechargement »).
 
 ### 3.3 `role_state`
 
 | colonne | type | rôle |
 |---|---|---|
-| role_oid oid PK, role_name text | | |
+| role_oid oid, role_name text | | clé primaire `(role_oid, cluster_id)` (vérification 17) |
 | password_changed_at timestamptz | date du dernier changement connu |
 | expires_at timestamptz | changed_at + max_age (NULL si pas d'expiration) |
 | grace_until timestamptz | expires_at + grace_period |
@@ -121,7 +124,8 @@ du worker hors standby, à l'étape a0 de `run_maintenance()` et avant toute
 | lock_reason text | |
 | must_change bool | forcé par `expire_password()` |
 | valid_until_synced timestamptz | dernière valeur écrite dans pg_authid.rolvaliduntil par l'extension |
-| cluster_id bigint NOT NULL DEFAULT `_system_identifier()` | origine de la ligne, comme dans `role_profile` (vérification 15) |
+| cluster_id bigint NOT NULL DEFAULT `_system_identifier()` | origine de la ligne, comme dans `role_profile` (vérification 15) ; ligne restaurée inerte jusqu'à son rattachement (vérification 17) |
+
 
 ### 3.4 `password_history`
 
@@ -183,8 +187,8 @@ dans `format('%I')` / `quote_ident()` : aucune concaténation brute.
 | `lock_role(role name, duration interval DEFAULT NULL, reason text DEFAULT NULL)` | timestamptz | refusée pour un rôle de `exempt_roles` (`_require_not_exempt()`, même refus qu'`expire_password()`) ; NULL = manuel ; met à jour `role_state` (dont `role_name` = nom courant) + `shmem_lock_role` ; renvoie le `locked_until` posé (`infinity` pour un verrou manuel) |
 | `unlock_role(role name)` | void | `_ensure_state()` (ligne `role_state` créée si absente, `role_name` = nom courant) puis `role_state` + `shmem_unlock_role` + `shmem_reset_failures` ; audit `role_unlocked` seulement si le rôle était verrouillé (`role_state.locked_until` non NULL ou verrou actif en shmem d'après `_shmem_is_locked()`), sinon NOTICE sans audit |
 | `record_password_change(role text, verifier text)` | void | appelée **par le hook C** via SPI après acceptation ; insère l'historique, tronque à `history_count`, met à jour `role_state`, audit `password_changed` |
-| `rebind_restored_roles()` | TABLE(action text, role_name text, details jsonb) | superutilisateur seulement : appelle d'abord `_rebind_foreign_rows()` (vérification 16), puis, pour une restauration dans un clone (même `system_identifier`), rattache par nom les lignes de `role_state`, `role_profile` et `password_history` dont le couple (`role_oid`, `role_name`) ne correspond à aucun rôle (nom inexistant → purge) ; à appeler avant le premier `run_maintenance()` (README) |
-| `run_maintenance()` | TABLE(action text, role_name text, details jsonb) | ce que fait le worker (appelable par pg_cron) : sync VALID UNTIL, alertes, expirations, déverrouillages auto, purge rôles disparus, réconciliation `pg_authid.rolpassword` vs historique, `shmem_reload()` ; une passe à la fois (`pg_advisory_xact_lock`) |
+| `rebind_restored_roles(p_purge_unresolved bool DEFAULT false)` | TABLE(action text, role_name text, details jsonb) | superutilisateur seulement : appelle d'abord `_rebind_foreign_rows(p_purge_unresolved)` (vérification 17 : avec `true`, les lignes restaurées non résolues sont supprimées et journalisées, `purge` ; sinon elles restent inertes), puis, pour une restauration dans un clone (même `system_identifier`), rattache par nom les lignes locales de `role_state`, `role_profile` et `password_history` dont le couple (`role_oid`, `role_name`) ne correspond à aucun rôle (nom inexistant → purge) ; à appeler avant le premier `run_maintenance()` (README) |
+| `run_maintenance()` | TABLE(action text, role_name text, details jsonb) | ce que fait le worker (appelable par pg_cron) : sync VALID UNTIL, alertes, expirations, déverrouillages auto, purge rôles disparus, réconciliation `pg_authid.rolpassword` vs historique, `shmem_reload()` ; une passe à la fois (`pg_advisory_xact_lock`) ; étape a0 : rattachement des lignes restaurées (`_rebind_foreign_rows()`), puis, s'il en reste de non rattachées, une ligne `action = 'unbound'`, `details.rows` = leur nombre (vérification 17 ; pas une action : aucune ligne d'audit `maintenance` pour elle) |
 | `create_rotation_pair(pair text, role_a name, role_b name, group_role name)` | void | crée les rôles manquants (`LOGIN`, membres du groupe) |
 | `switch_rotation_pair(pair text, length int DEFAULT NULL)` | TABLE(active_role text, password text, previous_role text, previous_valid_until timestamptz) | longueur comme `rotate_password()` |
 | `purge_audit(older_than interval DEFAULT '365 days')` | bigint | |
@@ -192,8 +196,9 @@ dans `format('%I')` / `quote_ident()` : aucune concaténation brute.
 | `audit(event_type text, role_name text, details jsonb DEFAULT '{}')` | void | insère + `pg_notify(current_setting('pg_pass_policy.notify_channel'), json)` ; utilisée par toutes les autres ; `EXECUTE` à `pass_policy_admin` seulement |
 | `failed_attempts()` | TABLE(role_name text, failed_count int, first_failure_at timestamptz, last_failure_at timestamptz, locked_until timestamptz, role_oid oid) | **C** — lit la shmem ; `role_oid` (vérification 15) est la clé de l'entrée, NULL pour une pseudo-entrée (nom sans rôle quand il a été essayé) ; `role_name` est le nom courant du rôle (recherche `AUTHOID` sur la copie, hors LWLock), ou le dernier nom connu de l'entrée une fois l'OID disparu ; les pseudo-entrées ne sont nommées que pour un superutilisateur : pour les autres (viewer, admin), toutes sont regroupées en une seule ligne, `role_name` et `role_oid` NULL (somme des compteurs, premier et dernier échec, verrou le plus tardif), d'après la clé seule (un rôle créé ensuite sous le nom a sa propre entrée) ; l'entrée d'un rôle supprimé (OID absent de `pg_authid`, `role_dropped` ou pas encore) est repliée dans la même ligne (vérification 16) |
 | `_shmem_lock(role oid, until timestamptz)`, `_shmem_unlock(role oid, expired_only bool)`, `_shmem_reset(role oid)`, `_shmem_is_locked(role oid)` | void / bool / void / bool | **C**, internes, superutilisateur (vérification 15) — versions par OID de `shmem_lock_role()`, `shmem_unlock_role()` et `shmem_reset_failures()`, appelées par `lock_role()`, `unlock_role()` et l'étape f de `run_maintenance()` avec l'OID vérifié ; `_shmem_lock()` refuse un OID sans rôle (`42704`), les trois autres refusent l'OID 0 (`22023`, « invalid role OID », vérification 16) ; `_shmem_is_locked()` : vrai si la shmem porte un verrou actif de l'OID (`HASH_FIND`), utilisée par `unlock_role()` |
-| `_system_identifier()`, `_resolve_role_oid(oid, text, bigint)` | bigint / oid | internes (vérification 15) — `system_identifier` de pg_control (défaut de `cluster_id`) ; rôle auquel appartient une ligne de `role_state` / `role_profile` (vérification 16 : son OID s'il existe, sinon, pour une ligne restaurée seulement, le rôle de son nom, §6.3) |
-| `_rebind_foreign_rows()` | TABLE(action text, role_name text, details jsonb) | interne (vérification 16), aucun `GRANT` — seul rattachement des lignes restaurées d'une autre grappe : chaque ligne de `role_state` / `role_profile` dont le `cluster_id` diffère est retirée, résolue une fois (`_resolve_role_oid()`, `LATERAL`), puis réinsérée sous l'OID et le nom courant de son rôle avec le `cluster_id` courant (`remap`, audité : `maintenance`, `details.action = 'remap'`, ancien OID et ancien nom), fusionnée avec la ligne déjà là (`role_state` : verrou le plus long, dates les plus récentes, `must_change` si l'une l'a, `verifier_pending` de la ligne déjà là ; `role_profile` : `DO NOTHING`, l'affectation déjà là l'emporte), ou, non résolue, journalisée (`maintenance`, `details.action = 'unresolved'`, ligne complète) puis supprimée ; appelée par l'étape a0 de `run_maintenance()`, le rechargement du worker hors standby, `rebind_restored_roles()`, `_ensure_state()` (donc `lock_role()`, `unlock_role()`, `expire_password()`), `_record_password_change()`, `assign_profile()`, `unassign_profile()` et `drop_profile()` |
+| `_system_identifier()`, `_resolve_role_oid(oid, text)`, `_unbound_count()` | bigint / oid / bigint | internes (vérification 15) — `system_identifier` de pg_control (défaut de `cluster_id` ; `EXECUTE` accordé au viewer et à l'admin pour les vues, vérification 17) ; rôle auquel appartient une ligne restaurée (vérification 17 : le rôle de son nom, sinon celui de son OID si aucun rôle ne porte le nom, sinon personne, §6.3) ; nombre de lignes restaurées non rattachées (`cluster_id <` ou `>` la valeur courante, servi par les index sur `cluster_id`), lu par le rechargement du worker et `run_maintenance()` |
+| `_rebind_foreign_rows(p_purge_unresolved bool DEFAULT false)` | TABLE(action text, role_name text, details jsonb) | interne (vérifications 16 et 17), aucun `GRANT` — seul rattachement des lignes restaurées d'une autre grappe, en une instruction : chaque ligne de `role_state` / `role_profile` dont le `cluster_id` diffère est résolue une fois (`_resolve_role_oid()`, `LATERAL`), écrite comme ligne locale de son rôle (OID et nom courant, `cluster_id` courant) puis supprimée (`remap`, audité : `maintenance`, `details.action = 'remap'`, ancien OID, ancien nom, `merged`) ; fusion avec la ligne locale (vérification 17) : la ligne locale garde toutes ses dates (`password_changed_at`, `expires_at`, `grace_until`, `last_warned_at`, `valid_until_synced`, `verifier_pending`), seuls le verrou (le plus long, avec son auteur et sa raison) et `must_change` (OU) sont fusionnés ; entre lignes restaurées du même rôle, les dates du changement le plus récent et le verrou le plus long ; `role_profile` : `DO NOTHING`, l'affectation locale l'emporte, entre lignes restaurées la plus récente par `assigned_at` (comparé en `timestamptz`) ; non résolue, la ligne reste inerte, jamais supprimée automatiquement (avec `p_purge_unresolved` seulement : supprimée et journalisée, `details.action = 'purge'`, ligne complète) ; appelée par l'étape a0 de `run_maintenance()` et par `rebind_restored_roles()` seulement |
+
 | `shmem_reload()` | void | **C** — superutilisateur seulement (comme les autres `shmem_*`) ; demande, à la validation de la transaction appelante, au worker de recharger les paramètres de verrouillage dans la shmem (un ROLLBACK annule la demande) |
 | `shmem_lock_role(role text, until timestamptz)` | void | **C** — usage direct par un superutilisateur (standby compris) ; `until` NULL = manuel (DT_NOEND) ; écriture shmem différée au COMMIT (annulée par ROLLBACK / ROLLBACK TO SAVEPOINT) ; nom sans rôle : ERROR `42704` ; l'OID du rôle est capturé à l'appel et le verrou appliqué à cet OID au PRE_COMMIT (un renommage dans la transaction n'y change rien) |
 | `shmem_unlock_role(role text, expired_only boolean DEFAULT false)` | bool | **C** — vise l'OID du rôle qui porte le nom, ou, sans rôle de ce nom, la pseudo-entrée du nom (levée d'un pseudo-verrou) ; différée au COMMIT ; ne lève pas un verrou automatique posé après la demande ; `expired_only` : ne lève qu'un verrou expiré (étape f de `run_maintenance()`) et renvoie false, sans rien différer, si la shmem porte un verrou actif au moment de l'appel ; true sinon |
@@ -586,16 +591,14 @@ verrou soit encore actif ou déjà expiré ; un verrou expiré est conservé
 dans l'entrée tant que l'audit est en attente, `ppp_expire_lock()`).
 
 Pour un rôle, l'upsert de `role_state` vient **d'abord**, par OID (CTE :
-`pg_authid` de l'OID, puis `INSERT … ON CONFLICT (role_oid) DO UPDATE …`),
+`pg_authid` de l'OID, puis `INSERT … ON CONFLICT (role_oid, cluster_id) DO UPDATE …`),
 et la ligne `role_locked` découle de
 son résultat, sans recherche préalable qui pourrait courir avec l'écriture :
 écrite, l'audit porte le nom courant du rôle ; OID disparu (rôle supprimé),
 rien n'est écrit dans `role_state` et l'audit porte le dernier nom connu de
-l'entrée et `details.role_dropped = true`. La ligne de l'OID est celle du
-rôle : chaque rechargement rattache d'abord les lignes restaurées
-(`_rebind_foreign_rows()`), et une ligne restaurée depuis sous cet OID
-appartient de toute façon à ce rôle (`_resolve_role_oid()` : l'OID d'abord ;
-vérification 16, garde `cluster_id` et `lock_kept` supprimés). Le
+l'entrée et `details.role_dropped = true`. L'upsert ne porte que sur la
+ligne locale de l'OID (`cluster_id` par défaut) : une ligne restaurée du
+même OID est une autre ligne, inerte, jamais touchée (vérification 17). Le
 `role_locked` automatique porte aussi `details.role_oid`. Les `auth_failed`
 d'un rôle portent son nom courant (`pg_authid` par OID), ou le dernier nom
 connu une fois l'OID disparu. Les pseudo-entrées ne
@@ -627,27 +630,33 @@ pseudo-entrées sans pseudo-verrou actif ni rien à journaliser dont le
 dernier échec est plus ancien que leur `failure_window` (24 h si la fenêtre
 est ≤ 0).
 
-Hors standby, la transaction du rechargement commence par
-`_rebind_foreign_rows()` (vérification 16), avant toute lecture : les lignes
-restaurées d'une autre grappe sont rattachées à leur rôle et fusionnées, ou
-journalisées puis supprimées si elles ne se résolvent pas ; il n'en reste
-plus aucune. Il réinjecte ensuite les verrous de `role_state`, **par OID**,
-résolus une fois par ligne (`LATERAL … OFFSET 0`) par
-`_resolve_role_oid(role_oid, role_name, cluster_id)` : l'OID de la ligne
-s'il existe (ligne de cette grappe ; ligne restaurée après pg_upgrade, qui
-garde les OID), sinon, pour une ligne restaurée seulement, le rôle qui porte
-son nom (pg_dump / pg_restore), sinon personne ; une ligne de cette grappe
-dont l'OID n'existe plus est ignorée, quel que soit le rôle qui porte son nom
-(rôle supprimé puis recréé : plus de réinjection sur le rôle recréé). Un
-standby ne peut pas écrire : la même résolution s'y fait en mémoire, sans
-rattacher. Plusieurs lignes résolues vers le même rôle (standby) : le verrou
-le plus long l'emporte (fail-closed). Seules les lignes résolues
-comptent pour la fenêtre de démarrage. Puis il recharge les paramètres des
-profils (`max_failures`, `failure_window`, `lock_duration`, bornés à
-2^31 − 1 s ≈ 68 ans avant conversion en `int4`) pour chaque rôle de
-`role_profile` résolu de même (une ligne de cette grappe l'emporte sur une
-ligne restaurée du même rôle) + les valeurs du profil `default` dans
-`ppp_shared->default_*`. Sur un standby, les OID sont répliqués avec
+Le rechargement est en **lecture seule** (vérification 17, qui remplace la
+vérification 16 : plus de rattachement au rechargement, une erreur
+d'écriture ne peut plus l'empêcher de charger les verrous). Il réinjecte
+les verrous des seules lignes locales de `role_state` (`cluster_id =
+_system_identifier()`), **par OID** (jointure sur `pg_authid`) : une ligne
+dont l'OID n'existe plus est ignorée, quel que soit le rôle qui porte son
+nom (rôle supprimé puis recréé : plus de réinjection sur le rôle recréé).
+Seules ces lignes comptent pour la fenêtre de démarrage. Puis il recharge
+les paramètres des profils (`max_failures`, `failure_window`,
+`lock_duration`, bornés à 2^31 − 1 s ≈ 68 ans avant conversion en `int4`)
+pour chaque rôle d'une ligne locale de `role_profile` + les valeurs du
+profil `default` dans `ppp_shared->default_*`. Les lignes restaurées d'une
+autre grappe sont **inertes** : aucun verrou ni profil n'en est tiré ; le
+rechargement en compte le nombre (`_unbound_count()`, sur les index de
+`cluster_id`) et émet, s'il est non nul, un WARNING au plus une fois par
+heure (horodatage en mémoire du worker, remis à zéro quand le compte
+retombe à 0) : « N rows restored from another cluster are not bound: run
+pass_policy.run_maintenance() or rebind_restored_roles() ». Seules l'étape
+a0 de `run_maintenance()` et `rebind_restored_roles()` les rattachent
+(`_rebind_foreign_rows()`), par le **nom** d'abord (`_resolve_role_oid()` :
+restauration par pg_dump / pg_restore, où les OID diffèrent et se
+chevauchent couramment à partir de 16384), sinon par l'OID si aucun rôle ne
+porte le nom et que l'OID existe (pg_upgrade, qui garde les OID de
+`pg_authid`, suivi d'un renommage), sinon jamais : la ligne reste inerte,
+jamais supprimée automatiquement (`rebind_restored_roles(true)` la
+supprime, journalisée). Limites en §12. Sur un standby, les OID sont répliqués avec
+
 `pg_authid` et le `system_identifier` est celui du primaire : la logique est
 la même.
 Un verrou `lock_from_state` (réinjecté depuis `role_state`, ou posé par
@@ -1037,6 +1046,7 @@ basic ou en-tête reverse-proxy (`REMOTE_USER`), rôle PG dédié membre de
 - (vérification 14) Revue de `7ab9ae9..63a6575` : le contrôle par OID de la vérification 13 rendait le hook **permissif** dans plusieurs cas. Principe non négociable retenu : dans le doute, le verrou s'applique (fail-closed). (1) Verrou d'un autre rôle avec audit en attente : la connexion passait sans rien compter, d'où une force brute illimitée pendant la fenêtre (jusqu'à la promotion sur un standby) ; elle est désormais **refusée comme verrouillée**, quel que soit le statut, jusqu'à l'audit (limite §12 : disponibilité sacrifiée à la sûreté). (2) Un verrou à `lock_role_oid` invalide cédait dès que le nom avait un rôle ; il ne cède plus que s'il s'agit d'un pseudo-verrou certain (nouveau drapeau `lock_on_missing`, posé par le hook quand la recherche a été faite et que le nom n'avait pas de rôle ; effacé par `shmem_lock_role()` et la réinjection) et que le rôle existe maintenant ; tout autre verrou d'OID inconnu s'applique, comme un verrou quand la recherche est sautée ou échoue (`ppp_lock_is_foreign()`). (3) `ppp_restart_entry()` gardait les paramètres du profil de l'ancien rôle et ne demandait aucun rechargement : elle appelle maintenant `ppp_init_entry()` (valeurs par défaut) et lève `reload_requested` (le worker est réveillé après le relâchement du verrou, `ppp_signal_worker_reload()`) : le rechargement fixe le profil du nouveau rôle et réinjecte sous son nouveau nom le verrou persisté d'un rôle renommé. (4) Les compteurs d'un rôle supprimé étaient hérités par le rôle recréé sous le même nom (quatre échecs audités + un échec du nouveau rôle = verrou) : nouveau champ `owner_oid`, posé à chaque échec compté ; à un échec à compter ou à un succès, une entrée dont `owner_oid` est valide et différent de l'OID du rôle est remise à zéro (même chemin que (3)) si elle est réglée, sinon la connexion est refusée comme verrouillée (« temporarily locked »), bon mot de passe compris, jusqu'au tour du worker. (5) Renommage : le nettoyage retirait l'entrée de l'ancien nom même quand `role_state` n'avait pas le verrou, qui était alors perdu ; il ne la retire plus que si `role_state` a, pour l'OID, une ligne dont `locked_until` couvre le verrou (`ppp_lock_persisted()`, requête SPI sous un instantané récent) et que l'instance n'est pas un standby ; sinon l'entrée reste sous l'ancien nom, sans LOG (limite §12 : le verrou local d'un standby ne suit pas le renommage). (6) Repli par nom du rechargement conservé (sûreté après restauration) ; le cas `DROP ROLE` puis `CREATE ROLE` du même nom avant la maintenance, qui peut verrouiller le nouveau rôle, est documenté comme fail-closed (§12). (7) L'ERROR `42704` au PRE_COMMIT de la vérification 13 est retirée : `shmem_lock_role()` capture l'OID à l'appel (le rôle existe alors, sinon `42704` comme avant), passé à `ppp_defer_op()`, et le PRE_COMMIT l'utilise même si le rôle a été renommé ou supprimé dans la transaction ; le nettoyage du worker gère ensuite renommage et suppression. (8) La recherche `ppp_role_lookup()` n'est plus faite à chaque connexion : `HASH_FIND` d'abord sous verrou partagé, recherche seulement pour un échec à compter, pendant la fenêtre de démarrage, ou si l'entrée porte un verrou actif ou, pour que (4) ne soit pas un oracle, quelque chose en attente pour un OID connu (`ppp_lookup_needed()`) ; si l'entrée retrouvée sous le verrou exclusif en a besoin entre-temps, le verrou est relâché pour la recherche et repris. Tests (tous échouent avec `63a6575`, vérifié) : `lockout.sh` (`DROP ROLE` + `CREATE ROLE` avec verrou en attente d'audit → connexion du nouveau rôle refusée ; quatre échecs audités, `DROP ROLE` + `CREATE ROLE`, un échec → compteur à 1 sans verrou, puis connexion réussie ; mêmes échecs non audités → nouveau rôle refusé, accepté après le tour du worker ; verrou permanent non persisté d'un rôle renommé avant l'audit → entrée conservée sous l'ancien nom, aucun LOG de retrait ; scénario `regress_ren` : aucun LOG de retrait), `hashfull.sh` (pseudo-verrou d'un nom inventé, rôle créé avant l'audit → refusé, accepté après le tour du worker ; rôle réinjecté par le nom puis renommé, ligne `role_state` d'un OID périmé → aucun LOG de retrait), `standby.sh` (verrou local d'un rôle renommé : aucun LOG de retrait, verrou conservé sous l'ancien nom après deux tours du worker du standby ; le rôle recréé sous l'ancien nom se connecte), `60_lock_unlock` (`shmem_lock_role()` puis `ALTER ROLE … RENAME` dans la même transaction → COMMIT accepté, verrou sous l'ancien nom). Le cas d'un verrou d'OID inconnu qui n'est pas un pseudo-verrou (recherche sautée) n'est pas atteignable depuis un test : seul le pseudo-verrou en attente d'audit l'est (`hashfull.sh`).
 - (vérification 15) Revue de `63a6575..e590e35` : huit trous restaient, tous dus à la clé par nom du hash (un renommage, un `DROP ROLE` puis `CREATE ROLE` du même nom, un nom essayé avant la création d'un rôle exigeaient chacun un cas particulier : `lock_role_oid`, `lock_on_missing`, `owner_oid`, `role_missing`, `update_seq`, retrait au renommage, repli par nom du rechargement, refus « temporarily locked »). **Clé OID** : l'entrée d'un rôle existant est indexée par son OID, celle d'un nom sans rôle par le nom (pseudo-entrée, `pppRoleKey`, §6.3) ; hash `HASH_ELEM | HASH_FUNCTION` (`ppp_key_hash()`), comparaison `memcmp()` de dynahash (clé mise à zéro par `ppp_make_key()`). Le hook recherche le rôle à chaque connexion, avant le LWLock, et ne fait plus aucun test d'appartenance ; le chemin courant (succès sans état) ne prend qu'un verrou partagé ; hors transaction il refuse (`57P03`, fail-closed). Le code des cas particuliers est **supprimé**, pas adapté : `ppp_restart_entry()`, `ppp_lookup_needed()`, `ppp_lock_is_foreign()`, le refus « temporarily locked », `ppp_recheck_gone_roles()`, `ppp_lock_persisted()`, `ppp_role_gone()`, la requête de recherche et l'ERROR « disappeared » de l'étape d'audit, le LOG « renamed to … reloaded from role_state », le repli par nom du rechargement et la jointure des profils par nom. Le worker retire l'entrée réglée d'un OID disparu (LOG « lock of dropped role … released » s'il portait un verrou) ou la marque `role_dropped` tant qu'elle a un audit en attente (classe `PENDING_AUDIT`, puis `INACTIVE`) ; l'upsert de `role_state` vient avant l'audit, qui découle de son résultat (`role_dropped`, `role_oid` dans `details`). **Origine des lignes** : colonne `cluster_id` (`system_identifier`, `_system_identifier()`) dans `role_state` et `role_profile` ; `_resolve_role_oid()` résout une ligne de cette grappe par son OID seulement, une ligne restaurée par son nom, sinon par son OID (pg_upgrade), sinon pas du tout ; le rechargement (plus long verrou si plusieurs lignes donnent le même rôle) et l'étape a0 (qui ne remappe plus que les lignes restaurées, fusionne avec la ligne de cette grappe en gardant le verrou le plus long, et ne purge pas une ligne restaurée non résolue) l'utilisent ; l'upsert du worker n'écrase pas une ligne restaurée non remappée (verrou gardé en attente, LOG). Les fonctions SQL passent un OID au C (`_shmem_lock()`, `_shmem_unlock()`, `_shmem_reset()`, `_shmem_is_locked()` : un renommage concurrent ne peut plus verrouiller un rôle dans `role_state` et un autre en shmem) ; l'API texte (`shmem_*_role`) reste pour l'usage direct d'un superutilisateur. `failed_attempts()` gagne la colonne `role_oid` (NULL pour une pseudo-entrée) et regroupe pour les non-superutilisateurs toutes les pseudo-entrées, d'après la clé ; `v_role_status` la joint par OID (la jointure par nom était fausse après un renommage). Vérifications dans les sources : `hash_create()` choisit `memcmp` dès que la fonction de hachage n'est pas `string_hash` (`dynahash.c` 16.4 et 17beta1, logique introduite en 14 avec `HASH_STRINGS`) ; `GetSystemIdentifier()` est déclarée dans `access/xlog.h` en 13.2, 16.4 et 17beta1 ; `PerformAuthentication()` est appelée après `StartTransactionCommand()` et `GetTransactionSnapshot()` dans `InitPostgres()` (13.2, 16.4, 17beta1) ; pg_upgrade conserve les OID de `pg_authid` (`pg_dumpall --binary-upgrade` émet `binary_upgrade_set_next_pg_authid_oid()`, 13.2 et 16.4) et la nouvelle grappe vient d'un `initdb` (autre `system_identifier`). Sources 14, 15 et 18 non disponibles : l'API est supposée stable entre 13.2 et 17beta1, et le binaire 18.6 exporte `GetSystemIdentifier`, `hash_bytes`, `hash_bytes_uint32`, `IsTransactionState`, `ClientAuthentication_hook` et `binary_upgrade_next_pg_authid_oid` ; la matrice Docker 14 à 18 reste le contrôle de compilation et de comportement. Tests : `lockout.sh` (trous 1, 2, 5 et 6, scénarios de renommage et de recréation adaptés), `hashfull.sh` (trou 3 et lignes restaurées au rechargement), `standby.sh` (trou 4, renommage d'un verrou local), `60_lock_unlock`, `70_maintenance` (a0 sur des lignes restaurées, ligne de cette grappe à OID disparu purgée), `90_privileges`. Les scénarios des trous 1 à 6 échouent tous avec `e590e35` (script de contrôle hors dépôt, sans `role_oid` ni `cluster_id`).
 - (vérification 16) Revue de `e590e35..542b010` et revue de sécurité de `542b010` : tous les défauts restants venaient de la coexistence des lignes restaurées d'une autre grappe (`cluster_id` différent) avec les lignes locales. (1) `unlock_role()` n'effaçait pas la ligne restaurée résolue vers le rôle (le rechargement réinjectait le verrou) ; `_ensure_state()`, `_record_password_change()` et `assign_profile()` écrasaient par `ON CONFLICT (role_oid)` une ligne restaurée d'un autre rôle portant le même OID : un `pass_policy_admin` non superutilisateur pouvait, par `unlock_role('bob')`, renommer en `bob` et déverrouiller la ligne restaurée de `dba` (superutilisateur) qui portait l'OID local de `bob` (escalade) ; les vues joignaient `role_state` par OID, en désaccord avec la résolution du rechargement ; le verrou `lock_kept` du worker était journalisé (LOG) à chaque tour sans fin ; la logique de rattachement existait en trois copies (étape a0, rechargement, `rebind_restored_roles()`) et `_resolve_role_oid()` était appelée deux fois par ligne. Décision : **une seule fonction de rattachement**, `_rebind_foreign_rows()` (interne, plpgsql, pas `SECURITY DEFINER` : ses appelants le sont, ou sont le hook et le worker en superutilisateur ; `EXECUTE` révoqué de `PUBLIC` comme toutes les fonctions internes), qui convertit toutes les lignes restaurées de `role_state` et `role_profile` en lignes locales (OID résolu une fois par ligne en `LATERAL`, `cluster_id` courant, fusion avec la ligne locale : verrou le plus long, dates les plus récentes, `must_change` si l'une l'a ; `DO NOTHING` pour `role_profile` quand une affectation locale existe), journalise chaque rattachement (`maintenance`, `details.action = 'remap'`) et supprime les lignes non résolues après les avoir journalisées (`details.action = 'unresolved'`, ligne complète). Elle est appelée par l'étape a0 de `run_maintenance()`, au début de chaque rechargement du worker (même transaction, avant la lecture des verrous et des profils ; sur un standby, aucune écriture : la résolution se fait en lecture seule, en mémoire), par `rebind_restored_roles()`, et par l'API avant toute écriture de ces tables, dans la même transaction : `_ensure_state()` (donc `lock_role()`, `unlock_role()`, `expire_password()`), `_record_password_change()` (hook et `_ensure_recorded()`, après la branche `CREATE ROLE … PASSWORD` qui n'écrit que l'historique), `assign_profile()`, `unassign_profile()` et `drop_profile()`. Les copies de l'étape a0 et de `rebind_restored_roles()` sont supprimées. (2) **Ordre de résolution** (corrige le cas pg_upgrade) : l'OID de la ligne s'il existe dans `pg_authid` (pg_upgrade garde les OID), sinon, pour une ligne restaurée, le rôle qui porte son nom (pg_dump / pg_restore), sinon personne ; limite en §12. (3) Hors standby, après (1) il n'existe plus de ligne restaurée : la garde `WHERE s.cluster_id = courant` de l'upsert du worker, `lock_kept` et son LOG répété sont supprimés (l'upsert redevient un simple `ON CONFLICT (role_oid) DO UPDATE`), ainsi que les conditions `cluster_id` des renommages et de la purge de l'étape a ; les `ON CONFLICT (role_oid)` de l'API redeviennent sûrs, les vues (jointes par OID) concordent avec le rechargement. (4) `failed_attempts()` : pour un non-superutilisateur, l'entrée d'un rôle supprimé (OID absent de `pg_authid`) est repliée dans la ligne NULL des noms sans rôle (le viewer voyait le dernier nom et l'OID du rôle supprimé). (5) `_shmem_unlock(0)`, `_shmem_reset(0)` et `_shmem_is_locked(0)` faisaient planter le backend (`ppp_make_key()` avec un nom NULL) : garde explicite `ppp_arg_roleid()`, ERROR `22023` « invalid role OID ». (6) Recherche `AUTHNAME` à chaque connexion : acceptée (§12). Tests : `60_lock_unlock` (OID 0 refusé par les quatre fonctions), `70_maintenance` (ligne non résolue journalisée puis supprimée ; ligne restaurée portant l'OID d'un rôle local sous le nom d'un autre puis `lock_role()` : rattachée et journalisée avant l'écriture, aucune ligne pour l'autre rôle ; cas pg_upgrade : rattachée par l'OID bien que le nom soit porté par un autre rôle), `lockout.sh` (verrou d'une ligne restaurée levé par `unlock_role()` après rechargement et après `run_maintenance()` ; scénario de l'escalade : ligne à l'OID de `bob` sous le nom de `dba` rattachée à `bob` dès le rechargement, `dba` jamais verrouillé ni réécrit, `unlock_role('bob')` par l'admin non superutilisateur ; variante sans rechargement, `ALTER ROLE bob PASSWORD` par `bob` lui-même : rattachement avant l'écriture ; ligne de `dba` rattachée par le nom : `dba` reste verrouillé en shmem et dans `role_state` après `unlock_role('bob')` par l'admin non superutilisateur et `ALTER ROLE bob PASSWORD` par `bob` ; viewer : entrée d'un rôle supprimé repliée), `hashfull.sh` (rattachement au rechargement sans maintenance, ligne non résolue journalisée puis supprimée, rôle renommé après le rechargement toujours verrouillé). Avec `542b010` : le backend plante sur l'OID 0, et les tests (a) à (e), (1) et la variante échouent ; dans (2), seules les vérifications de `role_state` échouent (la ligne n'y est pas rattachée), `dba` restant verrouillé en shmem.
+- (vérification 17) Revue de `542b010..0fcfba4` ; **remplace les décisions (1) et (2) de la vérification 16**. Le rattachement des lignes restaurées dans le chemin chaud avait des effets de bord : le changement de mot de passe d'un utilisateur (hook, `_record_password_change()`) rattachait toute la grappe et pouvait échouer ou attendre ; le rechargement du worker écrivait, et une erreur l'empêchait de charger les verrous (fenêtre de démarrage maintenue fermée) ; les lignes non résolues étaient supprimées définitivement (restauration des tables avant les rôles) ; l'ordre « OID d'abord » rattachait mal après pg_dump / pg_restore, où les OID se chevauchent couramment (16384…) ; la fusion des dates par `greatest()` repoussait l'expiration (fail-open) ; le tri JSON comparait le texte d'un `timestamptz` ; les lignes restaurées étaient cherchées sans index ; les boucles de renvoi des lignes étaient recopiées. Décision : (1) les lignes restaurées sont **inertes** et coexistent avec les lignes locales sans collision : clé primaire `(role_oid, cluster_id)` pour `role_state` et `role_profile` (`ON CONFLICT (role_oid, cluster_id)` partout), index sur `cluster_id` ; toutes les lectures et écritures de l'API, des vues (`_role_effective_profile`, `v_role_status`, `v_locked`, `effective_profile()`), du hook (`min_age`, `_record_password_change()`) et du worker (upsert du verrou, rechargement) ne portent que sur les lignes locales, prédicat unique `cluster_id = _system_identifier()` (`STABLE`, servi par la clé primaire ; `EXECUTE` accordé au viewer et à l'admin pour les vues) ; plus aucun rattachement dans `_ensure_state()`, `_record_password_change()`, `lock_role()`, `unlock_role()`, `expire_password()`, `assign_profile()`, `unassign_profile()`, `drop_profile()` (qui compte toutefois les lignes restaurées du profil : la clé étrangère l'exige), ni dans le rechargement du worker, redevenu en lecture seule ; la purge de l'étape a et les renommages ne touchent que les lignes locales. (2) Rattachement à l'étape a0 de `run_maintenance()` et dans `rebind_restored_roles(p_purge_unresolved bool DEFAULT false)` seulement, par `_rebind_foreign_rows(p_purge_unresolved)` (une seule instruction à CTE modifiantes, une seule boucle d'audit ; les appelants font `RETURN QUERY`) ; résolution (`_resolve_role_oid(oid, text)`) par le **nom** d'abord, puis par l'OID si aucun rôle ne porte le nom et que l'OID existe, sinon la ligne reste inerte, jamais supprimée automatiquement (`p_purge_unresolved => true` : supprimée et journalisée, `details.action = 'purge'`, ligne complète) ; limite pg_upgrade en §12. (3) Fusion avec une ligne locale existante : la ligne locale fait foi pour toutes les dates (`password_changed_at`, `expires_at`, `grace_until`, `last_warned_at`, `valid_until_synced`, `verifier_pending`), seuls `locked_until` (le plus long, avec `locked_by` et `lock_reason`) et `must_change` (OU) sont fusionnés (fail-closed sur le verrou seulement) ; entre lignes restaurées du même rôle sans ligne locale, les dates du changement le plus récent et le verrou le plus long ; `role_profile` : l'affectation locale l'emporte (`DO NOTHING`), entre lignes restaurées la plus récente par `assigned_at` comparé en `timestamptz` (`DISTINCT ON … ORDER BY assigned_at DESC`, plus de tri JSON). (4) À chaque rechargement, le worker compte les lignes restaurées non rattachées (`_unbound_count()`, `cluster_id <` ou `>` la valeur courante pour profiter des index) et émet un WARNING au plus une fois par heure (horodatage en mémoire du worker, remis à zéro quand le compte retombe à 0) : « N rows restored from another cluster are not bound: run pass_policy.run_maintenance() or rebind_restored_roles() » ; `run_maintenance()` renvoie ce compte (ligne `action = 'unbound'`, `details.rows`, sans ligne d'audit `maintenance`). Aucun verrou n'est appliqué depuis une ligne inerte : limite en §12, marche à suivre dans le README. Tests : `70_maintenance` ((a) `ALTER ROLE … PASSWORD` avec des lignes restaurées présentes, l'une à l'OID local du rôle sous un autre nom : aucune écriture sur elles, `xmin` inchangé, aucun `remap` ; (b) ligne non résolue conservée par deux passes de `run_maintenance()` et par `rebind_restored_roles()`, supprimée et journalisée par `rebind_restored_roles(p_purge_unresolved => true)` seulement ; (c) OID croisés de deux rôles : verrou et profil rattachés par le nom ; (d) fusion : dates locales conservées, verrou le plus long, `must_change` ; lignes inertes avant la maintenance dans `v_role_status` ; `lock_role()` sur un rôle dont l'OID porte une ligne restaurée d'un autre nom : ligne restaurée intacte, rattachée ensuite par le nom ; limite pg_upgrade : rattachée au rôle du nom), `lockout.sh` ((e) rechargement sans écriture, empreinte `xmin` comprise, WARNING une seule fois pour deux rechargements, verrou appliqué seulement après `run_maintenance()` ; (f) scénario `dba`/`bob` de la vérification 16 : ni `unlock_role('regress_bob')` par l'admin non superutilisateur ni `ALTER ROLE regress_bob PASSWORD` par `regress_bob` ne touchent la ligne restaurée de `regress_dba` ni n'écrivent de `remap`, la maintenance la rattache par le nom à `regress_dba`, verrouillé, que l'admin ne peut pas déverrouiller), `hashfull.sh` (rechargement seul : lignes restaurées inchangées, WARNING « 4 rows », fenêtre fermée, aucun verrou inerte appliqué ; après `run_maintenance()`, rattachées par le nom et verrouillées, ligne non résolue conservée). Avec `0fcfba4`, (a), (b), (c) et (d) échouent (lignes restaurées réécrites et `remap` par le hook, rôle verrouillé à tort ; ligne non résolue supprimée et `p_purge_unresolved` inconnu ; verrou et profil échangés ; dates repoussées).
 
 ## 12. Constats de revue acceptés
 
@@ -1166,28 +1176,45 @@ Points relevés en revue et volontairement non corrigés :
   tour (ou la maintenance qui purge `role_state`), un nouveau rôle du même
   OID hériterait de l'entrée ou de la ligne : héritage fail-closed,
   hautement improbable.
-- **Restaurations** (vérifications 15 et 16) : entre grappes clonées (même
+- **Restaurations** (vérifications 15 à 17) : entre grappes clonées (même
   `system_identifier` : `pg_basebackup`, copie de fichiers), les lignes
   restaurées passent pour des lignes de la grappe et ne sont pas rattachées
   par `_rebind_foreign_rows()` : appeler `rebind_restored_roles()` (README).
   Une ligne restaurée d'une autre grappe dont le rôle est introuvable au
-  moment du rattachement (premier rechargement ou première écriture qui
-  suit la restauration) est journalisée (`unresolved`) puis supprimée : un
-  rôle créé plus tard sous ce nom n'en hérite pas ; restaurer les rôles
-  (`pg_dumpall --globals-only`) avant les données de l'extension.
-- **Ligne restaurée dont l'OID d'origine est pris** (vérification 16) : la
-  résolution essaie l'OID avant le nom (pg_upgrade garde les OID de
-  `pg_authid`, le nom peut y être périmé ou porté par un autre rôle). Restaurée
-  par pg_dump / pg_restore dans une grappe où son OID d'origine appartient à
-  un autre rôle, une ligne va à ce rôle : son verrou, son état et son profil
-  s'appliquent au mauvais rôle (fail-closed pour le verrou : un rôle de trop
-  verrouillé, jamais un verrou perdu en silence pour celui qui le reçoit),
-  et le rôle d'origine ne les reçoit pas. Exemple de la revue de sécurité :
-  ligne de `dba` (superutilisateur, verrouillé) portant l'OID local de `bob`
-  : `bob` est verrouillé, `dba` ne l'est pas. Le rattachement est journalisé
-  (`maintenance`, `details.action = 'remap'`, ancien OID et ancien nom :
-  `old_name` différent du nom du rôle signale le cas) ; corriger à la main
-  (`lock_role()` du rôle d'origine, `unlock_role()` de l'autre).
+  moment du rattachement reste inerte et comptée (WARNING du worker, ligne
+  `unbound` de `run_maintenance()`), jamais supprimée automatiquement : un
+  rôle créé plus tard sous ce nom la recevra à la maintenance suivante.
+  `rebind_restored_roles(p_purge_unresolved => true)` la supprime
+  (journalisée, `purge`). Restaurer les rôles (`pg_dumpall --globals-only`)
+  avant les données de l'extension reste conseillé.
+- **Verrous restaurés appliqués à la première maintenance** (vérification
+  17) : une ligne restaurée est inerte jusqu'à son rattachement ; entre la
+  restauration (ou un pg_upgrade, après lequel **toutes** les lignes viennent
+  d'une autre grappe, `initdb` donnant un autre `system_identifier`) et la
+  première `run_maintenance()`, ni ses verrous, ni son profil, ni ses dates
+  ne s'appliquent, et la fenêtre de démarrage se ferme sans eux. Avec
+  `worker_interval > 0`, le premier tour du worker fait la maintenance dès
+  son démarrage et recharge la mémoire partagée à la fin du même tour ; avec
+  `worker_interval = 0`, appeler `run_maintenance()` (ou
+  `rebind_restored_roles()`) soi-même, avant de rouvrir les connexions
+  (README, « Restauration dans un autre cluster »). Choix : un rattachement
+  dans le chemin chaud (changement de mot de passe, API, rechargement)
+  faisait écrire toute la grappe par le premier `ALTER ROLE … PASSWORD`
+  venu et pouvait bloquer le rechargement (vérification 16, abandonnée).
+- **Résolution par le nom d'abord** (vérification 17) : après pg_dump /
+  pg_restore, les OID diffèrent et se chevauchent couramment (16384…) ; le
+  nom est la seule clé fiable, l'OID n'est essayé que si aucun rôle ne
+  porte le nom. Limite : cas pg_upgrade (OID conservés) où, avant la mise à
+  jour et sans maintenance depuis, un rôle a été **renommé** (ligne restée
+  sous l'ancien nom) **et** un autre rôle a pris cet ancien nom : la ligne
+  va au rôle qui porte le nom, pas au rôle renommé de son OID (verrou,
+  profil et `must_change` au mauvais rôle, le rôle renommé ne les reçoit
+  pas). Le rattachement est journalisé (`maintenance`, `details.action =
+  'remap'`, `old_oid` et `new_oid` différents le signalent) ; corriger à la
+  main (`lock_role()` / `unlock_role()`, `assign_profile()`). Lancer
+  `run_maintenance()` avant un pg_upgrade (rôles renommés à jour) l'évite.
+  Une ligne restaurée dont le nom n'existe pas et dont l'OID appartient à un
+  autre rôle va de même à ce rôle (fail-closed pour le verrou).
 - **Hook hors transaction** (vérification 15) : si le hook d'authentification
   s'exécutait un jour hors transaction (non atteignable de 14 à 17 d'après
   les sources, supposé pour 18), il refuserait toute connexion non exemptée

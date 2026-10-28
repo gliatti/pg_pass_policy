@@ -145,20 +145,23 @@ COMMENT ON TABLE profile IS 'Password policy profiles; "default" applies to ever
  * rows restored into another cluster are told apart: their role_oid may be
  * the OID of another role there.
  *
- * _resolve_role_oid(): the existing role a row of these tables belongs to,
- * NULL if none: (1) the role of its OID if it exists (a row of this
- * cluster; a restored row after pg_upgrade, which keeps the OIDs of
- * pg_authid, binary_upgrade_set_next_pg_authid_oid(), the name being
- * possibly stale or borne by another role), or else (2) for a row restored
- * from another cluster only, the role that bears its name (pg_dump /
- * pg_restore: the OIDs differ, the names are kept), or else (3) nobody.  A
- * row of this cluster whose OID no longer exists belongs to nobody (a role
- * dropped then created again under the same name is another role).  Limit
- * (SPEC §12): restored into a cluster where its former OID belongs to
- * another role, a row goes to that role (fail-closed for its lock).
- * Called once per row by _rebind_foreign_rows() and by the reload queries
- * of the worker (on a standby, where nothing can be rebound, the restored
- * rows are thus resolved in memory only, SPEC 6.3).
+ * The rows of this cluster (cluster_id = _system_identifier(), the single
+ * predicate used everywhere, served by the primary key (role_oid,
+ * cluster_id)) are the only ones the SQL API, the views, the C hook and the
+ * worker ever read or write.  A restored row is INERT: it coexists with the
+ * row of this cluster of the same OID (no collision, primary key), applies
+ * nothing (no lock, no profile, no expiry) and is never written, until
+ * _rebind_foreign_rows() binds it to its role (step a0 of run_maintenance(),
+ * rebind_restored_roles(); SPEC §12 for the window in between).
+ *
+ * _resolve_role_oid(): the role a restored row belongs to, NULL if none:
+ * (1) the role that bears its name (pg_dump / pg_restore: the OIDs differ,
+ * often overlap from 16384 on, the names are kept), or else (2) the role
+ * of its OID, when no role bears its name (pg_upgrade keeps the OIDs of
+ * pg_authid, binary_upgrade_set_next_pg_authid_oid(), and the role may have
+ * been renamed since the row was written), or else (3) nobody: the row
+ * stays inert.  Limit in SPEC §12 (pg_upgrade, role renamed and its former
+ * name taken by another role).
  */
 CREATE FUNCTION _system_identifier()
 RETURNS bigint
@@ -166,34 +169,34 @@ AS 'MODULE_PATHNAME', 'ppp_system_identifier'
 LANGUAGE C STABLE STRICT PARALLEL SAFE;
 COMMENT ON FUNCTION _system_identifier() IS 'Internal: system identifier of pg_control (origin of the role_state and role_profile rows)';
 
-CREATE FUNCTION _resolve_role_oid(p_oid oid, p_name text, p_cluster_id bigint)
+CREATE FUNCTION _resolve_role_oid(p_oid oid, p_name text)
 RETURNS oid
 LANGUAGE sql STABLE
 SET search_path = pg_catalog, pg_temp
 AS $$
-    SELECT coalesce((SELECT a.oid FROM pg_catalog.pg_authid a WHERE a.oid = p_oid),
-                    (SELECT a.oid FROM pg_catalog.pg_authid a
-                      WHERE a.rolname = p_name::name
-                        AND p_cluster_id <> pass_policy._system_identifier()))
+    SELECT coalesce((SELECT a.oid FROM pg_catalog.pg_authid a WHERE a.rolname = p_name::name),
+                    (SELECT a.oid FROM pg_catalog.pg_authid a WHERE a.oid = p_oid))
 $$;
-COMMENT ON FUNCTION _resolve_role_oid(oid, text, bigint) IS 'Internal: role a role_state / role_profile row belongs to (its OID if it exists; else, for a restored row, the role of its name)';
+COMMENT ON FUNCTION _resolve_role_oid(oid, text) IS 'Internal: role a restored role_state / role_profile row belongs to (the role of its name, else the role of its OID)';
 
 -- 3.2 role_profile
 CREATE TABLE role_profile (
-    role_oid    oid PRIMARY KEY,
+    role_oid    oid NOT NULL,
     role_name   text NOT NULL,
     profile_id  int NOT NULL REFERENCES profile (profile_id),
     assigned_at timestamptz NOT NULL DEFAULT now(),
     assigned_by text,
-    -- Addition to SPEC §3.2: origin of the row (see _resolve_role_oid())
-    cluster_id  bigint NOT NULL DEFAULT pass_policy._system_identifier()
+    -- Addition to SPEC §3.2: origin of the row (see _system_identifier())
+    cluster_id  bigint NOT NULL DEFAULT pass_policy._system_identifier(),
+    PRIMARY KEY (role_oid, cluster_id)
 );
 CREATE INDEX role_profile_profile_idx ON role_profile (profile_id);
+CREATE INDEX role_profile_cluster_idx ON role_profile (cluster_id);
 COMMENT ON TABLE role_profile IS 'Profile assigned to a role (no row = default profile)';
 
 -- 3.3 role_state
 CREATE TABLE role_state (
-    role_oid            oid PRIMARY KEY,
+    role_oid            oid NOT NULL,
     role_name           text NOT NULL,
     password_changed_at timestamptz,
     expires_at          timestamptz,
@@ -210,11 +213,32 @@ CREATE TABLE role_state (
     -- run_maintenance() that the mismatch is expected and that the history
     -- row must simply be replaced by the stored verifier.
     verifier_pending    bool NOT NULL DEFAULT false,
-    -- Addition to SPEC §3.3: origin of the row (see _resolve_role_oid())
-    cluster_id          bigint NOT NULL DEFAULT pass_policy._system_identifier()
+    -- Addition to SPEC §3.3: origin of the row (see _system_identifier())
+    cluster_id          bigint NOT NULL DEFAULT pass_policy._system_identifier(),
+    PRIMARY KEY (role_oid, cluster_id)
 );
 CREATE INDEX role_state_locked_idx ON role_state (locked_until) WHERE locked_until IS NOT NULL;
+CREATE INDEX role_state_cluster_idx ON role_state (cluster_id);
 COMMENT ON TABLE role_state IS 'Per-role password lifecycle and lock state';
+
+/*
+ * Number of restored rows not bound yet (role_state and role_profile): read
+ * by every reload of the worker (WARNING) and returned by run_maintenance().
+ * "<" OR ">" rather than "<>": both are served by the cluster_id indexes.
+ */
+CREATE FUNCTION _unbound_count()
+RETURNS bigint
+LANGUAGE sql STABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+    SELECT (SELECT count(*) FROM pass_policy.role_state s
+             WHERE s.cluster_id < pass_policy._system_identifier()
+                OR s.cluster_id > pass_policy._system_identifier())
+         + (SELECT count(*) FROM pass_policy.role_profile p
+             WHERE p.cluster_id < pass_policy._system_identifier()
+                OR p.cluster_id > pass_policy._system_identifier())
+$$;
+COMMENT ON FUNCTION _unbound_count() IS 'Internal: number of role_state / role_profile rows restored from another cluster and not bound yet';
 
 -- 3.4 password_history
 CREATE TABLE password_history (
@@ -298,9 +322,11 @@ COMMENT ON TABLE rotation_pair IS 'Zero-downtime rotation pairs: two login roles
  *   - dictionary: words are lower-cased and duplicates are silently skipped.
  * Caveat: a data-only restore with --disable-triggers bypasses this.
  * Role OIDs differ between clusters: the rows of role_state and
- * role_profile carry the cluster they were written in (cluster_id), and
- * _rebind_foreign_rows() turns the restored ones into rows of this cluster
- * (pg_dumpall --globals restores the roles by name).
+ * role_profile carry the cluster they were written in (cluster_id), stay
+ * inert once restored into another cluster, and _rebind_foreign_rows()
+ * binds them to their role (pg_dumpall --globals restores the roles by
+ * name).
+
  */
 CREATE FUNCTION _profile_restore_trg() RETURNS trigger
 LANGUAGE plpgsql
@@ -564,7 +590,7 @@ COMMENT ON FUNCTION _worker_pid() IS 'Internal: PID of the pg_pass_policy backgr
 CREATE VIEW _role_effective_profile AS
 SELECT a.oid AS role_oid, a.rolname::text AS role_name, p.*
   FROM pg_catalog.pg_authid a
-  LEFT JOIN role_profile rp ON rp.role_oid = a.oid
+  LEFT JOIN role_profile rp ON rp.role_oid = a.oid AND rp.cluster_id = pass_policy._system_identifier()
   JOIN profile p ON p.profile_id = coalesce(rp.profile_id,
                        (SELECT d.profile_id FROM profile d WHERE d.name = 'default'));
 COMMENT ON VIEW _role_effective_profile IS 'Internal: effective profile of every role';
@@ -826,8 +852,9 @@ BEGIN
                    CASE WHEN e.max_age IS NULL OR s2.password_changed_at IS NULL THEN NULL
                         ELSE s2.password_changed_at + e.max_age END AS new_expires
               FROM pass_policy._role_effective_profile e
-              JOIN pass_policy.role_state s2 ON s2.role_oid = e.role_oid) c
-     WHERE c.role_oid = s.role_oid
+              JOIN pass_policy.role_state s2 ON s2.role_oid = e.role_oid
+                                            AND s2.cluster_id = pass_policy._system_identifier()) c
+     WHERE c.role_oid = s.role_oid AND s.cluster_id = pass_policy._system_identifier()
        AND NOT s.must_change
        AND (p_oid IS NULL OR s.role_oid = p_oid)
        AND (s.expires_at IS DISTINCT FROM c.new_expires
@@ -886,7 +913,7 @@ BEGIN
              WHERE rp.previous_role = a.rolname AND rp.previous_valid_until IS NOT NULL) AS pair_bound
       INTO r
       FROM pg_catalog.pg_authid a
-      JOIN pass_policy.role_state s ON s.role_oid = a.oid
+      JOIN pass_policy.role_state s ON s.role_oid = a.oid AND s.cluster_id = pass_policy._system_identifier()
      WHERE a.oid = p_oid;
     IF NOT FOUND THEN
         RETURN NULL;
@@ -934,14 +961,15 @@ BEGIN
     IF r.rolvaliduntil IS NOT DISTINCT FROM v_new THEN
         UPDATE pass_policy.role_state s
            SET valid_until_synced = CASE WHEN v_new = 'infinity' THEN NULL ELSE v_new END
-         WHERE s.role_oid = p_oid;
+         WHERE s.role_oid = p_oid AND s.cluster_id = pass_policy._system_identifier();
         RETURN NULL;
     END IF;
 
     EXECUTE format('ALTER ROLE %I VALID UNTIL %L', r.rolname, v_new);
     UPDATE pass_policy.role_state s
        SET valid_until_synced = CASE WHEN v_new = 'infinity' THEN NULL ELSE v_new END
-     WHERE s.role_oid = p_oid;
+     WHERE s.role_oid = p_oid AND s.cluster_id = pass_policy._system_identifier();
+
     RETURN jsonb_build_object('old', r.rolvaliduntil, 'new', v_new, 'mode', p_mode);
 END
 $$;
@@ -1025,35 +1053,31 @@ COMMENT ON FUNCTION _trim_history(oid) IS 'Internal: truncates the password hist
 /*
  * _rebind_foreign_rows(): the single place where the rows of role_state and
  * role_profile restored from another cluster (cluster_id other than
- * _system_identifier()) become rows of this cluster.  Every such row is
- * removed, resolved once (_resolve_role_oid(): its OID if it exists, else
- * its name) and:
- *   - resolved: inserted again under the OID and the current name of its
- *     role, cluster_id of this cluster, and written to the audit (event
- *     'maintenance', action 'remap', former OID and name).  A role_state row already
- *     held by that role (or another restored row resolved to it) is merged:
- *     longest lock (fail-closed), most recent dates, must_change if either
- *     has it; verifier_pending is that of the row already there.  For
- *     role_profile, an assignment already held wins (DO NOTHING); between
- *     restored rows, the one resolved by its OID, then the most recent ;
- *   - not resolved: written to the audit (event 'maintenance', action
- *     'unresolved', with the row), then dropped ('unresolved').
- * All the rows are removed first, then inserted again: two rows exchanging
- * their OIDs are handled whatever the order.  Once it has run, no restored
- * row is left, and the ON CONFLICT (role_oid) of the SQL API and of the
- * worker only ever meet rows of this cluster.
+ * _system_identifier()) are bound to their role.  Every such row is
+ * resolved once (_resolve_role_oid(): its name, else its OID) and:
+ *   - resolved: written as the row of this cluster of its role (OID and
+ *     current name of the role), then removed, and written to the audit
+ *     (event 'maintenance', action 'remap', former OID and name, 'merged'
+ *     when the role already had a row or several restored rows resolve to
+ *     it).  Merged with that row: the row of this cluster keeps all its
+ *     dates (password_changed_at, expires_at, grace_until, last_warned_at,
+ *     valid_until_synced, verifier_pending); only the lock (longest,
+ *     fail-closed) and must_change (OR) are merged.  Between restored rows
+ *     of the same role, the dates of the most recent password change and
+ *     the longest lock are taken.  For role_profile, an assignment of this
+ *     cluster wins (DO NOTHING); between restored rows, the most recent
+ *     assigned_at ;
+ *   - not resolved: left in place, inert (never removed automatically),
+ *     unless p_purge_unresolved (rebind_restored_roles() only): then
+ *     removed and written to the audit (action 'purge', with the row).
+ * One statement per call: the rows are bound whatever their order (two
+ * rows exchanging their OIDs included).
  *
- * Called, in the caller's transaction and before any read or write of
- * these rows, by step a0 of run_maintenance(), by every reload of the
- * worker outside recovery (SPEC 6.3), by rebind_restored_roles() and by
- * the SQL API before it writes role_state or role_profile
- * (_ensure_state(), _record_password_change(), assign_profile(),
- * unassign_profile(), drop_profile()).  Without restored row it only reads
- * both tables.  Not SECURITY DEFINER: its callers are SECURITY DEFINER
- * functions, the C hook and the worker (superuser); EXECUTE is granted to
- * nobody.  Returns what it did, like run_maintenance().
+ * Called by step a0 of run_maintenance() and by rebind_restored_roles()
+ * only, both under the advisory lock of the maintenance.  Not SECURITY
+ * DEFINER: its callers are; EXECUTE is granted to nobody.
  */
-CREATE FUNCTION _rebind_foreign_rows()
+CREATE FUNCTION _rebind_foreign_rows(p_purge_unresolved bool DEFAULT false)
 RETURNS TABLE (action text, role_name text, details jsonb)
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
@@ -1061,86 +1085,100 @@ AS $$
 #variable_conflict use_column
 DECLARE
     v_cluster bigint := pass_policy._system_identifier();
-    v_tbl     text;
-    v_rows    jsonb[];
-    v_j       jsonb;
-    v_merged  bool;
+    r         record;
 BEGIN
-    IF NOT EXISTS (SELECT FROM pass_policy.role_state s WHERE s.cluster_id <> v_cluster)
-       AND NOT EXISTS (SELECT FROM pass_policy.role_profile p WHERE p.cluster_id <> v_cluster) THEN
-        RETURN;
-    END IF;
-
-    FOREACH v_tbl IN ARRAY ARRAY['role_state', 'role_profile']
+    FOR r IN
+        WITH s AS (
+            SELECT t.*, pg_catalog.to_jsonb(t) AS j, a.oid AS new_oid, a.rolname::text AS new_name,
+                   EXISTS (SELECT FROM pass_policy.role_state l
+                            WHERE l.role_oid = a.oid AND l.cluster_id = v_cluster) AS has_local
+              FROM pass_policy.role_state t
+             CROSS JOIN LATERAL (SELECT pass_policy._resolve_role_oid(t.role_oid, t.role_name) AS oid
+                                 OFFSET 0) x
+              LEFT JOIN pg_catalog.pg_authid a ON a.oid = x.oid
+             WHERE t.cluster_id <> v_cluster),
+        -- one row per role: dates of the latest change, longest lock, OR
+        s_dates AS (
+            SELECT DISTINCT ON (s.new_oid) s.* FROM s WHERE s.new_oid IS NOT NULL
+             ORDER BY s.new_oid, s.password_changed_at DESC NULLS LAST, s.role_oid),
+        s_lock AS (
+            SELECT DISTINCT ON (s.new_oid) s.new_oid, s.locked_until, s.locked_by, s.lock_reason,
+                   pg_catalog.bool_or(s.must_change) OVER (PARTITION BY s.new_oid) AS must_change
+              FROM s WHERE s.new_oid IS NOT NULL
+             ORDER BY s.new_oid, s.locked_until DESC NULLS LAST, s.role_oid),
+        s_ins AS (
+            INSERT INTO pass_policy.role_state AS x
+                   (role_oid, role_name, password_changed_at, expires_at, grace_until, last_warned_at,
+                    locked_until, locked_by, lock_reason, must_change, valid_until_synced,
+                    verifier_pending, cluster_id)
+            SELECT d.new_oid, d.new_name, d.password_changed_at, d.expires_at, d.grace_until,
+                   d.last_warned_at, l.locked_until, l.locked_by, l.lock_reason, l.must_change,
+                   d.valid_until_synced, d.verifier_pending, v_cluster
+              FROM s_dates d JOIN s_lock l ON l.new_oid = d.new_oid
+            ON CONFLICT (role_oid, cluster_id) DO UPDATE
+               SET must_change  = x.must_change OR EXCLUDED.must_change,
+                   locked_until = CASE WHEN EXCLUDED.locked_until > coalesce(x.locked_until, '-infinity')
+                                       THEN EXCLUDED.locked_until ELSE x.locked_until END,
+                   locked_by    = CASE WHEN EXCLUDED.locked_until > coalesce(x.locked_until, '-infinity')
+                                       THEN EXCLUDED.locked_by ELSE x.locked_by END,
+                   lock_reason  = CASE WHEN EXCLUDED.locked_until > coalesce(x.locked_until, '-infinity')
+                                       THEN EXCLUDED.lock_reason ELSE x.lock_reason END),
+        s_del AS (
+            DELETE FROM pass_policy.role_state t USING s
+             WHERE t.role_oid = s.role_oid AND t.cluster_id = s.cluster_id
+               AND (s.new_oid IS NOT NULL OR p_purge_unresolved)),
+        p AS (
+            SELECT t.*, pg_catalog.to_jsonb(t) AS j, a.oid AS new_oid, a.rolname::text AS new_name,
+                   EXISTS (SELECT FROM pass_policy.role_profile l
+                            WHERE l.role_oid = a.oid AND l.cluster_id = v_cluster) AS has_local
+              FROM pass_policy.role_profile t
+             CROSS JOIN LATERAL (SELECT pass_policy._resolve_role_oid(t.role_oid, t.role_name) AS oid
+                                 OFFSET 0) x
+              LEFT JOIN pg_catalog.pg_authid a ON a.oid = x.oid
+             WHERE t.cluster_id <> v_cluster),
+        p_ins AS (
+            INSERT INTO pass_policy.role_profile
+                   (role_oid, role_name, profile_id, assigned_at, assigned_by, cluster_id)
+            SELECT DISTINCT ON (p.new_oid) p.new_oid, p.new_name, p.profile_id, p.assigned_at,
+                   p.assigned_by, v_cluster
+              FROM p WHERE p.new_oid IS NOT NULL
+             ORDER BY p.new_oid, p.assigned_at DESC, p.role_oid
+            ON CONFLICT (role_oid, cluster_id) DO NOTHING),
+        p_del AS (
+            DELETE FROM pass_policy.role_profile t USING p
+             WHERE t.role_oid = p.role_oid AND t.cluster_id = p.cluster_id
+               AND (p.new_oid IS NOT NULL OR p_purge_unresolved)),
+        res AS (
+            SELECT 'role_state' AS tbl, s.role_oid, s.role_name, s.cluster_id, s.j, s.new_oid, s.new_name,
+                   s.has_local OR pg_catalog.count(*) OVER (PARTITION BY s.new_oid) > 1 AS merged
+              FROM s
+            UNION ALL
+            SELECT 'role_profile', p.role_oid, p.role_name, p.cluster_id, p.j, p.new_oid, p.new_name,
+                   p.has_local OR pg_catalog.count(*) OVER (PARTITION BY p.new_oid) > 1
+              FROM p)
+        SELECT CASE WHEN res.new_oid IS NOT NULL THEN 'remap' ELSE 'purge' END AS act,
+               coalesce(res.new_name, res.role_name) AS rname,
+               pg_catalog.jsonb_build_object('table', res.tbl, 'old_oid', res.role_oid,
+                                             'old_name', res.role_name, 'cluster_id', res.cluster_id)
+               OPERATOR(pg_catalog.||)
+               CASE WHEN res.new_oid IS NULL
+                    THEN pg_catalog.jsonb_build_object('row', res.j)
+                    ELSE pg_catalog.jsonb_build_object('new_oid', res.new_oid)
+                         OPERATOR(pg_catalog.||)
+                         CASE WHEN res.merged THEN '{"merged":true}'::jsonb ELSE '{}' END
+               END AS det
+          FROM res
+         WHERE res.new_oid IS NOT NULL OR p_purge_unresolved
+         ORDER BY 2, res.tbl, res.role_oid
     LOOP
-        -- removed and resolved once per row (LATERAL); resolved rows in
-        -- the order of their target, the row resolved by its own OID first
-        EXECUTE format(
-            'WITH d AS (DELETE FROM pass_policy.%1$I t WHERE t.cluster_id <> $1'
-            '           RETURNING pg_catalog.to_jsonb(t) AS j)'
-            ' SELECT pg_catalog.array_agg(d.j OPERATOR(pg_catalog.||)'
-            '            pg_catalog.jsonb_build_object(''new_oid'', a.oid, ''new_name'', a.rolname)'
-            '        ORDER BY a.oid, (d.j->>''role_oid'')::pg_catalog.oid IS DISTINCT FROM a.oid,'
-            '                 d.j->>''assigned_at'' DESC, d.j->>''role_oid'')'
-            '   FROM d'
-            '   LEFT JOIN LATERAL (SELECT x.oid, x.rolname FROM pg_catalog.pg_authid x'
-            '                       WHERE x.oid = pass_policy._resolve_role_oid('
-            '                                 (d.j->>''role_oid'')::pg_catalog.oid, d.j->>''role_name'','
-            '                                 (d.j->>''cluster_id'')::pg_catalog.int8)) a ON true', v_tbl)
-          INTO v_rows USING v_cluster;
-        FOREACH v_j IN ARRAY coalesce(v_rows, '{}')
-        LOOP
-            IF v_j->>'new_oid' IS NULL THEN
-                action := 'unresolved'; role_name := v_j->>'role_name';
-                details := jsonb_build_object('table', v_tbl, 'old_oid', (v_j->>'role_oid')::oid,
-                                              'row', v_j - 'new_oid' - 'new_name');
-                PERFORM pass_policy._audit('maintenance', role_name,
-                        jsonb_build_object('action', 'unresolved') || details);
-                RETURN NEXT;
-                CONTINUE;
-            END IF;
-            v_j := v_j || jsonb_build_object('old_oid', v_j->'role_oid', 'row_name', v_j->'role_name',
-                                             'role_oid', v_j->'new_oid',
-                                             'role_name', v_j->'new_name',
-                                             'cluster_id', v_cluster);
-            IF v_tbl = 'role_state' THEN
-                v_merged := EXISTS (SELECT FROM pass_policy.role_state x
-                                     WHERE x.role_oid = (v_j->>'new_oid')::oid);
-                INSERT INTO pass_policy.role_state AS x
-                SELECT (jsonb_populate_record(NULL::pass_policy.role_state, v_j)).*
-                ON CONFLICT (role_oid) DO UPDATE
-                   SET role_name           = EXCLUDED.role_name,
-                       password_changed_at = greatest(x.password_changed_at, EXCLUDED.password_changed_at),
-                       expires_at          = greatest(x.expires_at, EXCLUDED.expires_at),
-                       grace_until         = greatest(x.grace_until, EXCLUDED.grace_until),
-                       last_warned_at      = greatest(x.last_warned_at, EXCLUDED.last_warned_at),
-                       valid_until_synced  = greatest(x.valid_until_synced, EXCLUDED.valid_until_synced),
-                       must_change         = x.must_change OR EXCLUDED.must_change,
-                       locked_until = CASE WHEN EXCLUDED.locked_until > coalesce(x.locked_until, '-infinity')
-                                           THEN EXCLUDED.locked_until ELSE x.locked_until END,
-                       locked_by    = CASE WHEN EXCLUDED.locked_until > coalesce(x.locked_until, '-infinity')
-                                           THEN EXCLUDED.locked_by ELSE x.locked_by END,
-                       lock_reason  = CASE WHEN EXCLUDED.locked_until > coalesce(x.locked_until, '-infinity')
-                                           THEN EXCLUDED.lock_reason ELSE x.lock_reason END;
-            ELSE
-                INSERT INTO pass_policy.role_profile
-                SELECT (jsonb_populate_record(NULL::pass_policy.role_profile, v_j)).*
-                ON CONFLICT (role_oid) DO NOTHING;
-                v_merged := NOT FOUND;
-            END IF;
-            action := 'remap'; role_name := v_j->>'new_name';
-            details := jsonb_build_object('table', v_tbl, 'old_oid', (v_j->>'old_oid')::oid,
-                                          'new_oid', (v_j->>'new_oid')::oid,
-                                          'old_name', v_j->'row_name')
-                       || CASE WHEN v_merged THEN '{"merged":true}'::jsonb ELSE '{}' END;
-            PERFORM pass_policy._audit('maintenance', role_name,
-                    jsonb_build_object('action', 'remap') || details);
-            RETURN NEXT;
-        END LOOP;
+        action := r.act; role_name := r.rname; details := r.det;
+        PERFORM pass_policy._audit('maintenance', role_name,
+                jsonb_build_object('action', action) || details);
+        RETURN NEXT;
     END LOOP;
 END
 $$;
-COMMENT ON FUNCTION _rebind_foreign_rows() IS 'Internal: turns the role_state / role_profile rows restored from another cluster into rows of this cluster (resolved role, merged), drops and audits the unresolved ones';
+COMMENT ON FUNCTION _rebind_foreign_rows(bool) IS 'Internal: binds the role_state / role_profile rows restored from another cluster to their role (name, else OID; merged), leaves the unresolved ones inert unless asked to purge them';
 
 -- Records a password change (no permission check: trusted callers only).
 CREATE FUNCTION _record_password_change(p_role text, p_verifier text)
@@ -1168,9 +1206,6 @@ BEGIN
         RETURN;
     END IF;
 
-    -- restored rows first: the upsert below then only meets the role's own
-    -- row, with the lock of every restored row resolved to it
-    PERFORM pass_policy._rebind_foreign_rows();
     INSERT INTO pass_policy.password_history (role_oid, role_name, verifier, changed_at)
     VALUES (v_oid, p_role, p_verifier, now());
 
@@ -1181,7 +1216,7 @@ BEGIN
             last_warned_at, must_change, verifier_pending)
     VALUES (v_oid, p_role, now(), now() + p.max_age, now() + p.max_age + p.grace_period,
             NULL, false, true)
-    ON CONFLICT (role_oid) DO UPDATE
+    ON CONFLICT (role_oid, cluster_id) DO UPDATE
        SET role_name           = EXCLUDED.role_name,
            password_changed_at = EXCLUDED.password_changed_at,
            expires_at          = EXCLUDED.expires_at,
@@ -1217,17 +1252,16 @@ COMMENT ON FUNCTION _ensure_recorded(name) IS 'Internal: records a password chan
 
 -- Creates the role_state row of an existing role if missing, and refreshes
 -- its role_name (stale after ALTER ROLE ... RENAME until run_maintenance()).
--- The restored rows are rebound first (_rebind_foreign_rows()): the row of
--- the OID is then the role's own, with the lock of every row resolved to it.
+-- Row of this cluster only (cluster_id default): a restored row of the
+-- same OID is another, inert row, never touched here.
 CREATE FUNCTION _ensure_state(p_oid oid)
 RETURNS void
 LANGUAGE sql
 SET search_path = pg_catalog, pg_temp
 AS $$
-    SELECT FROM pass_policy._rebind_foreign_rows();
     INSERT INTO pass_policy.role_state AS s (role_oid, role_name)
     SELECT a.oid, a.rolname FROM pg_catalog.pg_authid a WHERE a.oid = p_oid
-    ON CONFLICT (role_oid) DO UPDATE SET role_name = EXCLUDED.role_name
+    ON CONFLICT (role_oid, cluster_id) DO UPDATE SET role_name = EXCLUDED.role_name
      WHERE s.role_name IS DISTINCT FROM EXCLUDED.role_name
 $$;
 COMMENT ON FUNCTION _ensure_state(oid) IS 'Internal: creates the role_state row of a role if missing, refreshes its role_name';
@@ -1307,7 +1341,7 @@ AS $$
              (SELECT rp.profile_id
                 FROM pass_policy.role_profile rp
                 JOIN pg_catalog.pg_authid a ON a.oid = rp.role_oid
-               WHERE a.rolname = $1),
+               WHERE a.rolname = $1 AND rp.cluster_id = pass_policy._system_identifier()),
              (SELECT d.profile_id FROM pass_policy.profile d WHERE d.name = 'default'))
 $$;
 COMMENT ON FUNCTION effective_profile(name) IS 'Profile applying to a role (assigned profile or "default")';
@@ -1410,12 +1444,12 @@ BEGIN
         RAISE EXCEPTION 'pg_pass_policy: profile "%" does not exist', v_name
               USING ERRCODE = 'undefined_object';
     END IF;
-    -- rows of dropped roles (purged by the next run_maintenance()) do not
-    -- hold the profile: they are purged here, only existing roles count
-    -- (restored rows rebound first: theirs are resolved, not purged)
-    PERFORM pass_policy._rebind_foreign_rows();
+    -- rows of this cluster of dropped roles (purged by the next
+    -- run_maintenance()) do not hold the profile: they are purged here.  A
+    -- restored row not bound yet does hold it (counted, never purged here:
+    -- rebind_restored_roles())
     DELETE FROM pass_policy.role_profile rp
-     WHERE rp.profile_id = v_id
+     WHERE rp.profile_id = v_id AND rp.cluster_id = pass_policy._system_identifier()
        AND NOT EXISTS (SELECT FROM pg_catalog.pg_authid a WHERE a.oid = rp.role_oid);
     SELECT count(*) INTO v_n FROM pass_policy.role_profile rp WHERE rp.profile_id = v_id;
     IF v_n > 0 THEN
@@ -1449,10 +1483,9 @@ BEGIN
         RAISE EXCEPTION 'pg_pass_policy: profile "%" does not exist', $2
               USING ERRCODE = 'undefined_object';
     END IF;
-    PERFORM pass_policy._rebind_foreign_rows();
     INSERT INTO pass_policy.role_profile AS rp (role_oid, role_name, profile_id, assigned_at, assigned_by)
     VALUES (v_oid, v_role, v_pid, now(), session_user)
-    ON CONFLICT (role_oid) DO UPDATE
+    ON CONFLICT (role_oid, cluster_id) DO UPDATE
        SET role_name = EXCLUDED.role_name, profile_id = EXCLUDED.profile_id,
            assigned_at = EXCLUDED.assigned_at, assigned_by = EXCLUDED.assigned_by;
     PERFORM pass_policy._refresh_role_state(v_oid);
@@ -1478,9 +1511,9 @@ BEGIN
     IF v_oid IS NOT NULL THEN
         PERFORM pass_policy._require_target_allowed(v_role);
     END IF;
-    PERFORM pass_policy._rebind_foreign_rows();
     DELETE FROM pass_policy.role_profile rp
-     WHERE rp.role_oid = v_oid OR (v_oid IS NULL AND rp.role_name = v_role);
+     WHERE rp.cluster_id = pass_policy._system_identifier()
+       AND (rp.role_oid = v_oid OR (v_oid IS NULL AND rp.role_name = v_role));
     IF NOT FOUND THEN
         RETURN;
     END IF;
@@ -1628,7 +1661,7 @@ BEGIN
     UPDATE pass_policy.role_state s
        SET must_change = true, expires_at = v_now, grace_until = v_now,
            last_warned_at = v_now, valid_until_synced = v_now
-     WHERE s.role_oid = v_oid;
+     WHERE s.role_oid = v_oid AND s.cluster_id = pass_policy._system_identifier();
     EXECUTE format('ALTER ROLE %I VALID UNTIL %L', v_role, v_now);
     PERFORM pass_policy._audit('password_expired', v_role,
             jsonb_build_object('manual', true, 'valid_until', v_now));
@@ -1662,7 +1695,7 @@ BEGIN
     PERFORM pass_policy._ensure_state(v_oid);
     UPDATE pass_policy.role_state s
        SET locked_until = v_until, locked_by = 'manual', lock_reason = $3
-     WHERE s.role_oid = v_oid;
+     WHERE s.role_oid = v_oid AND s.cluster_id = pass_policy._system_identifier();
     -- the OID checked above, not the name (a rename in between would lock
     -- another role in shared memory than in role_state)
     PERFORM pass_policy._shmem('lock', v_oid, CASE WHEN $2 IS NULL THEN NULL ELSE v_until END);
@@ -1701,11 +1734,11 @@ BEGIN
     -- _shmem_unlock() without expired_only always queues the unlock and
     -- returns true: _shmem_is_locked() (HASH_FIND of this OID) is asked.
     v_locked := (SELECT s.locked_until IS NOT NULL FROM pass_policy.role_state s
-                  WHERE s.role_oid = v_oid)
+                  WHERE s.role_oid = v_oid AND s.cluster_id = pass_policy._system_identifier())
                 OR pass_policy._shmem_is_locked(v_oid);
     UPDATE pass_policy.role_state s
        SET locked_until = NULL, locked_by = NULL, lock_reason = NULL
-     WHERE s.role_oid = v_oid;
+     WHERE s.role_oid = v_oid AND s.cluster_id = pass_policy._system_identifier();
     -- queued in any case (harmless without a lock); the failure counter is
     -- reset even if the role was not locked
     PERFORM pass_policy._shmem('unlock', v_oid);
@@ -1860,7 +1893,8 @@ BEGIN
         UPDATE pass_policy.role_state s
            SET must_change = true, expires_at = v_bound, grace_until = v_bound,
                last_warned_at = now(), valid_until_synced = v_bound
-         WHERE s.role_oid = v_old_oid;
+         WHERE s.role_oid = v_old_oid AND s.cluster_id = pass_policy._system_identifier();
+
         PERFORM pass_policy._apply_valid_until(v_old_oid, 'force');
     END IF;
 
@@ -1880,11 +1914,12 @@ COMMENT ON FUNCTION switch_rotation_pair(text, int) IS 'Rotates a pair: new pass
 /*
  * run_maintenance(): one pass of what the background worker does; may also
  * be scheduled with pg_cron (runs fine without the worker / shmem).
- *  a0. rebind the rows restored from another cluster (cluster_id,
- *      _rebind_foreign_rows()), map by role name the history rows whose
- *      role_oid no longer exists (restore, CREATE ROLE ... PASSWORD), then
- *      follow role renames ;
- *  a.  purge rows of roles that no longer exist ;
+ *  a0. bind the rows restored from another cluster (cluster_id,
+ *      _rebind_foreign_rows(); the unresolved ones stay inert and their
+ *      number is returned, action 'unbound'), map by role name the history
+ *      rows whose role_oid no longer exists (restore, CREATE ROLE ...
+ *      PASSWORD), then follow role renames ;
+ *  a.  purge rows of this cluster of roles that no longer exist ;
  *  b.  reconcile pg_authid.rolpassword with the history ;
  *  c.  recompute expires_at / grace_until ;
  *  d.  VALID UNTIL synchronisation (pass_policy.manage_valid_until); when
@@ -1928,18 +1963,20 @@ BEGIN
     END IF;
 
     ---------------------------------------------------------------- a0
-    -- Rows restored from another cluster: rebound to their role, or dropped
-    -- when they resolve to none (_rebind_foreign_rows(), SPEC 6.3).  From
-    -- here on, every row of role_state and role_profile is a row of this
-    -- cluster, keyed by the OID of its role: renames and purges below follow
-    -- the OID only (a role dropped then created again under the same name
-    -- is another role).
-    FOR r IN SELECT * FROM pass_policy._rebind_foreign_rows()
-    LOOP
-        action := r.action; role_name := r.role_name; details := r.details;
-        v_actions := v_actions + 1;
-        RETURN NEXT;
-    END LOOP;
+    -- Rows restored from another cluster: bound to their role
+    -- (_rebind_foreign_rows(), SPEC 6.3); the unresolved ones stay inert,
+    -- only counted.  Everything below reads and writes the rows of this
+    -- cluster only, keyed by the OID of their role: renames and purges
+    -- follow the OID only (a role dropped then created again under the same
+    -- name is another role).
+    RETURN QUERY SELECT * FROM pass_policy._rebind_foreign_rows();
+    GET DIAGNOSTICS v_n = ROW_COUNT;
+    v_actions := v_actions + v_n;
+    -- not an action: no 'maintenance' audit row at every pass for them
+    v_n := pass_policy._unbound_count();
+    IF v_n > 0 THEN
+        RETURN QUERY SELECT 'unbound'::text, NULL::text, jsonb_build_object('rows', v_n);
+    END IF;
     UPDATE pass_policy.password_history h SET role_oid = a.oid
       FROM pg_catalog.pg_authid a
      WHERE a.rolname = h.role_name AND h.role_oid IS DISTINCT FROM a.oid
@@ -1948,10 +1985,12 @@ BEGIN
     -- renames: the OID still exists under another name
     UPDATE pass_policy.role_state s SET role_name = a.rolname
       FROM pg_catalog.pg_authid a
-     WHERE a.oid = s.role_oid AND a.rolname <> s.role_name;
+     WHERE a.oid = s.role_oid AND a.rolname <> s.role_name
+       AND s.cluster_id = pass_policy._system_identifier();
     UPDATE pass_policy.role_profile p SET role_name = a.rolname
       FROM pg_catalog.pg_authid a
-     WHERE a.oid = p.role_oid AND a.rolname <> p.role_name;
+     WHERE a.oid = p.role_oid AND a.rolname <> p.role_name
+       AND p.cluster_id = pass_policy._system_identifier();
     UPDATE pass_policy.password_history h SET role_name = a.rolname
       FROM pg_catalog.pg_authid a
      WHERE a.oid = h.role_oid AND a.rolname <> h.role_name;
@@ -1959,7 +1998,8 @@ BEGIN
     ---------------------------------------------------------------- a
     FOR r IN
         DELETE FROM pass_policy.role_state s
-         WHERE NOT EXISTS (SELECT FROM pg_catalog.pg_authid a WHERE a.oid = s.role_oid)
+         WHERE s.cluster_id = pass_policy._system_identifier()
+           AND NOT EXISTS (SELECT FROM pg_catalog.pg_authid a WHERE a.oid = s.role_oid)
         RETURNING s.role_name AS rname
     LOOP
         action := 'purge'; role_name := r.rname; details := '{"table":"role_state"}';
@@ -1968,7 +2008,8 @@ BEGIN
     END LOOP;
     FOR r IN
         DELETE FROM pass_policy.role_profile p
-         WHERE NOT EXISTS (SELECT FROM pg_catalog.pg_authid a WHERE a.oid = p.role_oid)
+         WHERE p.cluster_id = pass_policy._system_identifier()
+           AND NOT EXISTS (SELECT FROM pg_catalog.pg_authid a WHERE a.oid = p.role_oid)
         RETURNING p.role_name AS rname
     LOOP
         action := 'purge'; role_name := r.rname; details := '{"table":"role_profile"}';
@@ -2003,7 +2044,7 @@ BEGIN
             UPDATE pass_policy.role_state s
                SET must_change = true, expires_at = r.prev_until, grace_until = r.prev_until,
                    last_warned_at = coalesce(s.last_warned_at, now())
-             WHERE s.role_oid = r.prev_oid
+             WHERE s.role_oid = r.prev_oid AND s.cluster_id = pass_policy._system_identifier()
                AND (NOT s.must_change OR s.grace_until IS NULL OR s.grace_until > r.prev_until);
         END IF;
         action := 'purge'; role_name := NULL;
@@ -2019,6 +2060,7 @@ BEGIN
                h.id AS hid, h.verifier AS hverifier, h.changed_at AS hchanged
           FROM pg_catalog.pg_authid a
           LEFT JOIN pass_policy.role_state s ON s.role_oid = a.oid
+                                             AND s.cluster_id = pass_policy._system_identifier()
           LEFT JOIN LATERAL (SELECT h1.id, h1.verifier, h1.changed_at
                                FROM pass_policy.password_history h1
                               WHERE h1.role_oid = a.oid
@@ -2034,7 +2076,7 @@ BEGIN
             VALUES (r.oid, r.rname, r.rolpassword, coalesce(r.password_changed_at, now()));
             INSERT INTO pass_policy.role_state AS s (role_oid, role_name, password_changed_at)
             VALUES (r.oid, r.rname, now())
-            ON CONFLICT (role_oid) DO UPDATE
+            ON CONFLICT (role_oid, cluster_id) DO UPDATE
                SET password_changed_at = coalesce(s.password_changed_at, now()),
                    verifier_pending = false;
             action := 'reconcile'; role_name := r.rname;
@@ -2050,7 +2092,7 @@ BEGIN
             UPDATE pass_policy.password_history h SET verifier = r.rolpassword WHERE h.id = r.hid;
             INSERT INTO pass_policy.role_state AS s (role_oid, role_name, password_changed_at)
             VALUES (r.oid, r.rname, r.hchanged)
-            ON CONFLICT (role_oid) DO UPDATE SET verifier_pending = false;
+            ON CONFLICT (role_oid, cluster_id) DO UPDATE SET verifier_pending = false;
             CONTINUE;                       -- bookkeeping only, not reported
         ELSIF r.hverifier <> r.rolpassword THEN
             -- the password was changed without going through the hook
@@ -2060,7 +2102,7 @@ BEGIN
             UPDATE pass_policy.role_state s
                SET password_changed_at = now(), last_warned_at = NULL,
                    must_change = false, verifier_pending = false
-             WHERE s.role_oid = r.oid;
+             WHERE s.role_oid = r.oid AND s.cluster_id = pass_policy._system_identifier();
             PERFORM pass_policy._audit('password_changed', r.rname,
                     jsonb_build_object('source', 'reconciliation'));
             action := 'reconcile'; role_name := r.rname;
@@ -2069,7 +2111,7 @@ BEGIN
             -- verifier matches: create a missing state row / clear the flag
             INSERT INTO pass_policy.role_state AS s (role_oid, role_name, password_changed_at)
             VALUES (r.oid, r.rname, r.hchanged)
-            ON CONFLICT (role_oid) DO UPDATE
+            ON CONFLICT (role_oid, cluster_id) DO UPDATE
                SET verifier_pending = false,
                    password_changed_at = coalesce(s.password_changed_at, EXCLUDED.password_changed_at);
             CONTINUE;
@@ -2113,6 +2155,7 @@ BEGIN
                        least(s.grace_until, pb.pair_bound) AS desired  -- least() ignores NULLs
                   FROM pass_policy.role_state s
                   JOIN pg_catalog.pg_authid a ON a.oid = s.role_oid
+                                              AND s.cluster_id = pass_policy._system_identifier()
                  CROSS JOIN LATERAL (SELECT a.oid = ANY (v_exempt) AS exempt) x
                   LEFT JOIN (SELECT rp.previous_role, min(rp.previous_valid_until) AS pair_bound
                                FROM pass_policy.rotation_pair rp
@@ -2151,11 +2194,13 @@ BEGIN
           JOIN pass_policy._role_effective_profile e ON e.role_oid = s.role_oid
           JOIN pg_catalog.pg_authid a ON a.oid = s.role_oid
          WHERE s.expires_at IS NOT NULL AND a.rolcanlogin
+           AND s.cluster_id = pass_policy._system_identifier()
            AND NOT (a.oid = ANY (v_exempt))
     LOOP
         IF now() >= r.expires_at THEN
             IF r.last_warned_at IS NULL OR r.last_warned_at < r.expires_at THEN
-                UPDATE pass_policy.role_state s SET last_warned_at = now() WHERE s.role_oid = r.role_oid;
+                UPDATE pass_policy.role_state s SET last_warned_at = now()
+                 WHERE s.role_oid = r.role_oid AND s.cluster_id = pass_policy._system_identifier();
                 details := jsonb_build_object('expires_at', r.expires_at, 'grace_until', r.grace_until);
                 PERFORM pass_policy._audit('password_expired', r.rname, details);
                 action := 'password_expired'; role_name := r.rname;
@@ -2164,7 +2209,8 @@ BEGIN
             END IF;
         ELSIF r.expires_at - now() < r.warn_before THEN
             IF r.last_warned_at IS NULL OR r.last_warned_at < now() - interval '1 day' THEN
-                UPDATE pass_policy.role_state s SET last_warned_at = now() WHERE s.role_oid = r.role_oid;
+                UPDATE pass_policy.role_state s SET last_warned_at = now()
+                 WHERE s.role_oid = r.role_oid AND s.cluster_id = pass_policy._system_identifier();
                 details := jsonb_build_object('expires_at', r.expires_at,
                                               'days_left', floor(extract(epoch FROM r.expires_at - now()) / 86400));
                 PERFORM pass_policy._audit('expiry_warning', r.rname, details);
@@ -2189,7 +2235,9 @@ BEGIN
                role_name = a.rolname
           FROM pg_catalog.pg_authid a
          WHERE a.oid = s.role_oid AND s.locked_until < now()
+           AND s.cluster_id = pass_policy._system_identifier()
         RETURNING s.role_oid, a.rolname::text AS rname
+
     -- An unlock refused by the shared memory (active newer lock, false) is
     -- neither audited nor returned: the role is still locked, and the
     -- worker copies the newer lock to role_state at its next cycle.
@@ -2219,8 +2267,10 @@ COMMENT ON FUNCTION run_maintenance() IS 'One maintenance pass (worker or pg_cro
  * rebind_restored_roles(): explicit repair after restoring the extension
  * tables into another cluster whose role OIDs differ (pg_dump /
  * pg_restore).  The rows restored from a cluster of another system
- * identifier (cluster_id) are rebound by _rebind_foreign_rows() anyway
- * (worker reload, run_maintenance(), SQL API), and first here too.  A clone
+ * identifier (cluster_id) are bound by _rebind_foreign_rows() first, as by
+ * step a0 of run_maintenance(); with p_purge_unresolved, those that resolve
+ * to no role are removed (audited, action 'purge') instead of being left
+ * inert.  A clone
  * of this cluster (pg_basebackup, file copy) has the same identifier: its
  * rows look like rows of this cluster, whose OIDs are stable (a row whose
  * OID exists under another name is a rename and the OID wins, SPEC §11 S3).
@@ -2228,12 +2278,13 @@ COMMENT ON FUNCTION run_maintenance() IS 'One maintenance pass (worker or pg_cro
  * to another role Y: only this function, called on purpose, rebinds the
  * rows of X by name.
  *
- * Every row of role_state, role_profile and password_history whose pair
+ * Then every row of this cluster of role_state, role_profile and
+ * password_history whose pair
  * (role_oid, role_name) matches no pg_authid row is rebound BY NAME: the
  * name exists under another OID -> the row takes that OID ('rebind'); the
  * name does not exist -> the row is purged ('purge').  A rebound row whose
  * target OID already holds a matching row is purged too (the matching row
- * wins).  For role_state and role_profile (primary key role_oid), all the
+ * wins).  For role_state and role_profile (key role_oid), all the
  * mismatched rows are first removed (DELETE ... RETURNING, kept in an
  * array) and then inserted again (INSERT ... ON CONFLICT DO NOTHING), so
  * that two rows exchanging their OIDs are handled whatever the order.
@@ -2244,7 +2295,7 @@ COMMENT ON FUNCTION run_maintenance() IS 'One maintenance pass (worker or pg_cro
  * run_maintenance() (worker_interval = 0 and enabled = off meanwhile, see
  * README).  Superuser only: it rewrites the rows of every role.
  */
-CREATE FUNCTION rebind_restored_roles()
+CREATE FUNCTION rebind_restored_roles(p_purge_unresolved bool DEFAULT false)
 RETURNS TABLE (action text, role_name text, details jsonb)
 LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
@@ -2268,17 +2319,9 @@ BEGIN
     -- not concurrently with a maintenance pass (same lock as run_maintenance)
     PERFORM pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtext('pg_pass_policy.run_maintenance'));
 
-    -- rows restored from another cluster: rebound as by run_maintenance()
-    FOR r IN SELECT * FROM pass_policy._rebind_foreign_rows()
-    LOOP
-        action := r.action; role_name := r.role_name; details := r.details;
-        IF r.action = 'remap' THEN
-            v_rebound := v_rebound + 1;
-        ELSE
-            v_purged := v_purged + 1;
-        END IF;
-        RETURN NEXT;
-    END LOOP;
+    -- rows restored from another cluster: bound as by run_maintenance()
+    RETURN QUERY SELECT * FROM pass_policy._rebind_foreign_rows(p_purge_unresolved);
+    GET DIAGNOSTICS v_rebound = ROW_COUNT;
 
     -- rows of this cluster whose pair (role_oid, role_name) matches no role
     FOREACH v_tbl IN ARRAY ARRAY['role_state', 'role_profile']
@@ -2287,9 +2330,11 @@ BEGIN
             'WITH c AS (SELECT t.role_oid AS old_oid, a.oid AS new_oid'
             '             FROM pass_policy.%1$I t'
             '             LEFT JOIN pg_catalog.pg_authid a ON a.rolname = t.role_name'
-            '            WHERE NOT EXISTS (SELECT FROM pg_catalog.pg_authid o'
+            '            WHERE t.cluster_id = pass_policy._system_identifier()'
+            '              AND NOT EXISTS (SELECT FROM pg_catalog.pg_authid o'
             '                               WHERE o.oid = t.role_oid AND o.rolname = t.role_name)),'
             '     d AS (DELETE FROM pass_policy.%1$I t USING c WHERE t.role_oid = c.old_oid'
+            '              AND t.cluster_id = pass_policy._system_identifier()'
             '           RETURNING pg_catalog.to_jsonb(t) OPERATOR(pg_catalog.||)'
             '                     pg_catalog.jsonb_build_object(''new_oid'', c.new_oid) AS j)'
             ' SELECT pg_catalog.array_agg(d.j) FROM d', v_tbl)
@@ -2304,7 +2349,7 @@ BEGIN
             '                   u.j OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_object(''role_oid'', u.j->''new_oid''))).*'
             '             FROM pg_catalog.unnest($1) u(j)'
             '            WHERE u.j->>''new_oid'' IS NOT NULL'
-            '           ON CONFLICT (role_oid) DO NOTHING'
+            '           ON CONFLICT (role_oid, cluster_id) DO NOTHING'
             '           RETURNING role_oid)'
             ' SELECT pg_catalog.array_agg(i.role_oid) FROM i', v_tbl)
           INTO v_kept USING v_rows;
@@ -2368,7 +2413,8 @@ BEGIN
     RETURN;
 END
 $$;
-COMMENT ON FUNCTION rebind_restored_roles() IS 'After a restore into another cluster: rebinds by role name the rows whose (role_oid, role_name) matches no role, purges those of missing roles (superuser)';
+COMMENT ON FUNCTION rebind_restored_roles(bool) IS 'After a restore: binds the rows restored from another cluster (purges the unresolved ones if asked), then rebinds by role name the rows of this cluster whose (role_oid, role_name) matches no role, purges those of missing roles (superuser)';
+
 
 -------------------------------------------------------------------------------
 -- 7. Views (SPEC §4)
@@ -2422,7 +2468,7 @@ SELECT q.role_name, q.profile, q.password_changed_at, q.expires_at, q.grace_unti
                        coalesce(f.failed_count, 0) AS failed_count
                   FROM pg_catalog.pg_roles r
                   JOIN _role_effective_profile e ON e.role_oid = r.oid
-                  LEFT JOIN role_state s ON s.role_oid = r.oid
+                  LEFT JOIN role_state s ON s.role_oid = r.oid AND s.cluster_id = _system_identifier()
                   LEFT JOIN failed_attempts() f ON f.role_oid = r.oid
                  WHERE r.rolcanlogin) p) q;
 COMMENT ON VIEW v_role_status IS 'Password and lock status of every login role (status: locked > exempt > expiry_state; is_exempt: listed in exempt_roles; expiry_state: computed regardless of lock and exemption; valid_until: rolvaliduntil; role_oid: join key for role_state)';
@@ -2439,7 +2485,7 @@ COMMENT ON VIEW v_expiring IS 'Login roles whose password is about to expire, in
 CREATE VIEW v_locked AS
 SELECT v.role_name, v.locked_until, s.locked_by, s.lock_reason, v.failed_count
   FROM v_role_status v
-  LEFT JOIN role_state s ON s.role_oid = v.role_oid
+  LEFT JOIN role_state s ON s.role_oid = v.role_oid AND s.cluster_id = _system_identifier()
  WHERE v.status = 'locked';
 COMMENT ON VIEW v_locked IS 'Currently locked roles';
 
@@ -2497,6 +2543,9 @@ GRANT EXECUTE ON FUNCTION _is_privileged(oid) TO pass_policy_viewer, pass_policy
 -- _is_exempt(): called by v_role_status (functions of a view run with the
 -- privileges of its user); pg_pass_policy.exempt_roles is readable by all
 GRANT EXECUTE ON FUNCTION _is_exempt(text) TO pass_policy_viewer, pass_policy_admin;
+-- _system_identifier(): called by the views (rows of this cluster only)
+GRANT EXECUTE ON FUNCTION _system_identifier() TO pass_policy_viewer, pass_policy_admin;
+
 -- record_password_change(): no grant (called by the C hook as superuser only)
 
 GRANT EXECUTE ON FUNCTION

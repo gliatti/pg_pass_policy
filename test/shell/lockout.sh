@@ -800,114 +800,105 @@ out=$(psql_as regress_rec "$GOOD_REC" "SELECT current_user") || true
 check_eq "rôle recréé : le nouveau rôle se connecte toujours" "regress_rec" "$out"
 psql_admin "DROP ROLE regress_rec" >/dev/null
 
-# --- (vérification 16) lignes restaurées d'une autre grappe (cluster_id 42) --
-# worker_interval = 0 : le worker ne recharge que sur demande (reload_sync).
-# Chaque rechargement, et l'API SQL avant toute écriture, rattache d'abord les
-# lignes restaurées (_rebind_foreign_rows()) : par leur OID s'il existe,
-# sinon par leur nom, et journalise chaque rattachement ('remap').
+# --- (vérification 17) lignes restaurées d'une autre grappe (cluster_id 42) --
+# worker_interval = 0 : le worker ne recharge que sur demande (reload_sync) et
+# ne fait aucune maintenance. Les lignes restaurées sont INERTES : le
+# rechargement du worker est en lecture seule, n'en applique aucune et
+# signale leur nombre (WARNING, au plus une fois par heure) ; l'API, le hook
+# et les vues ne lisent et n'écrivent que les lignes locales. Seul
+# run_maintenance() (étape a0) ou rebind_restored_roles() les rattache, par
+# le nom d'abord.
 psql_admin "SELECT pass_policy.create_profile('p_v16', '{\"min_age\": \"0\"}')" >/dev/null
 GOOD_BOB='Verif16-Change#2025q'
-GOOD_BOB2='Verif16-Again#2025w'
 fa_locked() {
 	psql_admin "SELECT count(*) FROM pass_policy.failed_attempts() WHERE role_name = '$1' AND locked_until IS NOT NULL"
 }
 state_locked() {
-	psql_admin "SELECT count(*) FROM pass_policy.role_state WHERE role_oid = '$1'::regrole::oid AND locked_until > now()"
+	psql_admin "SELECT count(*) FROM pass_policy.role_state WHERE role_oid = '$1'::regrole::oid
+	            AND cluster_id = pass_policy._system_identifier() AND locked_until > now()"
 }
-# (a) verrou venu d'une ligne restaurée rattachée par le nom : unlock_role()
-# le lève pour de bon (avec 542b010, la ligne restaurée restait en place et
-# chaque rechargement réinjectait le verrou)
+# empreinte des lignes restaurées (xmin compris : toute écriture la change)
+restored_rows() {
+	psql_admin "SELECT coalesce(string_agg(role_oid || ':' || role_name || ':' || xmin || ':' || coalesce(locked_until::text, '-'),
+	                                       ',' ORDER BY role_oid, role_name), '')
+	            FROM pass_policy.role_state WHERE cluster_id = 42"
+}
+unbound_warn='pg_pass_policy: 1 row restored from another cluster is not bound: run pass_policy.run_maintenance\(\) or rebind_restored_roles\(\)'
+# (e) verrou d'une ligne restaurée au nom d'un rôle existant : le
+# rechargement n'écrit rien (ligne inchangée, xmin compris), n'applique pas le
+# verrou et émet le WARNING (avec 0fcfba4, le rechargement rattachait la
+# ligne) ; la maintenance la rattache, le verrou s'applique, unlock_role() le
+# lève pour de bon
 psql_admin "CREATE ROLE regress_ua LOGIN PASSWORD '$GOOD'" >/dev/null
 psql_admin "INSERT INTO pass_policy.role_state (role_oid, role_name, locked_until, locked_by, lock_reason, cluster_id)
             VALUES (4000000031, 'regress_ua', 'infinity', 'manual', 'restored ua', 42)" >/dev/null
-reload_sync || fail "(a) pas de rechargement après la restauration"
+before=$(restored_rows)
+log0=$(wc -l <"$PPP_TMP/server.log")
+reload_sync || fail "v17 (e) pas de rechargement après la restauration"
+check_eq "v17 (e) rechargement : aucune écriture sur la ligne restaurée" "$before" "$(restored_rows)"
+n=$(tail -n "+$((log0 + 1))" "$PPP_TMP/server.log" | grep -cE "WARNING: +$unbound_warn" || true)
+check_eq "v17 (e) rechargement : WARNING des lignes restaurées non rattachées" "1" "$n"
+reload_sync || fail "v17 (e) pas de second rechargement"
+n=$(tail -n "+$((log0 + 1))" "$PPP_TMP/server.log" | grep -cE "WARNING: +$unbound_warn" || true)
+check_eq "v17 (e) second rechargement : WARNING non répété (une fois par heure)" "1" "$n"
+out=$(psql_as regress_ua "$GOOD" "SELECT current_user") || true
+check_eq "v17 (e) ligne restaurée inerte : aucun verrou appliqué avant la maintenance" "regress_ua" "$out"
+check_eq "v17 (e) run_maintenance() rattache la ligne (remap, aucune ligne non rattachée)" "1|" \
+	"$(psql_admin "SELECT count(*) FILTER (WHERE action = 'remap' AND role_name = 'regress_ua') || '|'
+	                || coalesce(max(details->>'rows') FILTER (WHERE action = 'unbound'), '')
+	                FROM pass_policy.run_maintenance()")"
+reload_sync || fail "v17 (e) pas de rechargement après run_maintenance"
 out=$(psql_as regress_ua "$GOOD") || true
-check_contains "(a) ligne restaurée : verrou appliqué par le nom" "is locked by pg_pass_policy" "$out"
-check_eq "(a) ligne rattachée par le rechargement (OID du rôle, grappe courante)" "1|0" \
-	"$(psql_admin "SELECT count(*) FILTER (WHERE role_oid = 'regress_ua'::regrole::oid AND cluster_id = pass_policy._system_identifier())
-	                 || '|' || count(*) FILTER (WHERE cluster_id <> pass_policy._system_identifier())
-	                 FROM pass_policy.role_state")"
+check_contains "v17 (e) après la maintenance : verrou restauré appliqué" "is locked by pg_pass_policy" "$out"
 psql_admin "SELECT pass_policy.unlock_role('regress_ua')" >/dev/null
-reload_sync || fail "(a) pas de rechargement après unlock_role"
-out=$(psql_as regress_ua "$GOOD" "SELECT current_user") || true
-check_eq "(a) unlock_role() : plus de verrou après rechargement" "regress_ua" "$out"
+reload_sync || fail "v17 (e) pas de rechargement après unlock_role"
 psql_admin "SELECT count(*) FROM pass_policy.run_maintenance()" >/dev/null
-reload_sync || fail "(a) pas de rechargement après run_maintenance"
+reload_sync || fail "v17 (e) pas de rechargement après la seconde maintenance"
 out=$(psql_as regress_ua "$GOOD" "SELECT current_user") || true
-check_eq "(a) unlock_role() : plus de verrou après run_maintenance()" "regress_ua" "$out"
+check_eq "v17 (e) unlock_role() : plus de verrou après rechargement et maintenance" "regress_ua" "$out"
 
-# Scénario de la revue de sécurité : un pass_policy_admin non
+# (f) scénario de la revue de sécurité : un pass_policy_admin non
 # superutilisateur, un rôle ordinaire regress_bob, un superutilisateur
-# regress_dba.
+# regress_dba ; ligne restaurée verrouillée de regress_dba portant l'OID local
+# de regress_bob (les OID se chevauchent après pg_restore). Avant la
+# maintenance, ni unlock_role('regress_bob') par l'admin, ni ALTER ROLE
+# regress_bob PASSWORD par regress_bob ne touchent la ligne de regress_dba
+# (avec 0fcfba4, elle était rattachée à regress_bob, son OID) ; la
+# maintenance la rattache par le nom à regress_dba, verrouillé, que l'admin ne
+# peut pas déverrouiller.
 psql_admin "CREATE ROLE regress_dba LOGIN SUPERUSER PASSWORD '$GOOD'" >/dev/null
 psql_admin "CREATE ROLE regress_bob LOGIN PASSWORD '$GOOD'" >/dev/null
 psql_admin "CREATE ROLE regress_padm LOGIN PASSWORD '$GOOD' IN ROLE pass_policy_admin" >/dev/null
 psql_admin "SELECT pass_policy.assign_profile('regress_bob', 'p_v16')" >/dev/null
-# (1) ligne restaurée portant l'OID local de regress_bob sous le nom
-# regress_dba, verrouillée : rattachée à regress_bob (son OID, limite SPEC
-# §12) dès le rechargement ; regress_dba n'a jamais ce verrou, rien n'est
-# jamais écrit sous son nom (avec 542b010, regress_dba était verrouillé par le
-# nom, puis déverrouillé par unlock_role('regress_bob') de l'admin)
 psql_admin "INSERT INTO pass_policy.role_state (role_oid, role_name, locked_until, locked_by, lock_reason, cluster_id)
             SELECT 'regress_bob'::regrole::oid, 'regress_dba', 'infinity', 'manual', 'restored dba', 42" >/dev/null
-reload_sync || fail "(1) pas de rechargement après la restauration"
-check_eq "(1) rechargement : regress_bob verrouillé, regress_dba non" "1|0" \
+before=$(restored_rows)
+audit0=$(psql_admin "SELECT max(id) FROM pass_policy.audit_log")
+reload_sync || fail "v17 (f) pas de rechargement après la restauration"
+check_eq "v17 (f) rechargement : ni regress_bob ni regress_dba verrouillés (ligne inerte)" "0|0" \
 	"$(fa_locked regress_bob)|$(fa_locked regress_dba)"
 out=$(psql_as regress_padm "$GOOD" "SELECT pass_policy.unlock_role('regress_bob')" 2>&1) || true
-check_not_contains "(1) unlock_role('regress_bob') par l'admin non superutilisateur" "ERROR" "$out"
-reload_sync || fail "(1) pas de rechargement après unlock_role"
-check_eq "(1) après unlock_role : regress_bob déverrouillé, regress_dba jamais verrouillé" "0|0" \
-	"$(fa_locked regress_bob)|$(fa_locked regress_dba)"
-check_eq "(1) aucune ligne role_state sous le nom regress_dba" "0" \
-	"$(psql_admin "SELECT count(*) FROM pass_policy.role_state WHERE role_name = 'regress_dba'")"
-check_eq "(1) rattachement journalisé (remap, ancien nom regress_dba)" "regress_bob|regress_dba" \
-	"$(psql_admin "SELECT string_agg(role_name || '|' || (details->>'old_name'), ',') FROM pass_policy.audit_log
-	                WHERE event_type = 'maintenance' AND details->>'action' = 'remap' AND details->>'old_name' = 'regress_dba'")"
-# (1, variante) même ligne restaurée, sans rechargement : regress_bob change
-# lui-même son mot de passe ; _record_password_change() rattache la ligne
-# avant d'écrire, sous l'OID et le nom de regress_bob
-psql_admin "INSERT INTO pass_policy.role_state (role_oid, role_name, locked_until, locked_by, lock_reason, cluster_id)
-            SELECT 4000000040, 'regress_dba_v', 'infinity', 'manual', 'restored dba', 42" >/dev/null
-psql_admin "DELETE FROM pass_policy.role_state WHERE role_oid = 'regress_bob'::regrole::oid" >/dev/null
-psql_admin "INSERT INTO pass_policy.role_state (role_oid, role_name, locked_until, locked_by, lock_reason, cluster_id)
-            SELECT 'regress_bob'::regrole::oid, 'regress_dba', now() + interval '1 hour', 'manual', 'restored dba', 42" >/dev/null
+check_not_contains "v17 (f) unlock_role('regress_bob') par l'admin non superutilisateur" "ERROR" "$out"
 out=$(psql_as regress_bob "$GOOD" "ALTER ROLE regress_bob PASSWORD '$GOOD_BOB'" 2>&1) || true
-check_not_contains "(1, variante) ALTER ROLE regress_bob PASSWORD par regress_bob" "ERROR|FATAL" "$out"
-check_eq "(1, variante) ligne rattachée avant l'écriture : regress_bob, grappe courante, verrou gardé" "regress_bob|true|true" \
-	"$(psql_admin "SELECT role_name || '|' || (cluster_id = pass_policy._system_identifier()) || '|' || (locked_until > now())
-	                FROM pass_policy.role_state WHERE role_oid = 'regress_bob'::regrole::oid")"
-check_eq "(1, variante) ligne non résolue journalisée puis supprimée" "1|0" \
-	"$(psql_admin "SELECT (SELECT count(*) FROM pass_policy.audit_log WHERE event_type = 'maintenance'
-	                         AND details->>'action' = 'unresolved' AND role_name = 'regress_dba_v')
-	                || '|' || (SELECT count(*) FROM pass_policy.role_state WHERE role_name = 'regress_dba_v')")"
-check_eq "(1, variante) toujours aucune ligne sous le nom regress_dba" "0" \
-	"$(psql_admin "SELECT count(*) FROM pass_policy.role_state WHERE role_name = 'regress_dba'")"
-psql_admin "SELECT pass_policy.unlock_role('regress_bob')" >/dev/null
-# (2) ligne restaurée de regress_dba d'un OID inconnu ici (rattachée par le
-# nom) et ligne restaurée verrouillée portant l'OID de regress_bob :
-# unlock_role('regress_bob') par l'admin non superutilisateur, puis ALTER
-# ROLE regress_bob PASSWORD par regress_bob, laissent regress_dba verrouillé
-# en mémoire partagée et dans role_state
-psql_admin "INSERT INTO pass_policy.role_state (role_oid, role_name, locked_until, locked_by, lock_reason, cluster_id)
-            VALUES (4000000041, 'regress_dba', 'infinity', 'manual', 'restored dba', 42)" >/dev/null
-psql_admin "DELETE FROM pass_policy.role_state WHERE role_oid = 'regress_bob'::regrole::oid" >/dev/null
-psql_admin "INSERT INTO pass_policy.role_state (role_oid, role_name, locked_until, locked_by, lock_reason, cluster_id)
-            SELECT 'regress_bob'::regrole::oid, 'regress_dba', 'infinity', 'manual', 'restored bob', 42" >/dev/null
-reload_sync || fail "(2) pas de rechargement après la restauration"
-check_eq "(2) rechargement : regress_dba et regress_bob verrouillés" "1|1" \
-	"$(fa_locked regress_dba)|$(fa_locked regress_bob)"
-out=$(psql_as regress_padm "$GOOD" "SELECT pass_policy.unlock_role('regress_bob')" 2>&1) || true
-check_not_contains "(2) unlock_role('regress_bob') par l'admin non superutilisateur" "ERROR" "$out"
-out=$(psql_as regress_bob "$GOOD_BOB" "ALTER ROLE regress_bob PASSWORD '$GOOD_BOB2'" 2>&1) || true
-check_not_contains "(2) ALTER ROLE regress_bob PASSWORD par regress_bob" "ERROR|FATAL" "$out"
-reload_sync || fail "(2) pas de rechargement après unlock_role"
-check_eq "(2) regress_dba verrouillé en mémoire partagée, regress_bob non" "1|0" \
-	"$(fa_locked regress_dba)|$(fa_locked regress_bob)"
-check_eq "(2) regress_dba verrouillé dans role_state" "1" "$(state_locked regress_dba)"
+check_not_contains "v17 (f) ALTER ROLE regress_bob PASSWORD par regress_bob" "ERROR|FATAL" "$out"
+check_eq "v17 (f) ligne restaurée de regress_dba intacte (xmin compris)" "$before" "$(restored_rows)"
+check_eq "v17 (f) aucune ligne d'audit 'remap' avant la maintenance" "0" \
+	"$(psql_admin "SELECT count(*) FROM pass_policy.audit_log WHERE id > $audit0 AND details->>'action' = 'remap'")"
+check_eq "v17 (f) ligne locale de regress_bob à son nom, non verrouillée" "regress_bob|0" \
+	"$(psql_admin "SELECT role_name FROM pass_policy.role_state WHERE role_oid = 'regress_bob'::regrole::oid
+	                AND cluster_id = pass_policy._system_identifier()")|$(state_locked regress_bob)"
+check_eq "v17 (f) run_maintenance() : ligne rattachée par le nom à regress_dba" "regress_dba|regress_dba" \
+	"$(psql_admin "SELECT string_agg(role_name || '|' || (details->>'old_name'), ',')
+	                FROM pass_policy.run_maintenance() WHERE action = 'remap'")"
+reload_sync || fail "v17 (f) pas de rechargement après run_maintenance"
+check_eq "v17 (f) après la maintenance : regress_dba verrouillé (shmem et role_state), regress_bob non" "1|1|0|0" \
+	"$(fa_locked regress_dba)|$(state_locked regress_dba)|$(fa_locked regress_bob)|$(state_locked regress_bob)"
 out=$(psql_as regress_dba "$GOOD") || true
-check_contains "(2) regress_dba refusé" "is locked by pg_pass_policy" "$out"
+check_contains "v17 (f) regress_dba refusé" "is locked by pg_pass_policy" "$out"
+out=$(psql_as regress_bob "$GOOD_BOB" "SELECT current_user") || true
+check_eq "v17 (f) regress_bob se connecte" "regress_bob" "$out"
 out=$(psql_as regress_padm "$GOOD" "SELECT pass_policy.unlock_role('regress_dba')" 2>&1) || true
-check_contains "(2) unlock_role('regress_dba') refusé à l'admin non superutilisateur" "only a superuser can manage privileged role" "$out"
+check_contains "v17 (f) unlock_role('regress_dba') refusé à l'admin non superutilisateur" "only a superuser can manage privileged role" "$out"
 psql_admin "SELECT pass_policy.unlock_role('regress_dba')" >/dev/null
 psql_admin "SELECT pass_policy.unassign_profile('regress_bob')" >/dev/null
 psql_admin "DROP ROLE regress_ua, regress_dba, regress_bob, regress_padm" >/dev/null

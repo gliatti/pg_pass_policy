@@ -903,9 +903,11 @@ ppp_describe(const char *code, const pppProfile *p, char **msg, char **detail,
  * applicable when the password was force-expired (must_change), nor to a
  * role that does not exist yet (CREATE ROLE).
  *
- * The role_state lookup is by OID only: a role_state row carrying the same
+ * The role_state lookup is by OID only, row of this cluster only (a
+ * restored row is inert, SPEC 6.3): a role_state row carrying the same
  * name but another OID can only belong to a dropped role (stale until the
  * next run_maintenance()), whose date must not apply to a re-created role.
+
  * A role created by CREATE ROLE ... PASSWORD has no role_state row until
  * the next run_maintenance(), only a password_history row with role_oid IS
  * NULL: the date of the most recent such row (by name) is used too, so that
@@ -933,7 +935,8 @@ ppp_min_age_violated(const char *username, Oid roleid, const pppProfile *p)
 								"FROM (SELECT pg_catalog.max(h1.changed_at) AS changed_at "
 								"FROM " PPP_SCHEMA ".password_history h1 "
 								"WHERE h1.role_oid IS NULL AND h1.role_name = $3) h "
-								"LEFT JOIN " PPP_SCHEMA ".role_state s ON s.role_oid = $1",
+								"LEFT JOIN " PPP_SCHEMA ".role_state s ON s.role_oid = $1 "
+								"AND s.cluster_id = " PPP_SCHEMA "._system_identifier()",
 								3, argtypes, values, NULL, true, 1);
 	if (ret != SPI_OK_SELECT)
 		elog(ERROR, "pg_pass_policy: role_state lookup failed: %s",

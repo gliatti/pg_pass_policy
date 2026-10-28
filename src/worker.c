@@ -93,6 +93,8 @@
 /* at most one message per minute for the conditions that last */
 #define PPP_UNTRUSTED_LOG_SECS	60
 #define PPP_WINDOW_KEPT_LOG_SECS 60
+/* at most one message per hour for the restored rows not bound yet */
+#define PPP_UNBOUND_LOG_SECS	3600
 
 /*
  * Profile durations converted to whole seconds for the shared memory (see
@@ -173,6 +175,7 @@ static bool ppp_sync_first = true;
 /* rate limiters of the worker's own messages (this process only) */
 static TimestampTz ppp_untrusted_logged_at = 0;
 static TimestampTz ppp_window_kept_logged_at = 0;
+static TimestampTz ppp_unbound_logged_at = 0;
 
 /* end of the last complete primary cycle (ppp_worker_cycle), 0 = none yet */
 static TimestampTz ppp_full_cycle_at = 0;
@@ -465,11 +468,9 @@ ppp_sync_pending(void)
 			 * audit row follows from the result, without any lookup that
 			 * could race with the write.  Its name is the current name of
 			 * the role (role_state has none for a dropped OID: no row
-			 * written, role_dropped).  A row of that OID is the role's
-			 * own: the restored rows are rebound by every reload
-			 * (_rebind_foreign_rows()), and one restored under this OID
-			 * since would belong to this role all the same
-			 * (_resolve_role_oid(): the OID first).
+			 * written, role_dropped).  Row of this cluster only (cluster_id
+			 * default): a restored row of the same OID is another, inert
+			 * row, never touched here (SPEC 6.3).
 			 */
 			values[0] = ObjectIdGetDatum(r->key.roleid);
 			values[1] = TimestampTzGetDatum(r->audit_locked_until); /* DT_NOEND = infinity */
@@ -480,7 +481,7 @@ ppp_sync_pending(void)
 										"(role_oid, role_name, locked_until, locked_by, lock_reason) "
 										"SELECT r.oid, r.rolname, $2, 'auto', "
 										"'too many failed authentication attempts' FROM r "
-										"ON CONFLICT (role_oid) DO UPDATE SET "
+										"ON CONFLICT (role_oid, cluster_id) DO UPDATE SET "
 										"role_name = EXCLUDED.role_name, "
 										"locked_until = EXCLUDED.locked_until, "
 										"locked_by = EXCLUDED.locked_by, "
@@ -985,19 +986,6 @@ ppp_sync_reload(void)
 	seq_snap = ppp_shared->lock_seq;
 	LWLockRelease(ppp_shared->lock);
 
-	/*
-	 * Rows restored from another cluster: rebound to their role (or
-	 * dropped and audited when they resolve to none) in this transaction,
-	 * before anything is read (SPEC 6.3, "Rechargement").  A standby cannot
-	 * write: the queries below resolve them in memory, the same way.
-	 */
-	if (!RecoveryInProgress())
-	{
-		ret = SPI_execute("SELECT FROM pass_policy._rebind_foreign_rows()", false, 0);
-		if (ret != SPI_OK_SELECT)
-			elog(ERROR, "_rebind_foreign_rows() returned SPI code %d", ret);
-	}
-
 	PushActiveSnapshot(GetLatestSnapshot());
 
 	/* profile "default" */
@@ -1020,25 +1008,20 @@ ppp_sync_reload(void)
 	}
 
 	/*
-	 * Roles with an assigned profile, by OID (current name for messages).
-	 * The OID of a row is resolved by _resolve_role_oid(), once per row
-	 * (SPEC 6.3, "Rechargement"): outside recovery every row is a row of
-	 * this cluster by now, resolved by its OID; on a standby a restored row
-	 * not rebound yet goes to its OID if it exists, else to its name.  A
-	 * row that does not resolve (dropped role, purged by run_maintenance())
-	 * is left out: it would otherwise give a from_profile entry
-	 * (PPP_CLASS_KEEP, never evicted) to nobody.  When a restored row and a
-	 * row of this cluster resolve to the same role, the latter wins.
+	 * Roles with an assigned profile, by OID (current name for messages):
+	 * rows of this cluster only (SPEC 6.3, "Rechargement"; a restored row
+	 * is inert until run_maintenance() binds it).  A row whose OID no
+	 * longer exists (dropped role, purged by run_maintenance()) is left
+	 * out: it would otherwise give a from_profile entry (PPP_CLASS_KEEP,
+	 * never evicted) to nobody.
 	 */
-	ret = SPI_execute("SELECT DISTINCT ON (a.oid) a.oid, a.rolname::text, p.max_failures, "
+	ret = SPI_execute("SELECT a.oid, a.rolname::text, p.max_failures, "
 					  PPP_SQL_WINDOW_SECS ", "
 					  PPP_SQL_LOCK_SECS " "
 					  "FROM pass_policy.role_profile rp "
 					  "JOIN pass_policy.profile p USING (profile_id) "
-					  "CROSS JOIN LATERAL (SELECT pass_policy._resolve_role_oid(rp.role_oid, "
-					  "rp.role_name, rp.cluster_id) AS oid OFFSET 0) x "
-					  "JOIN pg_catalog.pg_authid a ON a.oid = x.oid "
-					  "ORDER BY a.oid, rp.cluster_id = pass_policy._system_identifier() DESC",
+					  "JOIN pg_catalog.pg_authid a ON a.oid = rp.role_oid "
+					  "WHERE rp.cluster_id = pass_policy._system_identifier()",
 					  true, 0);
 	if (ret != SPI_OK_SELECT)
 		elog(ERROR, "reading role profiles returned SPI code %d", ret);
@@ -1067,19 +1050,17 @@ ppp_sync_reload(void)
 
 	/*
 	 * Persisted active locks ('infinity' comes back as DT_NOEND), by OID,
-	 * resolved as the profiles above: a row of this cluster whose OID no
+	 * rows of this cluster only, as the profiles above: a row whose OID no
 	 * longer exists (dropped role, purged by run_maintenance()) is ignored,
-	 * whoever bears its name now.  Several rows resolved to the same role
-	 * (standby): the longest lock wins (fail-closed).
+	 * whoever bears its name now.
 	 */
-	ret = SPI_execute("SELECT a.oid, a.rolname::text, pg_catalog.max(s.locked_until) "
+	ret = SPI_execute("SELECT a.oid, a.rolname::text, s.locked_until "
 					  "FROM pass_policy.role_state s "
-					  "CROSS JOIN LATERAL (SELECT pass_policy._resolve_role_oid(s.role_oid, "
-					  "s.role_name, s.cluster_id) AS oid OFFSET 0) x "
-					  "JOIN pg_catalog.pg_authid a ON a.oid = x.oid "
-					  "WHERE s.locked_until IS NOT NULL AND s.locked_until > now() "
-					  "GROUP BY a.oid, a.rolname",
+					  "JOIN pg_catalog.pg_authid a ON a.oid = s.role_oid "
+					  "WHERE s.cluster_id = pass_policy._system_identifier() "
+					  "AND s.locked_until IS NOT NULL AND s.locked_until > now()",
 					  true, 0);
+
 	if (ret != SPI_OK_SELECT)
 		elog(ERROR, "reading role_state returned SPI code %d", ret);
 	nlocks = SPI_processed;
@@ -1105,7 +1086,32 @@ ppp_sync_reload(void)
 		}
 	}
 
+	/*
+	 * Restored rows not bound yet: they apply nothing until run_maintenance()
+	 * or rebind_restored_roles() binds them (SPEC §12); told once an hour.
+	 */
+	ret = SPI_execute("SELECT pass_policy._unbound_count()", true, 1);
+	if (ret != SPI_OK_SELECT || SPI_processed != 1)
+		elog(ERROR, "_unbound_count() returned SPI code %d", ret);
+	{
+		bool		isnull;
+		int64		unbound = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
+														  SPI_tuptable->tupdesc, 1,
+														  &isnull));
+
+		if (isnull || unbound == 0)
+			ppp_unbound_logged_at = 0;	/* a new restore is told at once */
+		else if (ppp_log_due(&ppp_unbound_logged_at, GetCurrentTimestamp(),
+							 PPP_UNBOUND_LOG_SECS * 1000))
+			ereport(WARNING,
+					(errmsg_plural(PPP_LOG_PREFIX "%lld row restored from another cluster is not bound: run pass_policy.run_maintenance() or rebind_restored_roles()",
+								   PPP_LOG_PREFIX "%lld rows restored from another cluster are not bound: run pass_policy.run_maintenance() or rebind_restored_roles()",
+								   (unsigned long) unbound, (long long) unbound),
+					 errdetail("Rows of role_state and role_profile restored from another cluster apply no lock and no profile until they are bound to their role (at most one message per hour).")));
+	}
+
 	PopActiveSnapshot();
+
 
 	/*
 	 * Apply everything under the lock; nothing below can fail.
