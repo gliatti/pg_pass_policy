@@ -525,14 +525,13 @@ SELECT count(*) AS history_after,
              1 | t
 (1 row)
 
--- Le mot de passe historique est désormais détecté comme réutilisation.
--- check_password() répond pour le rôle (min_age d'abord, même pour un
--- superutilisateur : vérification 8) ; le hook, qui ignore min_age pour un
--- superutilisateur, montre la réutilisation.
+-- Le mot de passe historique est désormais détecté comme réutilisation, par
+-- check_password() comme par le hook (min_age ignoré pour un superutilisateur
+-- par les deux, vérification 9).
 SELECT ppp_test.code(pass_policy.check_password('regress_legacy', 'Legacy-Passw0rd#2019')) AS reuse;
   reuse  
 ---------
- PPP-030
+ PPP-031
 (1 row)
 
 SELECT ppp_test.try($$ALTER ROLE regress_legacy PASSWORD 'Legacy-Passw0rd#2019'$$) AS reuse_hook;
@@ -620,7 +619,7 @@ SELECT count(*) AS history_after FROM pass_policy.password_history
 SELECT ppp_test.code(pass_policy.check_password('regress_recon', 'Recon-Disabled#01')) AS reuse;
   reuse  
 ---------
- PPP-030
+ PPP-031
 (1 row)
 
 SELECT ppp_test.try($$ALTER ROLE regress_recon PASSWORD 'Recon-Disabled#01'$$) AS reuse_hook;

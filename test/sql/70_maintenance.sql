@@ -225,10 +225,9 @@ CREATE TEMP TABLE m6 AS SELECT * FROM pass_policy.run_maintenance();
 SELECT count(*) AS history_after,
        bool_and(verifier LIKE 'SCRAM-SHA-256$%') AS scram
   FROM pass_policy.password_history WHERE role_name = 'regress_legacy';
--- Le mot de passe historique est désormais détecté comme réutilisation.
--- check_password() répond pour le rôle (min_age d'abord, même pour un
--- superutilisateur : vérification 8) ; le hook, qui ignore min_age pour un
--- superutilisateur, montre la réutilisation.
+-- Le mot de passe historique est désormais détecté comme réutilisation, par
+-- check_password() comme par le hook (min_age ignoré pour un superutilisateur
+-- par les deux, vérification 9).
 SELECT ppp_test.code(pass_policy.check_password('regress_legacy', 'Legacy-Passw0rd#2019')) AS reuse;
 SELECT ppp_test.try($$ALTER ROLE regress_legacy PASSWORD 'Legacy-Passw0rd#2019'$$) AS reuse_hook;
 -- Une seconde passe ne duplique pas l'historique

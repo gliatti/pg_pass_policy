@@ -39,8 +39,8 @@ SELECT p.active_role = s.active_role AS pair_active_ok
   FROM pass_policy.rotation_pair p, ppp_test.switches s
  WHERE p.pair_name = 'app' AND s.n = 1;
 -- Le mot de passe renvoyé est celui du rôle actif (présent dans son
--- historique) : check_password() répond pour le rôle (min_age d'abord, même
--- pour un superutilisateur : vérification 8), le hook montre la réutilisation
+-- historique) : check_password() et le hook montrent la réutilisation
+-- (min_age ignoré pour un superutilisateur par les deux, vérification 9)
 SELECT ppp_test.code(pass_policy.check_password(active_role, password)) AS reuse
   FROM ppp_test.switches WHERE n = 1;
 SELECT ppp_test.try(format('ALTER ROLE %I PASSWORD %L', active_role, password)) AS reuse_hook

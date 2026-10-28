@@ -139,7 +139,6 @@ ppp_shmem_startup(void)
 		ppp_shared->not_loaded_logged_at = 0;
 		ppp_shared->shmem_init_at = GetCurrentTimestamp();
 		ppp_shared->worker_missing_logged_at = 0;
-		ppp_shared->rescue_logged_at = 0;
 	}
 
 	/* the role hash table belongs to lockout.c */

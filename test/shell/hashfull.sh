@@ -160,6 +160,31 @@ check_eq "la purge ne touche pas au verrou de la victime" "infinity" "$out"
 psql_admin "SELECT pass_policy.alter_profile('default', '{\"failure_window\": \"15 minutes\"}')" >/dev/null
 kick || true
 
+# --- rôles supprimés : le worker en fait des fantômes (vérification 9) -------
+# Hash plein de compteurs vivants de vrais rôles (non évincables en mode
+# COUNT) : l'échec d'un autre rôle n'est pas compté. Les rôles supprimés, leurs
+# échecs déjà audités (rien en attente), le tour suivant du worker passe leurs
+# entrées en role_missing (fantômes évincables) : l'échec est de nouveau compté.
+for i in $(seq 1 "$MAX"); do
+	psql_admin "CREATE ROLE regress_gone$i LOGIN PASSWORD '$GOOD'"
+	psql_as "regress_gone$i" "$BAD" >/dev/null || true
+done
+psql_admin "CREATE ROLE regress_gx LOGIN PASSWORD '$GOOD'"
+check_eq "hash plein de compteurs vivants de vrais rôles" "$MAX" "$(n_entries)"
+psql_as regress_gx "$BAD" >/dev/null || true
+check_eq "compteurs vivants non évincables : l'échec de regress_gx n'est pas compté" "0" \
+	"$(psql_admin "SELECT count(*) FROM pass_policy.failed_attempts() WHERE role_name = 'regress_gx'")"
+kick || fail "pas de tour du worker avant la suppression des rôles"
+for i in $(seq 1 "$MAX"); do psql_admin "DROP ROLE IF EXISTS regress_gone$i"; done
+kick || fail "pas de tour du worker après la suppression des rôles"
+sleep 1
+psql_as regress_gx "$BAD" >/dev/null || true
+check_eq "rôles supprimés devenus fantômes : l'échec de regress_gx est compté" "1" \
+	"$(psql_admin "SELECT failed_count FROM pass_policy.failed_attempts() WHERE role_name = 'regress_gx'")"
+# regress_gx supprimé à son tour : son entrée redevient évincable pour la suite
+psql_admin "DROP ROLE regress_gx"
+kick || fail "pas de tour du worker après la suppression de regress_gx"
+
 # --- toutes les entrées sont des verrous de vrais rôles : ERROR 53400 -------
 flood ghost6 24
 need=$((MAX - $(n_real_locked)))

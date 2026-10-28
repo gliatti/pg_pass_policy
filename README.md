@@ -25,8 +25,11 @@
 >   en `peer` passe (sauf verrou déjà en mémoire partagée, mais **même s'il
 >   est verrouillé dans `role_state`** : ce verrou n'est pas encore connu) ;
 >   n'y listez qu'un compte d'administration lié à un compte système, avec
->   une ligne `local … peer` dans `pg_hba.conf`. Un rôle exempté ne peut être
->   ni expiré ni verrouillé par l'extension.
+>   une ligne `local … peer` dans `pg_hba.conf`. `trust` n'y donne pas accès
+>   et la liste est vide par défaut : le refus `57P03` porte un HINT qui
+>   rappelle cette voie (« … through peer authentication as a superuser
+>   listed in pg_pass_policy.rescue_roles », même texte pour tout client).
+>   Un rôle exempté ne peut être ni expiré ni verrouillé par l'extension.
 
 Extension PostgreSQL (C + SQL) de gestion du cycle de vie des mots de passe des
 rôles, pour PostgreSQL **14 à 18** :
@@ -157,11 +160,13 @@ SELECT pass_policy.generate_password(32, 'applicatif');
 ```
 
 `check_password` répond comme le ferait `ALTER ROLE … PASSWORD` du même
-appelant (même évaluation que le hook, `min_age` d'un vérificateur pré-haché
-compris), à deux exceptions près : elle ignore `superuser_bypass` et
-contrôle `min_age` même pour un superutilisateur appelant : elle répond pour
-le profil du rôle, quel que soit l'appelant (un client qui vérifie un mot de
-passe pour autrui ne doit pas le croire conforme). Hors de la base `pg_pass_policy.database`,
+appelant, dans les deux sens (NULL : le hook accepterait ; un code : il
+refuserait avec ce code) : même évaluation que le hook, `min_age` compris
+(ignoré pour un superutilisateur appelant, qui peut changer le mot de passe
+aussitôt, contrôlé pour les autres, vérificateur pré-haché compris). Seule
+exception : elle ignore `superuser_bypass` (un superutilisateur qui vérifie
+un mot de passe pour autrui ne doit pas le croire conforme ; son propre
+`ALTER ROLE` passerait). Hors de la base `pg_pass_policy.database`,
 où la politique ne s'applique pas, `check_password` lève `PPP-003` et
 `generate_password` aussi avec `enforce_database = on` (sinon `WARNING`,
 mot de passe produit).
@@ -275,7 +280,11 @@ log l'indique (au plus une ligne par seconde, plus le message `worker_pid =
 `pass_policy` n'appartient plus à un superutilisateur) ; le worker réessaie
 toutes les 5 secondes, y compris sur un standby, et
 `pass_policy.worker_status()` montre `locks_loaded` à faux. Le client, lui,
-ne reçoit que le `57P03`, sans détail sur l'état interne. Les rôles de
+ne reçoit que le `57P03`, sans détail sur l'état interne, avec un HINT
+identique pour tous (« If the condition persists, an administrator can
+connect through peer authentication as a superuser listed in
+pg_pass_policy.rescue_roles. ») : il ne dit rien du rôle ni du contenu de
+la liste. Les rôles de
 `pg_pass_policy.exempt_roles` passent toujours : c'est le filet de sécurité
 de l'administrateur. Un **superutilisateur** listé dans
 `pg_pass_policy.rescue_roles` (vide par défaut : pas d'accès de secours) et
@@ -286,8 +295,8 @@ voie d'administration hors `exempt_roles`. Il est refusé « locked » si un
 verrou est déjà en mémoire partagée ; un verrou de `role_state` pas encore
 chargé, lui, n'est pas connu du hook et ne l'arrête pas : d'où la liste
 explicite et la seule méthode `peer`, qui lie le rôle à un compte système.
-Le log garde la trace des admissions (LOG « superuser … admitted by peer
-authentication … », au plus une ligne par minute). Un superutilisateur non
+Le log garde la trace de chaque admission (LOG « superuser "…" admitted by
+peer authentication … », une ligne par connexion, avec le nom du rôle). Un superutilisateur non
 listé, en `trust` (même sur socket Unix) ou dont le contrôle `peer` échoue,
 un rôle ordinaire (même listé) reçoivent le `57P03`. Une connexion de
 réplication d'un rôle non exempté est concernée de la même façon.
@@ -426,7 +435,7 @@ transaction) : la trace est une ligne du log serveur,
 | `PPP-018` | présent dans le dictionnaire des mots de passe courants (`reject_dictionary`) |
 | `PPP-019` | trop de caractères identiques consécutifs (`max_repeat`) |
 | `PPP-020` | caractère de contrôle, ou espace en début ou en fin ; dans une base UTF8, aussi les caractères Unicode de contrôle, de format et d'espace invisibles (U+0080–U+009F, U+00A0, U+00AD, U+200B–U+200F, U+2028–U+202F, U+2060–U+206F, U+3000, U+FEFF…) |
-| `PPP-030` | changé trop récemment (`min_age` ; non appliqué à un superutilisateur par `ALTER ROLE`, appliqué par `check_password()`) |
+| `PPP-030` | changé trop récemment (`min_age` ; non appliqué à un superutilisateur appelant, par `ALTER ROLE` comme par `check_password()`) |
 | `PPP-031` | parmi les `history_count` derniers mots de passe, l'actuel compris (`history_days`) |
 
 Les caractères sont comptés en points de code UTF-8 ; tout caractère non ASCII

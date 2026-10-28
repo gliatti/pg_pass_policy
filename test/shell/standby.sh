@@ -284,6 +284,25 @@ echo "pg_pass_policy.worker_interval = 2" >>"$SB_DATA/postgresql.conf"
 sb_admin "SELECT pg_reload_conf()" >/dev/null
 psql_admin "SELECT pass_policy.alter_profile('default', '{\"max_failures\": 5, \"lock_duration\": \"30 minutes\"}')" >/dev/null
 
+# --- standby : rôle supprimé avec un verrou en attente d'audit (vérification 9)
+# Verrou local posé sur le standby (audit en attente jusqu'à la promotion),
+# puis rôle supprimé sur le primaire et rejoué : le worker du standby ne fait
+# pas de l'entrée un fantôme (quelque chose est en attente). Elle reste non
+# évincable : un remplissage par des noms inexistants ne la perd pas, et son
+# audit role_locked (role_missing) est écrit après la promotion (plus bas).
+psql_admin "CREATE ROLE regress_sb_gone LOGIN PASSWORD '$GOOD'"
+sb_catch_up || fail "vérification 9 : le standby n'a pas rejoué regress_sb_gone"
+sleep 3 # profil default rétabli rechargé par le worker du standby
+for i in 1 2 3 4 5; do sb_as regress_sb_gone "$BAD" >/dev/null || true; done
+out=$(sb_as regress_sb_gone "$GOOD") || true
+check_contains "vérification 9 : regress_sb_gone verrouillé localement sur le standby" "is locked by pg_pass_policy" "$out"
+psql_admin "DROP ROLE regress_sb_gone"
+sb_catch_up || fail "vérification 9 : le standby n'a pas rejoué le DROP ROLE"
+sleep 3 # au moins un tour du worker du standby (ppp_sync_cleanup)
+for i in $(seq 1 24); do sb_as "phantom_sb_$i" "$BAD" >/dev/null || true; done
+out=$(sb_admin "SELECT count(*) FROM pass_policy.failed_attempts() WHERE role_name = 'regress_sb_gone' AND locked_until IS NOT NULL")
+check_eq "vérification 9 : l'entrée du rôle supprimé, verrou en attente d'audit, n'est pas évincée" "1" "$out"
+
 # --- lecture seule : aucune erreur d'écriture du worker du standby -----------
 n=$(tail -n "+$((sb_log0 + 1))" "$PPP_TMP/standby.log" | grep -cE 'pg_pass_policy: worker .* failed|read-only transaction' || true)
 check_eq "standby : aucun échec de cycle du worker (aucune écriture tentée)" "0" "$n"
@@ -323,6 +342,11 @@ out=$(sb_admin "SELECT coalesce(sum((details->>'count')::int), 0) >= 2 FROM pass
 check_eq "nouveau primaire : échecs comptés sur le standby audités (auth_failed)" "t" "$out"
 out=$(sb_as regress_sb_auto "$GOOD") || true
 check_contains "nouveau primaire : le rôle reste verrouillé" "is locked by pg_pass_policy" "$out"
+if wait_for_sb "SELECT count(*) > 0 FROM pass_policy.audit_log WHERE event_type = 'role_locked' AND role_name = 'regress_sb_gone' AND (details->>'role_missing')::boolean"; then
+	ok "vérification 9 : nouveau primaire : audit role_locked (role_missing) du rôle supprimé écrit"
+else
+	fail "vérification 9 : nouveau primaire : pas d'audit role_locked pour regress_sb_gone" "$(sb_admin "SELECT event_type, details FROM pass_policy.audit_log WHERE role_name = 'regress_sb_gone'")"
+fi
 n=$(tail -n "+$((sb_log0 + 1))" "$PPP_TMP/standby.log" | grep -c 'pg_pass_policy: worker .* failed' || true)
 check_eq "nouveau primaire : aucun échec de cycle du worker" "0" "$n"
 

@@ -1121,9 +1121,11 @@ ppp_evaluate_plain(const char *username, Oid roleid, const char *password,
  *   then complexity (skipped when bypass_complexity), minimum age and
  *   history (ppp_evaluate_plain()).
  *
- * bypass_complexity is superuser_bypass applied to a superuser caller: the
- * hook passes it, check_password() never does (it answers for the profile
- * of the role, whoever calls it).
+ * caller_is_super is the same for both (superuser() of the caller): the
+ * minimum age is skipped for a superuser caller by the hook and by
+ * check_password() alike.  bypass_complexity is superuser_bypass applied to
+ * a superuser caller: the hook passes it, check_password() never does (its
+ * only difference with the hook, see ppp_check_password()).
  */
 static const char *
 ppp_evaluate_password(const char *username, Oid roleid, const char *password,
@@ -1481,7 +1483,8 @@ ppp_policy_init(void)
  */
 static const char *
 ppp_check_secret(FunctionCallInfo fcinfo, const char *username, Oid roleid,
-				 const pppProfile *prof, bool may_check_history)
+				 const pppProfile *prof, bool may_check_history,
+				 bool caller_is_super)
 {
 	text	   *volatile pwtext = NULL;
 	char	   *volatile password = NULL;
@@ -1493,13 +1496,15 @@ ppp_check_secret(FunctionCallInfo fcinfo, const char *username, Oid roleid,
 		password = text_to_cstring(pwtext);
 
 		/*
-		 * superuser_bypass ignored, and min_age checked even for a
-		 * superuser caller (caller_is_super = false): the answer is that
-		 * of the profile of the role, not of the caller's own ALTER ROLE
+		 * Same caller as the hook would see (caller_is_super: min_age is
+		 * skipped for a superuser caller, as by the hook), but
+		 * superuser_bypass ignored (bypass_complexity = false): the only
+		 * difference with the hook, see ppp_check_password()
 		 */
 		code = ppp_evaluate_password(username, roleid, password,
 									 get_password_type(password), prof,
-									 may_check_history, false, false);
+									 may_check_history, caller_is_super,
+									 false);
 	}
 	PG_FINALLY();
 	{
@@ -1523,12 +1528,15 @@ ppp_check_secret(FunctionCallInfo fcinfo, const char *username, Oid roleid,
  * NULL if the password complies with the effective profile of the role,
  * otherwise "PPP-0xx: reason".  No side effect, no audit.
  *
- * pg_pass_policy.superuser_bypass is ignored: the function answers for the
- * profile of the role, so that a superuser checking a password for someone
- * else (client, CLI) is not told that a weak password complies.  The hook
- * still lets such a password through for a superuser caller.  For the same
- * reason the minimum age (PPP-030) is checked whoever the caller, while the
- * hook does not apply it to a superuser caller.
+ * The answer is the one the hook would give to the same caller running
+ * ALTER ROLE ... PASSWORD now, both ways (NULL: the hook accepts; a code:
+ * the hook refuses with that code), with a single exception:
+ * pg_pass_policy.superuser_bypass is ignored, so that a superuser checking
+ * a password for someone else (client, CLI) is not told that a weak
+ * password complies; the hook still lets such a password through for a
+ * superuser caller (complexity only).  The minimum age (PPP-030) follows
+ * the hook: skipped for a superuser caller, who may change the password at
+ * once, checked for anyone else (SPEC 4, verification 9).
  *
  * The minimum age, history and current password checks are only done when
  * the caller is a superuser, the role itself, or may change the role's
@@ -1581,7 +1589,7 @@ ppp_check_password(PG_FUNCTION_ARGS)
 												  roleid);
 
 		code = ppp_check_secret(fcinfo, username, roleid, &prof,
-								may_check_history);
+								may_check_history, caller_is_super);
 
 		/* back to the caller's identity, GUC level and memory context */
 		ppp_spi_end(&st);

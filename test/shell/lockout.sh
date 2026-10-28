@@ -749,6 +749,11 @@ client_out="$out"
 out=$(psql_as regress_lock "$BAD" "SELECT current_user") || true
 check_contains "fenêtre : mauvais mot de passe, même réponse (pas d'oracle)" "FATAL: +pg_pass_policy: lock state not loaded yet, retry" "$out"
 client_out="$client_out$out"
+# (vérification 9) HINT générique : la voie de secours (peer + rescue_roles),
+# le même texte pour tout client (rôle ordinaire comme superutilisateur, plus bas)
+hint_re='HINT: +If the condition persists, an administrator can connect through peer authentication as a superuser listed in pg_pass_policy.rescue_roles.'
+check_contains "fenêtre : le refus 57P03 indique rescue_roles et peer (HINT)" "$hint_re" "$out"
+hint_plain=$(printf '%s\n' "$out" | grep 'HINT:')
 out=$(psql_as regress_trust_locked "" "SELECT current_user") || true
 check_contains "fenêtre : rôle verrouillé par trust refusé aussi (57P03)" "FATAL: +pg_pass_policy: lock state not loaded yet, retry" "$out"
 psql_admin "CREATE ROLE regress_window LOGIN PASSWORD '$GOOD'" >/dev/null
@@ -775,6 +780,7 @@ client_out="$client_out$out"
 out=$(psql_as regress_su "$BAD" "SELECT current_user") || true
 check_contains "fenêtre, worker présent : superutilisateur, mauvais mot de passe : même réponse" "FATAL: +pg_pass_policy: lock state not loaded yet, retry" "$out"
 client_out="$client_out$out"
+check_eq "fenêtre : même HINT pour un superutilisateur que pour un rôle ordinaire" "$hint_plain" "$(printf '%s\n' "$out" | grep 'HINT:')"
 # (vérification 7, 8) voie locale de secours (voir plus haut)
 out=$(psql_local regress_su_peer) || true
 check_contains "fenêtre, rescue_roles vide : superutilisateur en peer refusé (57P03)" "FATAL: +pg_pass_policy: lock state not loaded yet, retry" "$out"
@@ -802,9 +808,10 @@ psql_admin "SELECT pass_policy.shmem_unlock_role('regress_su_peer')" >/dev/null
 out=$(psql_local regress_su_peer) || true
 check_eq "fenêtre : verrou shmem levé, superutilisateur en peer de nouveau accepté" "regress_su_peer" "$out"
 out=$(psql_local regress_su_peer) || true
-# deux admissions de plus en quelques secondes : un seul LOG (une fois par minute)
+# (vérification 9) chaque admission est journalisée, sans limitation, avec le
+# nom du rôle : trois admissions, trois LOG
 n=$(tail -n "+$((log0 + 1))" "$PPP_TMP/server.log" | grep -c 'superuser "regress_su_peer" admitted by peer authentication before the lock state is loaded' || true)
-check_eq "fenêtre : l'admission de secours est journalisée, une fois par minute (3 admissions)" "1" "$n"
+check_eq "fenêtre : chaque admission de secours est journalisée (3 admissions, 3 LOG)" "3" "$n"
 # Rien sur l'état interne n'est envoyé au client non authentifié (constat 1)
 check_not_contains "fenêtre : la sortie du client ne mentionne ni le worker ni exempt_roles" "worker|exempt" "$client_out"
 out=$(psql_admin "SELECT last_reload IS NULL FROM pass_policy.worker_status()")

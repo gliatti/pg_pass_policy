@@ -54,13 +54,6 @@ extern bool  ppp_enforce_database;
 #define PPP_WORKER_MISSING_GRACE_SECS	10
 #define PPP_WORKER_MISSING_LOG_SECS		60
 
-/*
- * LOG of a rescue admission (superuser of pg_pass_policy.rescue_roles
- * authenticated by peer during the start-up window): at most once per
- * PPP_RESCUE_LOG_SECS for the whole instance.
- */
-#define PPP_RESCUE_LOG_SECS				60
-
 /* ---- Mémoire partagée (remplie par le worker, lue par le hook auth) ------- */
 typedef struct pppRoleKey
 {
@@ -264,15 +257,14 @@ typedef struct pppSharedState
 	 * LOG of the hook when no worker has published its PID
 	 * (worker_pid = 0) PPP_WORKER_MISSING_GRACE_SECS after it: the worker
 	 * was never started (max_worker_processes exhausted) or cannot connect
-	 * (pg_pass_policy.database does not exist).  rescue_logged_at limits to
-	 * one per minute the LOG of a rescue admission (superuser of
-	 * pg_pass_policy.rescue_roles authenticated by peer during the window).
+	 * (pg_pass_policy.database does not exist).  A rescue admission
+	 * (superuser of pg_pass_policy.rescue_roles authenticated by peer during
+	 * the window) is logged every time, without such a limit.
 	 */
 	bool		locks_loaded;
 	TimestampTz not_loaded_logged_at;
 	TimestampTz shmem_init_at;
 	TimestampTz worker_missing_logged_at;
-	TimestampTz rescue_logged_at;
 
 	/*
 	 * Last time an eviction scan in PPP_ENTER_COUNT mode found nothing to

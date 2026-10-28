@@ -925,8 +925,15 @@ ppp_client_auth_hook(Port *port, int status)
 		log_not_loaded = ppp_log_due(&ppp_shared->not_loaded_logged_at, now,
 									 1000);
 	else if (local_admin && !refuse)
-		log_rescue = ppp_log_due(&ppp_shared->rescue_logged_at, now,
-								 PPP_RESCUE_LOG_SECS * 1000);
+	{
+		/*
+		 * Every rescue admission is logged, with the role name: the path is
+		 * open to the superusers of rescue_roles authenticated by peer
+		 * only, so the messages cannot be flooded by an outsider, and a
+		 * limit would hide admissions from the audit of the server log.
+		 */
+		log_rescue = true;
+	}
 
 	LWLockRelease(ppp_shared->lock);
 
@@ -948,7 +955,7 @@ ppp_client_auth_hook(Port *port, int status)
 		ereport(LOG,
 				(errmsg(PPP_LOG_PREFIX "superuser \"%s\" admitted by peer authentication before the lock state is loaded",
 						rolename),
-				 errdetail("The role is listed in pg_pass_policy.rescue_roles; a lock it may hold in role_state is not known yet (at most one message per minute).")));
+				 errdetail("The role is listed in pg_pass_policy.rescue_roles; a lock it may hold in role_state is not known yet.")));
 	if (hash_full)
 		ereport(LOG,
 				(errmsg(PPP_LOG_PREFIX "cannot track authentication failures of role \"%s\": too many tracked roles",
@@ -993,10 +1000,19 @@ ppp_client_auth_hook(Port *port, int status)
 					 errdetail("Roles not listed in pg_pass_policy.exempt_roles are refused, whatever the authentication method, until the persisted locks are re-injected from role_state (at most one message per second)."),
 					 errhint("Check that the pg_pass_policy background worker is running (pass_policy.worker_status()); roles listed in pg_pass_policy.exempt_roles can still connect, superusers listed in pg_pass_policy.rescue_roles through peer, and any superuser once no worker has started for %d seconds.",
 							 PPP_WORKER_MISSING_GRACE_SECS)));
+		/*
+		 * The hint is the same for every client, whatever the role, its
+		 * attributes and the contents of rescue_roles: it names the
+		 * documented emergency path and tells nothing about the role or
+		 * the configuration (trust is not accepted and rescue_roles is
+		 * empty by default, so an administrator locked out needs to know
+		 * where to look).
+		 */
 		ereport(FATAL,
 				(errcode(ERRCODE_CANNOT_CONNECT_NOW),
 				 errmsg(PPP_LOG_PREFIX "lock state not loaded yet, retry"),
-				 errdetail("The server has just started; retry in a few seconds.")));
+				 errdetail("The server has just started; retry in a few seconds."),
+				 errhint("If the condition persists, an administrator can connect through peer authentication as a superuser listed in pg_pass_policy.rescue_roles.")));
 	}
 }
 
@@ -1753,11 +1769,14 @@ ppp_failed_attempts(PG_FUNCTION_ARGS)
 		 * Does each name exist now?  Decided here, on the copy and outside
 		 * the LWLock, by a syscache lookup, for the callers that see the
 		 * folded row only (a superuser sees every name, the flag is not
-		 * used for him): the role_missing flag of the entry is refreshed by
-		 * an authentication attempt and by the synchronisation pass of the
-		 * worker (ppp_sync_cleanup) only, so a role created (or renamed)
-		 * under a name tried earlier would stay folded, and a role renamed
-		 * away would keep its old name visible, until then.
+		 * used for him).  The role_missing flag of the entry is not used on
+		 * purpose: it is only a cache for the eviction classes, set by an
+		 * authentication attempt and turned on by the synchronisation pass
+		 * of the worker (ppp_sync_cleanup, false -> true only, for entries
+		 * with nothing pending), so a role created (or renamed) under a
+		 * name tried earlier would stay folded, and a role renamed away
+		 * would keep its old name visible, until then.  The view must be
+		 * exact at the time it is read: its own lookup is kept (SPEC 12).
 		 */
 		for (i = 0; i < nrows; i++)
 			rows[i].role_missing =
