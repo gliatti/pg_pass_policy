@@ -1216,6 +1216,7 @@ def test_list_audit_pages_without_count_over(client, test_url):
         first = db.list_audit(conn, role="web_t_alpha", limit=2, offset=0)
         assert len(first.rows) == 2 and first.has_next and first.total == total
         assert not first.capped and "total" not in first.rows[0]
+        assert "matching" not in first.rows[0]
         last_offset = (total - 1) // 2 * 2
         last = db.list_audit(conn, role="web_t_alpha", limit=2, offset=last_offset)
         assert not last.has_next and last.total == total

@@ -80,15 +80,21 @@ def _row_response(
     notice: str | None = None,
     warning: str | None = None,
     password: str | None = None,
+    rotated: bool = False,
 ) -> Any:
-    if password is None:
+    """rotated: a rotation is committed (with or without a password), the
+    row is then re-read through db.reread_after_commit()."""
+    if password is None and not rotated:
         row = db.get_role(conn, role)
     else:
         # the rotation is committed: whatever happens to the re-read, this
-        # response is the only place the new password will ever be shown
-        row, warning = db.reread_after_commit(
+        # response is the only place the new password (or the warning that
+        # none was returned) will ever be shown
+        row, reread = db.reread_after_commit(
             conn, lambda c: db.get_role(c, role), log, f"role {role} rotated", REREAD_WARNING
         )
+        if reread is not None:
+            warning = reread if warning is None else f"{warning} {reread}"
     context = {
         "r": row,
         "role_name": role,
@@ -118,10 +124,12 @@ def rotate(
         # committed, but rotate_password() returned NULL or an empty string:
         # said as such (200: the rotation did happen, the role's old password
         # no longer works) rather than a password displayed as "None" or an
-        # empty reveal box, as for a pair switch (pairs.NO_ROW_WARNING); no
-        # password to protect, so the row is read the normal way
+        # empty reveal box, as for a pair switch (pairs.NO_ROW_WARNING); the
+        # row is re-read as after any committed rotation
         log.error("role %s: rotation applied but no password returned", role)
-        return _row_response(request, conn, role, warning=NO_PASSWORD_WARNING.format(role))
+        return _row_response(
+            request, conn, role, warning=NO_PASSWORD_WARNING.format(role), rotated=True
+        )
     # the password exists only in this response (no-store), never in a log or a URL
     return _row_response(request, conn, role, password=password)
 

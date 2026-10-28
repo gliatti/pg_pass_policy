@@ -61,15 +61,14 @@ def _context(request: Request, conn: Connection, filters: dict[str, Any]) -> dic
 
             result = fetch(page)
             # a page past the end (stale link, hand-typed URL): the last
-            # page, not an empty table with a "page 7 / 2" footer; no second
-            # query when nothing matches (the last page is empty as well).
-            # The total of a page past the end is exact (list_audit()).
-            if not result.capped:
-                clamped = min(page, _page_count(result.total, page_size))
-                if clamped != page:
-                    page = clamped
-                    if result.total:
-                        result = fetch(page)
+            # page known from the bounded count (the real last page when it
+            # is not capped), not an empty table with a "page 7 / 2" footer;
+            # no second query when nothing matches (the last page is empty
+            # as well).
+            if not result.rows and page > 1:
+                page = min(page, _page_count(result.total, page_size))
+                if result.total:
+                    result = fetch(page)
     except (psycopg.DataError, db.InvalidFilter) as exc:
         error = f"Invalid filter: {db.error_message(exc)}"
     # more than AUDIT_COUNT_CAP events: the page count is unknown, the
@@ -81,7 +80,7 @@ def _context(request: Request, conn: Connection, filters: dict[str, Any]) -> dic
         "events": result.rows,
         "total": result.total,
         "total_label": total_label(result),
-        "has_next": result.has_next if pages is None else page < pages,
+        "has_next": result.has_next,
         "page": page,
         "pages": pages,
         "filters": filters,

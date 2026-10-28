@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import logging
+from datetime import datetime
 from types import SimpleNamespace
 
 import psycopg
@@ -55,15 +56,20 @@ def _proxy_request(raw: bytes) -> Request:
     return Request(scope)
 
 
-@pytest.mark.parametrize("raw", [b"\xc9milie", b"bad\xff", b"\xe2\x82"])
-def test_a_proxy_user_that_is_not_utf8_is_refused(raw, caplog):
+@pytest.mark.parametrize(
+    ("raw", "user"), [(b"\xc9milie", "Émilie"), (b"bad\xff", "bad\xff"), (b"\xe2\x82", None)]
+)
+def test_a_proxy_user_that_is_not_utf8_is_read_as_latin1(raw, user, caplog):
     caplog.set_level(logging.WARNING)
     settings = make_settings(auth="proxy", basic_users="", proxy_header="X-Remote-User")
-    with pytest.raises(HTTPException) as refused:
-        auth.user_from_proxy(_proxy_request(raw), settings)
-    assert refused.value.status_code == 401
-    assert "not valid UTF-8" in refused.value.detail
-    assert "not valid UTF-8" in caplog.text
+    if user is None:
+        # latin-1 gives a C1 control (\x82): refused as any such name
+        with pytest.raises(HTTPException) as refused:
+            auth.user_from_proxy(_proxy_request(raw), settings)
+        assert refused.value.status_code == 401
+    else:
+        assert auth.user_from_proxy(_proxy_request(raw), settings) == user
+    assert "not valid UTF-8: read as latin-1" in caplog.text
     # the same function on the UTF-8 bytes of the name
     assert auth.user_from_proxy(_proxy_request("Émilie".encode()), settings) == "Émilie"
 
@@ -89,8 +95,9 @@ def test_printable_names_are_accepted(name):
 
 
 class _AuditConn:
-    """Answers the page query with `matching` rows past `offset` (at most
-    LIMIT), and the count queries with min(matching, LIMIT) or matching."""
+    """Answers the single audit query with `matching` events: the bounded
+    count min(matching, cap) and the rows past `offset` (at most LIMIT), or
+    one row with NULL page columns when the page is empty."""
 
     def __init__(self, matching: int):
         self.matching = matching
@@ -98,11 +105,12 @@ class _AuditConn:
 
     def execute(self, sql, params):
         self.queries.append((sql, params))
-        if sql.lstrip().startswith("SELECT count(*)"):
-            n = min(self.matching, params[-1]) if "LIMIT" in sql else self.matching
-            return SimpleNamespace(fetchone=lambda: {"n": n})
-        limit, offset = params[-2], params[-1]
-        rows = [{"id": i} for i in range(offset, min(self.matching, offset + limit))]
+        n_where = (len(params) - 3) // 2
+        cap, limit, offset = params[n_where], params[-2], params[-1]
+        n = min(self.matching, cap)
+        rows = [
+            {"matching": n, "id": i} for i in range(offset, min(self.matching, offset + limit))
+        ] or [{"matching": n, "id": None}]
         return SimpleNamespace(fetchall=lambda: rows)
 
 
@@ -111,9 +119,10 @@ def test_audit_queries_one_row_more_and_never_counts_over():
     page = db.list_audit(conn, limit=50, offset=0)
     sql, params = conn.queries[0]
     assert "OVER" not in sql and params[-2:] == [51, 0]
-    # last page: the total comes from the page itself, no count
+    # last page: one statement for the page and the count
     assert page == db.AuditPage(page.rows, 30)
     assert len(page.rows) == 30 and len(conn.queries) == 1
+    assert "matching" not in page.rows[0]
 
 
 def test_audit_nothing_matches_is_one_query():
@@ -122,12 +131,14 @@ def test_audit_nothing_matches_is_one_query():
     assert len(conn.queries) == 1
 
 
-def test_audit_with_a_next_page_counts_up_to_the_cap():
+def test_audit_page_and_count_are_one_statement_up_to_the_cap():
     conn = _AuditConn(120)
     page = db.list_audit(conn, role="r", limit=50, offset=50)
     assert len(page.rows) == 50 and page.has_next and page.total == 120 and not page.capped
-    sql, params = conn.queries[1]
-    assert "LIMIT %s" in sql and params == ["r", db.AUDIT_COUNT_CAP + 1]
+    assert len(conn.queries) == 1
+    sql, params = conn.queries[0]
+    assert sql.count("LIMIT %s") == 2
+    assert params == ["r", db.AUDIT_COUNT_CAP + 1, "r", 51, 50]
 
     conn = _AuditConn(25_000)
     page = db.list_audit(conn, limit=50, offset=0)
@@ -135,11 +146,37 @@ def test_audit_with_a_next_page_counts_up_to_the_cap():
     assert audit.total_label(page) == "10,000+"
 
 
-def test_audit_page_past_the_end_counts_exactly():
+def test_the_last_page_beyond_the_cap_is_shown_capped_too():
+    conn = _AuditConn(25_000)
+    page = db.list_audit(conn, limit=50, offset=24_950)
+    assert len(page.rows) == 50 and not page.has_next
+    assert page.capped and audit.total_label(page) == "10,000+"
+
+
+def test_audit_page_past_the_end_is_counted_up_to_the_cap_only():
     conn = _AuditConn(25_000)
     page = db.list_audit(conn, limit=50, offset=30_000)
-    assert page == db.AuditPage([], 25_000)
-    assert "LIMIT" not in conn.queries[1][0]
+    assert page == db.AuditPage([], db.AUDIT_COUNT_CAP + 1, capped=True)
+    assert len(conn.queries) == 1
+
+
+def test_a_stale_link_past_a_capped_audit_is_clamped(app, monkeypatch):  # noqa: F811
+    seen: list[int] = []
+
+    def list_audit(conn, *, offset, limit, **kw):
+        # 25,000 events, counted up to the cap
+        seen.append(offset)
+        rows = [{"id": 1, "event_type": "auth_failed"}] if offset < 25_000 else []
+        return db.AuditPage(rows, db.AUDIT_COUNT_CAP + 1, capped=True, has_next=bool(rows))
+
+    monkeypatch.setattr(db, "list_audit", list_audit)
+    client, _ = _client(app)
+    response = client.get("/audit/table", params={"page": "700"})
+    assert response.status_code == 200
+    # 10,001 events known: page 201 (offset 10,000), never an exact count
+    assert seen == [699 * 50, 200 * 50]
+    assert "10,000+ events — page 201</p>" in response.text
+    assert "&page=202" in response.text
 
 
 def test_a_capped_audit_is_paged_with_next_only(app, monkeypatch):  # noqa: F811
@@ -170,7 +207,7 @@ def test_an_invalid_date_is_refused(text):
         db.parse_since(text)
 
 
-@pytest.mark.parametrize("text", ["7", " 30 ", "-3", "1.5", "20261027"])
+@pytest.mark.parametrize("text", ["7", " 30 ", "-3", "1.5", "20261345", "202610"])
 def test_a_bare_number_needs_a_unit(text):
     with pytest.raises(db.InvalidFilter, match="needs a unit"):
         db.parse_since(text)
@@ -179,6 +216,8 @@ def test_a_bare_number_needs_a_unit(text):
 def test_valid_since_values():
     assert db.parse_since("2026-10-27").day == 27
     assert db.parse_since("2026-10-27T10:00").hour == 10
+    # eight digits forming a valid date are a date (ISO basic form)
+    assert db.parse_since("20261027") == datetime(2026, 10, 27)
     assert db.parse_since("7 days") == "7 days"
     assert db.parse_since("1 hour 30 minutes") == "1 hour 30 minutes"
     assert db.parse_since("  ") is None
@@ -202,19 +241,28 @@ def _basic(user: str, password: str) -> str:
 
 
 def test_basic_auth_is_cached_in_the_session(unit_app, monkeypatch):
-    calls: list[str] = []
-    real = auth.verify_basic
+    calls: list[bytes] = []
+    real = auth._verify_decoded
+    decodes: list[str | None] = []
+    real_decode = auth._decode_basic
 
-    def counting(authorization, users):
-        calls.append(authorization)
-        return real(authorization, users)
+    def counting(user_b, password_b, users):
+        calls.append(user_b)
+        return real(user_b, password_b, users)
 
-    monkeypatch.setattr(auth, "verify_basic", counting)
+    def counting_decode(authorization):
+        decodes.append(authorization)
+        return real_decode(authorization)
+
+    monkeypatch.setattr(auth, "_verify_decoded", counting)
+    monkeypatch.setattr(auth, "_decode_basic", counting_decode)
     client = TestClient(unit_app)
     good = {"Authorization": _basic(TEST_USER, TEST_PASSWORD)}
     for _ in range(3):
         assert client.get("/_whoami", headers=good).json() == {"user": TEST_USER}
     assert len(calls) == 1, "bcrypt runs once, then the session fingerprint is used"
+    # the header is decoded once per request (cache check and bcrypt check)
+    assert len(decodes) == 3
     # the cookie holds a keyed fingerprint, never the header nor the password
     cookie = client.cookies.get("pgpp_session")
     payload = base64.b64decode(cookie.split(".")[0] + "==")
@@ -281,6 +329,20 @@ def test_a_rotation_without_a_password_is_a_warning(app, monkeypatch, caplog, pa
     assert 'class="secret"' not in response.text
     assert "role app: rotation applied but no password returned" in caplog.text
     assert events == ["get_role"]
+
+
+def test_a_rotation_without_a_password_survives_a_failed_reread(app, monkeypatch, caplog):  # noqa: F811
+    caplog.set_level(logging.ERROR)
+    monkeypatch.setattr(db, "rotate_password", lambda conn, role, length: None)
+    monkeypatch.setattr(db, "get_role", _raise(psycopg.OperationalError("connection lost")))
+    client, token = _client(app)
+    response = client.post(
+        "/roles/app/rotate", headers={"X-CSRF-Token": token, "HX-Request": "true"}
+    )
+    assert response.status_code == 200, response.text
+    assert roles.NO_PASSWORD_WARNING.format("app").split(",")[0] in response.text
+    assert "could not be read back" in response.text
+    assert "role app rotated, the re-read failed: connection lost" in caplog.text
 
 
 # --- 13: worker status re-read after a maintenance run -------------------------------------

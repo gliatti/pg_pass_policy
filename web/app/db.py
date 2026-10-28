@@ -648,28 +648,32 @@ _BARE_NUMBER_RE = re.compile(r"^[+-]?(\d+\.?\d*|\.\d+)$")
 
 
 def parse_since(text: str | None) -> datetime | str | None:
-    """'2026-10-27' / '2026-10-27T10:00' -> datetime ; '7 days' -> interval text ; '' -> None.
+    """'2026-10-27' / '2026-10-27T10:00' / '20261027' -> datetime ; '7 days' ->
+    interval text ; '' -> None.
 
-    InvalidFilter for a value that looks like a date but is not one
-    ('2026-13-45': "invalid date") and for a bare number ('7': a unit is
-    required).  Any other text is an interval checked by PostgreSQL (a
-    DataError for an invalid one)."""
+    A valid ISO date is a date, the basic form without dashes included
+    ('20261027': fromisoformat is tried first).  InvalidFilter for a value
+    that looks like a date but is not one ('2026-13-45': "invalid date") and
+    for any other bare number ('7', '20261345': a unit is required).  Any
+    other text is an interval checked by PostgreSQL (a DataError for an
+    invalid one)."""
     if not text or not text.strip():
         return None
     text = text.strip()
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        pass
     if _BARE_NUMBER_RE.match(text):
         raise InvalidFilter(
             f"since {text!r}: a number needs a unit ('7 days', '12 hours') or use a date"
             " (YYYY-MM-DD)"
         )
-    try:
-        return datetime.fromisoformat(text)
-    except ValueError:
-        if _DATE_LIKE_RE.match(text):
-            raise InvalidFilter(
-                f"since {text!r}: invalid date (expected YYYY-MM-DD or YYYY-MM-DDTHH:MM)"
-            ) from None
-        return text
+    if _DATE_LIKE_RE.match(text):
+        raise InvalidFilter(
+            f"since {text!r}: invalid date (expected YYYY-MM-DD or YYYY-MM-DDTHH:MM)"
+        )
+    return text
 
 
 def _audit_where(
@@ -701,14 +705,21 @@ AUDIT_COUNT_CAP = 10_000
 class AuditPage:
     """A page of the audit log.
 
-    total is exact unless capped, in which case more than AUDIT_COUNT_CAP
-    events match (total is then AUDIT_COUNT_CAP + 1).  has_next: another
-    page follows this one."""
+    total is the number of matching events, counted up to
+    AUDIT_COUNT_CAP + 1: exact unless capped, in which case more than
+    AUDIT_COUNT_CAP events match (total is then AUDIT_COUNT_CAP + 1), on
+    every page, the last one included.  has_next: another page follows this
+    one (the only source of the pager's "next" link)."""
 
     rows: list[dict[str, Any]]
     total: int
     capped: bool = False
     has_next: bool = False
+
+
+_AUDIT_COLUMNS = (
+    "id, event_time, event_type, role_name, actor, database, client_addr, application_name, details"
+)
 
 
 def list_audit(
@@ -721,45 +732,37 @@ def list_audit(
 ) -> AuditPage:
     """One page of events, newest first, and how many events match.
 
-    The page is read with one row more than shown (LIMIT limit + 1), which
-    tells whether a next page exists without counting.  The total then
-    costs:
+    A single statement reads both, so that they come from the same snapshot
+    (a page and a total that disagree would show a wrong pager):
 
-    - nothing on the last page (offset + rows shown) or when nothing
-      matches at all;
-    - a bounded count otherwise (a next page exists): it stops after
-      AUDIT_COUNT_CAP + 1 rows, so that a large audit_log is never scanned
-      whole to display "10,000+";
-    - an exact count only for a page past the end (stale link, hand-typed
-      URL), so that the caller can show the real last page.
+    - the page, with one row more than shown (LIMIT limit + 1), which tells
+      whether a next page exists;
+    - a bounded count, which stops after AUDIT_COUNT_CAP + 1 rows, so that a
+      large audit_log is never scanned whole to display "10,000+".  Also
+      for a page past the end (stale link, hand-typed URL): the caller
+      clamps to the last page this count knows of, never to an exact count.
 
     count(*) OVER () would instead compute the whole match before LIMIT, on
     every page."""
     where, params = _audit_where(role, event_type, since)
-    rows = conn.execute(
-        "SELECT id, event_time, event_type, role_name, actor, database, client_addr,"
-        "       application_name, details"
-        f"  FROM pass_policy.audit_log WHERE {where}"
-        " ORDER BY id DESC LIMIT %s OFFSET %s",
-        [*params, limit + 1, offset],
+    result = conn.execute(
+        "SELECT c.n AS matching, p.*"
+        "  FROM (SELECT count(*) AS n FROM (SELECT 1 FROM pass_policy.audit_log"
+        f"         WHERE {where} LIMIT %s) AS m) AS c"
+        f"  LEFT JOIN LATERAL (SELECT {_AUDIT_COLUMNS} FROM pass_policy.audit_log"
+        f"         WHERE {where} ORDER BY id DESC LIMIT %s OFFSET %s) AS p ON true"
+        " ORDER BY p.id DESC",
+        [*params, AUDIT_COUNT_CAP + 1, *params, limit + 1, offset],
     ).fetchall()
+    n = result[0]["matching"] if result else 0
+    # no event on this page: a single row whose page columns are NULL (id is
+    # the primary key, never NULL otherwise)
+    rows = [
+        {k: v for k, v in row.items() if k != "matching"} for row in result if row["id"] is not None
+    ]
     has_next = len(rows) > limit
     del rows[limit:]
-    if rows and not has_next:
-        return AuditPage(rows, offset + len(rows))
-    if not rows and not offset:
-        return AuditPage(rows, 0)
-    if rows:
-        n = conn.execute(
-            f"SELECT count(*) AS n FROM (SELECT 1 FROM pass_policy.audit_log WHERE {where}"
-            " LIMIT %s) AS matching",
-            [*params, AUDIT_COUNT_CAP + 1],
-        ).fetchone()["n"]
-        return AuditPage(rows, n, capped=n > AUDIT_COUNT_CAP, has_next=True)
-    n = conn.execute(
-        f"SELECT count(*) AS n FROM pass_policy.audit_log WHERE {where}", params
-    ).fetchone()["n"]
-    return AuditPage(rows, n)
+    return AuditPage(rows, n, capped=n > AUDIT_COUNT_CAP, has_next=has_next)
 
 
 # --- rotation pairs ----------------------------------------------------------

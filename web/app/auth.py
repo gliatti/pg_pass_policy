@@ -96,7 +96,11 @@ def verify_basic(authorization: str | None, users: dict[str, bytes]) -> str | No
     decoded = _decode_basic(authorization)
     if decoded is None:
         return None
-    user_b, password_b = decoded
+    return _verify_decoded(*decoded, users)
+
+
+def _verify_decoded(user_b: bytes, password_b: bytes, users: dict[str, bytes]) -> str | None:
+    """verify_basic() on the (user, password) bytes of a decoded header."""
     try:
         user = user_b.decode("utf-8")
     except UnicodeDecodeError:
@@ -136,8 +140,16 @@ def _basic_fingerprint(settings: Settings, authorization: str, digest: bytes) ->
     return hmac.new(key, message, hashlib.sha256).hexdigest()
 
 
-def _cached_basic_user(request: Request, settings: Settings, authorization: str) -> str | None:
-    """The user of a session whose cached fingerprint matches this header."""
+def _cached_basic_user(
+    request: Request,
+    settings: Settings,
+    authorization: str,
+    claimed: str | None = None,
+) -> str | None:
+    """The user of a session whose cached fingerprint matches this header.
+
+    claimed: the user name of the header, when the caller already decoded
+    it (authenticate_basic()); decoded here otherwise."""
     cached = request.session.get(SESSION_BASIC_KEY)
     if not isinstance(cached, dict):
         return None
@@ -145,7 +157,9 @@ def _cached_basic_user(request: Request, settings: Settings, authorization: str)
     if not isinstance(user, str) or not isinstance(fingerprint, str):
         return None
     digest = settings.basic_user_hashes().get(user)
-    if digest is None or basic_user_name(authorization) != user:
+    if claimed is None:
+        claimed = basic_user_name(authorization)
+    if digest is None or claimed != user:
         return None
     expected = _basic_fingerprint(settings, authorization, digest)
     return user if hmac.compare_digest(fingerprint, expected) else None
@@ -154,16 +168,20 @@ def _cached_basic_user(request: Request, settings: Settings, authorization: str)
 def authenticate_basic(request: Request, settings: Settings) -> str | None:
     """verify_basic() on the Authorization header, skipped when the session
     holds the fingerprint of the same header (_basic_fingerprint()).  A
-    failed check drops the cached fingerprint."""
+    failed check drops the cached fingerprint.  The header is decoded once,
+    for both steps."""
     authorization = request.headers.get("authorization")
-    if not authorization:
+    decoded = _decode_basic(authorization)
+    if not authorization or decoded is None:
         request.session.pop(SESSION_BASIC_KEY, None)
         return None
-    user = _cached_basic_user(request, settings, authorization)
+    user_b, password_b = decoded
+    claimed = user_b.decode("utf-8", "replace")
+    user = _cached_basic_user(request, settings, authorization, claimed)
     if user is not None:
         return user
     users = settings.basic_user_hashes()
-    user = verify_basic(authorization, users)
+    user = _verify_decoded(user_b, password_b, users)
     if user is None:
         request.session.pop(SESSION_BASIC_KEY, None)
         return None
@@ -203,18 +221,16 @@ def user_from_proxy(request: Request, settings: Settings) -> str:
     # Starlette decodes header values as latin-1 (the HTTP default): the
     # reverse proxy sends the user name in UTF-8, so "Émilie" would arrive
     # as "Ã\x89milie".  The original bytes are recovered (latin-1 maps each
-    # byte to one character) and decoded as UTF-8; bytes that are not valid
-    # UTF-8 are refused rather than replaced, so that two different headers
-    # never give the same user name.
+    # byte to one character) and decoded as UTF-8.  Bytes that are not valid
+    # UTF-8 keep their latin-1 reading (the behaviour before UTF-8 decoding,
+    # for a proxy that sends latin-1), with a warning: the same name may
+    # then come from two different headers ("É" as C3 89 or as C9).
     raw = request.headers.get(header) or ""
     try:
         user = raw.encode("latin-1").decode("utf-8").strip()
     except UnicodeError:
-        log.warning("proxy header %s refused: not valid UTF-8", header)
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Not authenticated (proxy header is not valid UTF-8)",
-        ) from None
+        log.warning("proxy header %s is not valid UTF-8: read as latin-1", header)
+        user = raw.strip()
     if not user or not _USER_RE.match(user):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

@@ -190,7 +190,9 @@ def test_audit_pager_links_carry_the_filters(monkeypatch):
     events: list[str] = []
     app = _app()
     app.state.pool = FakePool(events)
-    monkeypatch.setattr(db, "list_audit", lambda conn, **kw: db.AuditPage([], 500))
+    # has_next is the only source of the "next" link
+    page = db.AuditPage([{"id": 1, "event_type": "auth_failed"}], 500, has_next=True)
+    monkeypatch.setattr(db, "list_audit", lambda conn, **kw: page)
     client, _ = _client(app, events)
     response = client.get(
         "/audit/table", params={"role": "a b&c", "type": "auth_failed", "page": "2"}

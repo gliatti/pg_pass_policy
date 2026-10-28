@@ -22,17 +22,21 @@ Pages :
 | `/healthz` | sonde de vie (sans authentification, ne touche pas la base) |
 
 Audit : le filtre « depuis » accepte une date (`2026-10-27`,
-`2026-10-27T10:00`) ou une durée avec son unité (`7 days`, `12 hours`). Une
-valeur qui ressemble à une date sans en être une (`2026-13-45`) est refusée
-(« invalid date »), de même qu'un nombre seul (`7`), que PostgreSQL lirait
-comme des secondes : l'unité est exigée. La pagination lit une ligne de plus
-que la page pour savoir s'il existe une page suivante, sans compter toute la
-sélection à chaque page (pas de `count(*) OVER ()`). Le total affiché est
-exact jusqu'à 10 000 événements : sur la dernière page il découle de la page
-elle-même, ailleurs un comptage borné s'arrête à 10 001 lignes, et au-delà
-le total s'affiche « 10,000+ » sans nombre de pages (lien « next » seul).
-Une page au-delà de la fin (lien périmé) déclenche un comptage exact pour
-afficher la vraie dernière page.
+`2026-10-27T10:00`, ou la forme ISO compacte `20261027`) ou une durée avec
+son unité (`7 days`, `12 hours`). Une valeur qui ressemble à une date sans
+en être une (`2026-13-45`) est refusée (« invalid date »), de même qu'un
+nombre seul qui n'est pas une date valide (`7`, `20261345`), que PostgreSQL
+lirait comme des secondes : l'unité est exigée. La pagination lit une ligne
+de plus que la page pour savoir s'il existe une page suivante, sans compter
+toute la sélection à chaque page (pas de `count(*) OVER ()`). La page et le
+total viennent d'une seule requête, donc du même instantané : ils ne peuvent
+pas se contredire. Le total est un comptage borné qui s'arrête à 10 001
+lignes : exact jusqu'à 10 000 événements, il s'affiche « 10,000+ » au-delà,
+sur toutes les pages (la dernière comprise), sans nombre de pages (lien
+« next » seul). Une page au-delà de la fin (lien périmé) ramène à la
+dernière page connue de ce comptage borné : la vraie dernière page sous le
+plafond, la page du 10 001ᵉ événement au-delà (jamais de comptage exact non
+borné).
 
 Statut et état du mot de passe : la colonne `status` de `v_role_status`
 montre d'abord le verrou (`locked`) puis l'exemption (`exempt`) ; l'état du
@@ -195,9 +199,16 @@ Les liens générés sont relatifs (chemin seul) : un préfixe de chemin se
 déclare avec `--root-path /pgpp`.
 
 En mode `proxy`, la valeur de l'en-tête est lue en UTF-8 (`Émilie` arrive
-sous la forme des octets `C3 89 6D…`) : une valeur qui n'est pas de l'UTF-8
-valide est refusée (401) au lieu d'être devinée, de sorte que deux en-têtes
-différents ne donnent jamais le même nom.
+sous la forme des octets `C3 89 6D…`). Changement de comportement pour les
+noms non ASCII : auparavant, la valeur était toujours lue en latin-1 et un nom
+envoyé en UTF-8 arrivait déformé (`Émilie` devenait `Ã\x89milie`) ; avec
+un mandataire qui envoie de l'UTF-8, le nom réel est désormais lu, ce qui change le nom enregistré dans
+`application_name` et donc dans le journal d'audit. Une valeur qui n'est pas
+de l'UTF-8 valide garde sa lecture latin-1 (comportement antérieur, pour un
+mandataire qui envoie du latin-1) et produit un avertissement dans le
+journal (`not valid UTF-8: read as latin-1`). Dans ce cas, un même nom peut
+venir de deux en-têtes différents (`É` en UTF-8 `C3 89` ou en latin-1 `C9`) :
+le mandataire doit envoyer un seul encodage.
 
 Derrière HTTPS, `PGPP_WEB_SESSION_HTTPS_ONLY=true` est requis : le cookie de
 session devient `__Host-pgpp_session` (`Secure`, `Path=/`, sans `Domain`),
