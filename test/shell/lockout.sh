@@ -704,18 +704,26 @@ psql_admin "CREATE ROLE regress_su SUPERUSER LOGIN PASSWORD '$GOOD'" >/dev/null
 # puis « locked » une fois les verrous réinjectés
 psql_admin "CREATE ROLE regress_trust_locked LOGIN" >/dev/null
 psql_admin "SELECT pass_policy.lock_role('regress_trust_locked', NULL, 'trust test')" >/dev/null
-# (vérification 7) voie d'administration de secours : pendant la fenêtre, un
-# superutilisateur authentifié par une méthode locale sans secret (peer, ou
-# trust sur socket Unix) entre toujours, sauf verrou en shmem ; un rôle
-# ordinaire en trust local, un superutilisateur en trust TCP ou dont le
-# contrôle peer échoue reçoivent toujours 57P03. Socket Unix ouverte pour la
-# suite du script (dernière valeur de postgresql.conf).
+# (vérification 7, restreinte en vérification 8) voie d'administration de
+# secours : pendant la fenêtre, seul un superutilisateur listé dans
+# pg_pass_policy.rescue_roles et authentifié en peer entre, sauf verrou en
+# shmem ; rescue_roles vide (défaut) : aucun accès de secours. Un
+# superutilisateur en trust local (même listé), en peer non listé, en trust
+# TCP ou dont le contrôle peer échoue, un rôle ordinaire listé en peer ou en
+# trust local reçoivent 57P03. Socket Unix ouverte pour la suite du script
+# (dernière valeur de postgresql.conf).
 psql_admin "CREATE ROLE regress_su_peer SUPERUSER LOGIN" >/dev/null
 psql_admin "CREATE ROLE regress_su_nopeer SUPERUSER LOGIN" >/dev/null
 psql_admin "CREATE ROLE regress_su_tcp SUPERUSER LOGIN" >/dev/null
+psql_admin "CREATE ROLE regress_su_unlisted SUPERUSER LOGIN" >/dev/null
+psql_admin "CREATE ROLE regress_peer_plain LOGIN" >/dev/null
 mkdir -p "$PPP_TMP/sock"
 echo "unix_socket_directories = '$PPP_TMP/sock'" >>"$PPP_TMP/data/postgresql.conf"
-echo "pppmap $(id -un) regress_su_peer" >>"$PPP_TMP/data/pg_ident.conf"
+{
+	echo "pppmap $(id -un) regress_su_peer"
+	echo "pppmap $(id -un) regress_su_unlisted"
+	echo "pppmap $(id -un) regress_peer_plain"
+} >>"$PPP_TMP/data/pg_ident.conf"
 psql_local() {
 	"$PPP_BINDIR/psql" -X -q -At -w -v ON_ERROR_STOP=1 \
 		-h "$PPP_TMP/sock" -p "$PPP_PORT" -U "$1" -d "$PPP_DB" -c "${2:-SELECT current_user}" 2>&1
@@ -723,6 +731,8 @@ psql_local() {
 cp "$PPP_TMP/data/pg_hba.conf" "$PPP_TMP/pg_hba.conf.orig"
 {
 	echo "local all regress_su_peer peer map=pppmap"
+	echo "local all regress_su_unlisted peer map=pppmap"
+	echo "local all regress_peer_plain peer map=pppmap"
 	echo "local all regress_su_nopeer peer"
 	echo "local all regress_su trust"
 	echo "local all regress_window trust"
@@ -765,25 +775,36 @@ client_out="$client_out$out"
 out=$(psql_as regress_su "$BAD" "SELECT current_user") || true
 check_contains "fenêtre, worker présent : superutilisateur, mauvais mot de passe : même réponse" "FATAL: +pg_pass_policy: lock state not loaded yet, retry" "$out"
 client_out="$client_out$out"
-# (vérification 7) voie locale de secours (voir plus haut)
-out=$(psql_local regress_su) || true
-check_eq "fenêtre : superutilisateur non exempté en trust sur socket Unix accepté" "regress_su" "$out"
+# (vérification 7, 8) voie locale de secours (voir plus haut)
 out=$(psql_local regress_su_peer) || true
-check_eq "fenêtre : superutilisateur non exempté en peer accepté" "regress_su_peer" "$out"
+check_contains "fenêtre, rescue_roles vide : superutilisateur en peer refusé (57P03)" "FATAL: +pg_pass_policy: lock state not loaded yet, retry" "$out"
+psql_admin "ALTER SYSTEM SET pg_pass_policy.rescue_roles = 'regress_su_peer, regress_su_nopeer, regress_su, regress_peer_plain'" >/dev/null
+psql_admin "SELECT pg_reload_conf()" >/dev/null
+sleep 1
+out=$(psql_local regress_su) || true
+check_contains "fenêtre : superutilisateur listé en trust sur socket Unix refusé (57P03, peer seulement)" "FATAL: +pg_pass_policy: lock state not loaded yet, retry" "$out"
+out=$(psql_local regress_su_peer) || true
+check_eq "fenêtre : superutilisateur listé dans rescue_roles en peer accepté" "regress_su_peer" "$out"
+out=$(psql_local regress_su_unlisted) || true
+check_contains "fenêtre : superutilisateur en peer non listé refusé (57P03)" "FATAL: +pg_pass_policy: lock state not loaded yet, retry" "$out"
+out=$(psql_local regress_peer_plain) || true
+check_contains "fenêtre : rôle ordinaire listé en peer refusé (57P03)" "FATAL: +pg_pass_policy: lock state not loaded yet, retry" "$out"
 out=$(psql_local regress_su_nopeer) || true
-check_contains "fenêtre : superutilisateur dont le contrôle peer échoue : 57P03 (pas d'oracle)" "FATAL: +pg_pass_policy: lock state not loaded yet, retry" "$out"
+check_contains "fenêtre : superutilisateur listé dont le contrôle peer échoue : 57P03 (pas d'oracle)" "FATAL: +pg_pass_policy: lock state not loaded yet, retry" "$out"
 out=$(psql_local regress_window) || true
 check_contains "fenêtre : rôle ordinaire en trust sur socket Unix refusé (57P03)" "FATAL: +pg_pass_policy: lock state not loaded yet, retry" "$out"
 out=$("$PPP_BINDIR/psql" -X -q -At -w -h 127.0.0.1 -p "$PPP_PORT" -U regress_su_tcp -d "$PPP_DB" -c "SELECT current_user" 2>&1) || true
 check_contains "fenêtre : superutilisateur en trust TCP refusé (57P03)" "FATAL: +pg_pass_policy: lock state not loaded yet, retry" "$out"
-n=$(tail -n "+$((log0 + 1))" "$PPP_TMP/server.log" | grep -c 'superuser "regress_su_peer" admitted by local peer authentication before the lock state is loaded' || true)
-check_eq "fenêtre : l'admission locale du superutilisateur est journalisée (LOG)" "1" "$( [ "$n" -ge 1 ] && echo 1 || echo 0)"
 psql_admin "SELECT pass_policy.shmem_lock_role('regress_su_peer', NULL)" >/dev/null
 out=$(psql_local regress_su_peer) || true
 check_contains "fenêtre : superutilisateur en peer verrouillé en shmem : refusé « locked »" "is locked by pg_pass_policy" "$out"
 psql_admin "SELECT pass_policy.shmem_unlock_role('regress_su_peer')" >/dev/null
 out=$(psql_local regress_su_peer) || true
 check_eq "fenêtre : verrou shmem levé, superutilisateur en peer de nouveau accepté" "regress_su_peer" "$out"
+out=$(psql_local regress_su_peer) || true
+# deux admissions de plus en quelques secondes : un seul LOG (une fois par minute)
+n=$(tail -n "+$((log0 + 1))" "$PPP_TMP/server.log" | grep -c 'superuser "regress_su_peer" admitted by peer authentication before the lock state is loaded' || true)
+check_eq "fenêtre : l'admission de secours est journalisée, une fois par minute (3 admissions)" "1" "$n"
 # Rien sur l'état interne n'est envoyé au client non authentifié (constat 1)
 check_not_contains "fenêtre : la sortie du client ne mentionne ni le worker ni exempt_roles" "worker|exempt" "$client_out"
 out=$(psql_admin "SELECT last_reload IS NULL FROM pass_policy.worker_status()")
@@ -820,10 +841,12 @@ check_eq "fenêtre fermée : worker_status().locks_loaded = true" "t" "$out"
 out=$(psql_as regress_trust_locked "" "SELECT current_user") || true
 check_contains "fenêtre fermée : rôle verrouillé par trust refusé (locked)" "is locked by pg_pass_policy" "$out"
 cp "$PPP_TMP/pg_hba.conf.orig" "$PPP_TMP/data/pg_hba.conf"
+psql_admin "ALTER SYSTEM RESET pg_pass_policy.rescue_roles" >/dev/null
 psql_admin "SELECT pg_reload_conf()" >/dev/null
 psql_admin "SELECT pass_policy.unlock_role('regress_trust_locked')" >/dev/null
 psql_admin "DROP ROLE regress_trust_locked" >/dev/null
 psql_admin "DROP ROLE regress_su_peer; DROP ROLE regress_su_nopeer; DROP ROLE regress_su_tcp" >/dev/null
+psql_admin "DROP ROLE regress_su_unlisted; DROP ROLE regress_peer_plain" >/dev/null
 psql_admin "SELECT pass_policy.unlock_role('regress_lock')" >/dev/null
 out=$(psql_as regress_lock "$GOOD" "SELECT current_user") || true
 check_eq "fenêtre fermée : unlock_role, connexion acceptée" "regress_lock" "$out"

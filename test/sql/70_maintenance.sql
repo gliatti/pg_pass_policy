@@ -225,8 +225,12 @@ CREATE TEMP TABLE m6 AS SELECT * FROM pass_policy.run_maintenance();
 SELECT count(*) AS history_after,
        bool_and(verifier LIKE 'SCRAM-SHA-256$%') AS scram
   FROM pass_policy.password_history WHERE role_name = 'regress_legacy';
--- Le mot de passe historique est désormais détecté comme réutilisation
+-- Le mot de passe historique est désormais détecté comme réutilisation.
+-- check_password() répond pour le rôle (min_age d'abord, même pour un
+-- superutilisateur : vérification 8) ; le hook, qui ignore min_age pour un
+-- superutilisateur, montre la réutilisation.
 SELECT ppp_test.code(pass_policy.check_password('regress_legacy', 'Legacy-Passw0rd#2019')) AS reuse;
+SELECT ppp_test.try($$ALTER ROLE regress_legacy PASSWORD 'Legacy-Passw0rd#2019'$$) AS reuse_hook;
 -- Une seconde passe ne duplique pas l'historique
 CREATE TEMP TABLE m7 AS SELECT * FROM pass_policy.run_maintenance();
 SELECT count(*) AS history_after_2nd_run FROM pass_policy.password_history
@@ -255,6 +259,7 @@ CREATE TEMP TABLE m8 AS SELECT * FROM pass_policy.run_maintenance();
 SELECT count(*) AS history_after FROM pass_policy.password_history
  WHERE role_name = 'regress_recon';
 SELECT ppp_test.code(pass_policy.check_password('regress_recon', 'Recon-Disabled#01')) AS reuse;
+SELECT ppp_test.try($$ALTER ROLE regress_recon PASSWORD 'Recon-Disabled#01'$$) AS reuse_hook;
 
 -- manage_valid_until = off : le worker ne gère plus VALID UNTIL, mais une
 -- borne qu'il a posée lui-même (expire_password) est levée une fois le mot de

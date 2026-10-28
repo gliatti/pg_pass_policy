@@ -286,9 +286,10 @@ SELECT name, context FROM pg_settings
  pg_pass_policy.max_tracked_roles  | postmaster
  pg_pass_policy.notify_channel     | sighup
  pg_pass_policy.require_scram      | sighup
+ pg_pass_policy.rescue_roles       | sighup
  pg_pass_policy.superuser_bypass   | sighup
  pg_pass_policy.worker_interval    | sighup
-(11 rows)
+(12 rows)
 
 -- Préfixe réservé : un GUC inconnu est refusé (PG >= 15) ou signalé (PG 14).
 -- Non affiché : le comportement diffère selon la version.

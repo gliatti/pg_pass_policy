@@ -45,6 +45,7 @@ bool		ppp_manage_valid_until = true;
 bool		ppp_log_events = true;
 char	   *ppp_notify_channel = NULL;
 char	   *ppp_exempt_roles = NULL;
+char	   *ppp_rescue_roles = NULL;
 bool		ppp_superuser_bypass = false;
 bool		ppp_require_scram = true;
 bool		ppp_enforce_database = true;
@@ -138,6 +139,7 @@ ppp_shmem_startup(void)
 		ppp_shared->not_loaded_logged_at = 0;
 		ppp_shared->shmem_init_at = GetCurrentTimestamp();
 		ppp_shared->worker_missing_logged_at = 0;
+		ppp_shared->rescue_logged_at = 0;
 	}
 
 	/* the role hash table belongs to lockout.c */
@@ -167,9 +169,13 @@ typedef struct pppExemptList
 
 static const pppExemptList *ppp_exempt_list = NULL;
 
+/* pg_pass_policy.rescue_roles, parsed the same way (same check hook) */
+static const pppExemptList *ppp_rescue_list = NULL;
+
 /*
- * GUC check hook for pg_pass_policy.exempt_roles: the value must be a valid
- * comma-separated list of identifiers; the split list is returned in *extra.
+ * GUC check hook for pg_pass_policy.exempt_roles and
+ * pg_pass_policy.rescue_roles: the value must be a valid comma-separated
+ * list of identifiers; the split list is returned in *extra.
  */
 static bool
 ppp_check_exempt_roles(char **newval, void **extra, GucSource source)
@@ -235,6 +241,38 @@ ppp_assign_exempt_roles(const char *newval, void *extra)
 	ppp_exempt_list = (const pppExemptList *) extra;
 }
 
+/* GUC assign hook for pg_pass_policy.rescue_roles (same as above) */
+static void
+ppp_assign_rescue_roles(const char *newval, void *extra)
+{
+	ppp_rescue_list = (const pppExemptList *) extra;
+}
+
+/*
+ * Is rolename in the list parsed from the GUC value raw?  An empty value
+ * matches nothing.  The check hook builds the list (extra) for every
+ * accepted non-empty value, the boot value included, so it cannot be
+ * missing here; should it ever be, nothing matches (fail closed).
+ */
+static bool
+ppp_list_contains(const char *raw, const pppExemptList *list,
+				  const char *rolename)
+{
+	int			i;
+
+	if (rolename == NULL || raw == NULL || raw[0] == '\0')
+		return false;
+
+	Assert(list != NULL);
+	if (list == NULL)
+		return false;
+
+	for (i = 0; i < list->count; i++)
+		if (strcmp(list->names[i], rolename) == 0)
+			return true;
+	return false;
+}
+
 /*
  * Is the role exempted from the policy and from the lockout?
  *
@@ -248,25 +286,19 @@ ppp_assign_exempt_roles(const char *newval, void *extra)
 bool
 ppp_role_is_exempt(const char *rolename)
 {
-	int			i;
+	return ppp_list_contains(ppp_exempt_roles, ppp_exempt_list, rolename);
+}
 
-	if (rolename == NULL || ppp_exempt_roles == NULL ||
-		ppp_exempt_roles[0] == '\0')
-		return false;
-
-	/*
-	 * The check hook builds the list (extra) for every accepted non-empty
-	 * value, the boot value included, so it cannot be missing here.  Should
-	 * it ever be, no role is exempt: the policy applies (fail closed).
-	 */
-	Assert(ppp_exempt_list != NULL);
-	if (ppp_exempt_list == NULL)
-		return false;
-
-	for (i = 0; i < ppp_exempt_list->count; i++)
-		if (strcmp(ppp_exempt_list->names[i], rolename) == 0)
-			return true;
-	return false;
+/*
+ * Is the role listed in pg_pass_policy.rescue_roles, the superusers allowed
+ * in by peer authentication during the start-up window (SPEC 6.3,
+ * "Démarrage")?  Same parsing rules as exempt_roles; empty (default) = no
+ * rescue access.  Safe to call from the ClientAuthentication hook.
+ */
+bool
+ppp_role_is_rescue(const char *rolename)
+{
+	return ppp_list_contains(ppp_rescue_roles, ppp_rescue_list, rolename);
 }
 
 /*
@@ -587,6 +619,15 @@ _PG_init(void)
 							   PGC_SIGHUP,
 							   GUC_LIST_INPUT,
 							   ppp_check_exempt_roles, ppp_assign_exempt_roles, NULL);
+
+	DefineCustomStringVariable("pg_pass_policy.rescue_roles",
+							   "Comma-separated list of superusers admitted by peer authentication before the lock state is loaded.",
+							   "Unquoted names are down-cased like SQL identifiers. Empty: no such rescue access.",
+							   &ppp_rescue_roles,
+							   "",
+							   PGC_SIGHUP,
+							   GUC_LIST_INPUT,
+							   ppp_check_exempt_roles, ppp_assign_rescue_roles, NULL);
 
 	DefineCustomBoolVariable("pg_pass_policy.superuser_bypass",
 							 "Superusers setting a password are not subject to the complexity rules.",

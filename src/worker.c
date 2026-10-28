@@ -871,6 +871,14 @@ ppp_free_pending(void)
  * Step 3a: expired locks and inactive entries (shared memory only)
  * ------------------------------------------------------------------------
  */
+/* name of an entry and whether it exists, for ppp_sync_cleanup() */
+typedef struct pppMissingRow
+{
+	char		rolename[NAMEDATALEN];
+	uint64		generation;		/* entry->generation when copied */
+	bool		role_missing;
+} pppMissingRow;
+
 static void
 ppp_sync_cleanup(void)
 {
@@ -882,8 +890,54 @@ ppp_sync_cleanup(void)
 	int			purged = 0;
 	int			purged_missing = 0;
 	bool		in_recovery = RecoveryInProgress();
+	pppMissingRow *mrows;
+	int			nmrows = 0;
+	int			maxmrows;
+	int			i;
+
+	/*
+	 * Refresh role_missing of every entry: the authentication hook only
+	 * sets it at an attempt, so a role created, renamed or dropped since
+	 * kept a stale flag, and the eviction classes (ppp_entry_class) and
+	 * the purge below disagreed with failed_attempts(), which decides by a
+	 * syscache lookup.  Names copied under a shared lock, looked up outside
+	 * it (no catalog access under an LWLock), written back below under the
+	 * exclusive lock to the same incarnation of the entry only.
+	 */
+	mrows = (pppMissingRow *) ppp_alloc_hash_copy(CurrentMemoryContext,
+												  sizeof(pppMissingRow),
+												  &maxmrows, LW_SHARED);
+	hash_seq_init(&seq, ppp_role_hash);
+	while ((entry = (pppRoleEntry *) hash_seq_search(&seq)) != NULL)
+	{
+		if (nmrows >= maxmrows)
+		{
+			hash_seq_term(&seq);
+			break;
+		}
+		strlcpy(mrows[nmrows].rolename, entry->key.rolename, NAMEDATALEN);
+		mrows[nmrows].generation = entry->generation;
+		nmrows++;
+	}
+	LWLockRelease(ppp_shared->lock);
+
+	for (i = 0; i < nmrows; i++)
+		mrows[i].role_missing =
+			!SearchSysCacheExists1(AUTHNAME, CStringGetDatum(mrows[i].rolename));
 
 	LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
+	for (i = 0; i < nmrows; i++)
+	{
+		pppRoleKey	key;
+
+		ppp_make_key(&key, mrows[i].rolename);
+		entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key, HASH_FIND,
+											 NULL);
+		if (entry != NULL && entry->generation == mrows[i].generation)
+			entry->role_missing = mrows[i].role_missing;
+	}
+	pfree(mrows);
+
 	hash_seq_init(&seq, ppp_role_hash);
 	while ((entry = (pppRoleEntry *) hash_seq_search(&seq)) != NULL)
 	{
@@ -1263,7 +1317,7 @@ ppp_sync_reload(void)
 		ereport(LOG,
 				(errmsg(PPP_LOG_PREFIX "%d persisted locks could not be loaded in shared memory: connections stay refused",
 						locks_not_tracked),
-				 errdetail("Until every lock of role_state is loaded, roles authenticating with a password or a secret are refused (57P03), superusers included, except pg_pass_policy.exempt_roles; the reload is retried every few seconds (at most one message per minute)."),
+				 errdetail("Until every lock of role_state is loaded, roles authenticating with a password or a secret are refused (57P03), superusers included, except pg_pass_policy.exempt_roles and the superusers of pg_pass_policy.rescue_roles through peer; the reload is retried every few seconds (at most one message per minute)."),
 				 errhint("Increase pg_pass_policy.max_tracked_roles.")));
 
 	if (not_tracked > 0)

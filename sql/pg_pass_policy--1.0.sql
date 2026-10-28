@@ -766,7 +766,10 @@ COMMENT ON FUNCTION _refresh_role_state(oid) IS 'Internal: recomputes expires_at
  *             NULL -> 'infinity' only if the current value was written by us;
  *             never overrides a shorter value set manually ;
  *   'force'   rotation: always writes coalesce(desired, 'infinity') ;
- *   'unblock' manage_valid_until = off, or exempt role: writes only if the
+ *   'unblock' step d of run_maintenance(), for a role whose VALID UNTIL
+ *             the extension does not manage (manage_valid_until = off, or
+ *             exempt role) and whose password has been changed since (a
+ *             plain ALTER ROLE included): writes only if the
  *             current VALID UNTIL is already in the past and was written by
  *             the extension (= valid_until_synced: expire_password(), pair
  *             bound, former sync), and then 'infinity' (bounded by a
@@ -1904,8 +1907,10 @@ BEGIN
     -- expire_password, former sync) and whose password has been changed
     -- since (must_change cleared) are considered, in 'unblock' mode
     -- (rewrites only a VALID UNTIL already in the past).  Exempt roles are
-    -- kept for 'unblock', as in rotate_password(): their password may be
-    -- changed by a plain ALTER ROLE, which the hook does not record.
+    -- kept for 'unblock': their password may be changed by a plain
+    -- ALTER ROLE, which the hook does not record.  rotate_password() and
+    -- switch_rotation_pair() use 'release' instead (_rotate_role(): the
+    -- password has just been replaced, a future bound is lifted too).
     -- The target value is computed here for all roles at once, as
     -- _apply_valid_until() does (keep both in step): only the roles whose
     -- current VALID UNTIL differs from it are passed to that function, which

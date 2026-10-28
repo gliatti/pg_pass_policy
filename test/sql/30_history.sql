@@ -68,7 +68,8 @@ SELECT ppp_test.try($$ALTER ROLE regress_hist PASSWORD 'History-Five#2024'$$) AS
 ALTER ROLE regress_hist PASSWORD 'History-Five#2024';
 RESET SESSION AUTHORIZATION;
 SELECT current_user = session_user AS back_to_superuser;
--- check_password appelé par un superutilisateur : min_age ne s'applique pas
+-- check_password appelé par un superutilisateur : min_age s'applique quand
+-- même (réponse pour le rôle, vérification 8) ; le hook, lui, l'ignore
 SELECT ppp_test.code(pass_policy.check_password('regress_hist', 'History-Five#2024')) AS min_age_superuser_check;
 -- Le superutilisateur contourne min_age
 SELECT ppp_test.try($$ALTER ROLE regress_hist PASSWORD 'History-Five#2024'$$) AS min_age_superuser;
@@ -122,6 +123,8 @@ SELECT count(*) FILTER (WHERE role_oid IS NULL) AS unmapped_rows,
        count(*) FILTER (WHERE role_oid = 'regress_fresh'::regrole::oid) AS oid_rows
   FROM pass_policy.password_history WHERE role_name = 'regress_fresh';
 SELECT ppp_test.try($$ALTER ROLE regress_fresh PASSWORD 'Fresh-Pass#2024aa'$$) AS fresh_reuse_create_password;
+-- check_password() répond pour le rôle : min_age (profil default, 1 jour)
+-- passe avant l'historique, même pour un superutilisateur (vérification 8)
 SELECT ppp_test.code(pass_policy.check_password('regress_fresh', 'Fresh-Pass#2024aa')) AS fresh_check;
 -- … et min_age compte depuis cette ligne tant que role_state n'existe pas
 -- (profil default : min_age = 1 day ; le rôle change lui-même son mot de passe)

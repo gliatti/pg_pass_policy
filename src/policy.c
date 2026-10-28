@@ -56,10 +56,30 @@ static check_password_hook_type prev_check_password_hook = NULL;
 
 /*
  * WARNING "policy not applied" (extension not installed here, or outside
- * pg_pass_policy.database: hook and generate_password()) emitted once per
- * session
+ * pg_pass_policy.database) emitted once per session, with one flag per
+ * source: the hook (password changes) and generate_password().  Separate
+ * flags, so that a generate_password() called first does not silence the
+ * WARNING of a password change that the policy does not check.
  */
-static bool ppp_missing_schema_warned = false;
+static bool ppp_hook_not_applied_warned = false;
+static bool ppp_generate_not_applied_warned = false;
+
+/*
+ * WARNING "password policy not applied outside database", at most once per
+ * session for the flag *warned (see above).
+ */
+static void
+ppp_warn_policy_not_applied(bool *warned)
+{
+	if (*warned)
+		return;
+	ereport(WARNING,
+			(errmsg("pg_pass_policy: password policy not applied outside database \"%s\"",
+					ppp_database),
+			 errhidestmt(true),
+			 errhidecontext(true)));
+	*warned = true;
+}
 
 /*
  * True while this backend runs the password hook: lets the SQL side
@@ -1280,22 +1300,17 @@ ppp_policy_not_applicable(const char *username, bool in_ppp_db)
 		ppp_reject(username, "PPP-003", &prof);
 	}
 
-	if (!ppp_missing_schema_warned)
+	if (!in_ppp_db)
+		ppp_warn_policy_not_applied(&ppp_hook_not_applied_warned);
+	else if (!ppp_hook_not_applied_warned)
 	{
-		if (in_ppp_db)
-			ereport(WARNING,
-					(errmsg("pg_pass_policy: extension is not installed in database \"%s\", password policy not applied",
-							ppp_database),
-					 errhint("Run CREATE EXTENSION pg_pass_policy in this database."),
-					 errhidestmt(true),
-					 errhidecontext(true)));
-		else
-			ereport(WARNING,
-					(errmsg("pg_pass_policy: password policy not applied outside database \"%s\"",
-							ppp_database),
-					 errhidestmt(true),
-					 errhidecontext(true)));
-		ppp_missing_schema_warned = true;
+		ereport(WARNING,
+				(errmsg("pg_pass_policy: extension is not installed in database \"%s\", password policy not applied",
+						ppp_database),
+				 errhint("Run CREATE EXTENSION pg_pass_policy in this database."),
+				 errhidestmt(true),
+				 errhidecontext(true)));
+		ppp_hook_not_applied_warned = true;
 	}
 }
 
@@ -1306,7 +1321,7 @@ ppp_policy_not_applicable(const char *username, bool in_ppp_db)
  * always_error (check_password()): ERROR PPP-003 whatever enforce_database,
  * since an answer "compliant" would be meaningless.  Otherwise
  * (generate_password()): ERROR PPP-003 with enforce_database, else a
- * WARNING (once per session, shared with the hook) and the caller goes on
+ * WARNING (once per session, flag separate from the hook's) and the caller goes on
  * (a random password harms nobody).
  */
 static void
@@ -1330,16 +1345,8 @@ ppp_require_policy_database(bool always_error)
 				 errhint("%s", hint),
 				 errhidestmt(true),
 				 errhidecontext(true)));
-	/* same once-per-session flag as the hook (ppp_policy_not_applicable) */
-	if (!ppp_missing_schema_warned)
-	{
-		ereport(WARNING,
-				(errmsg("pg_pass_policy: password policy not applied outside database \"%s\"",
-						ppp_database),
-				 errhidestmt(true),
-				 errhidecontext(true)));
-		ppp_missing_schema_warned = true;
-	}
+	/* once per session, flag of its own (not the hook's) */
+	ppp_warn_policy_not_applied(&ppp_generate_not_applied_warned);
 }
 
 /*
@@ -1474,8 +1481,7 @@ ppp_policy_init(void)
  */
 static const char *
 ppp_check_secret(FunctionCallInfo fcinfo, const char *username, Oid roleid,
-				 const pppProfile *prof, bool may_check_history,
-				 bool caller_is_super)
+				 const pppProfile *prof, bool may_check_history)
 {
 	text	   *volatile pwtext = NULL;
 	char	   *volatile password = NULL;
@@ -1486,11 +1492,14 @@ ppp_check_secret(FunctionCallInfo fcinfo, const char *username, Oid roleid,
 		pwtext = PG_GETARG_TEXT_PP(1);
 		password = text_to_cstring(pwtext);
 
-		/* superuser_bypass ignored: the answer is that of the profile */
+		/*
+		 * superuser_bypass ignored, and min_age checked even for a
+		 * superuser caller (caller_is_super = false): the answer is that
+		 * of the profile of the role, not of the caller's own ALTER ROLE
+		 */
 		code = ppp_evaluate_password(username, roleid, password,
 									 get_password_type(password), prof,
-									 may_check_history, caller_is_super,
-									 false);
+									 may_check_history, false, false);
 	}
 	PG_FINALLY();
 	{
@@ -1517,7 +1526,9 @@ ppp_check_secret(FunctionCallInfo fcinfo, const char *username, Oid roleid,
  * pg_pass_policy.superuser_bypass is ignored: the function answers for the
  * profile of the role, so that a superuser checking a password for someone
  * else (client, CLI) is not told that a weak password complies.  The hook
- * still lets such a password through for a superuser caller.
+ * still lets such a password through for a superuser caller.  For the same
+ * reason the minimum age (PPP-030) is checked whoever the caller, while the
+ * hook does not apply it to a superuser caller.
  *
  * The minimum age, history and current password checks are only done when
  * the caller is a superuser, the role itself, or may change the role's
@@ -1570,7 +1581,7 @@ ppp_check_password(PG_FUNCTION_ARGS)
 												  roleid);
 
 		code = ppp_check_secret(fcinfo, username, roleid, &prof,
-								may_check_history, caller_is_super);
+								may_check_history);
 
 		/* back to the caller's identity, GUC level and memory context */
 		ppp_spi_end(&st);

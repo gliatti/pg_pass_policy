@@ -30,6 +30,7 @@ extern bool  ppp_manage_valid_until;
 extern bool  ppp_log_events;
 extern char *ppp_notify_channel;
 extern char *ppp_exempt_roles;         /* liste séparée par des virgules */
+extern char *ppp_rescue_roles;         /* idem, accès peer de secours */
 extern bool  ppp_superuser_bypass;
 extern bool  ppp_require_scram;
 extern bool  ppp_enforce_database;
@@ -52,6 +53,13 @@ extern bool  ppp_enforce_database;
  */
 #define PPP_WORKER_MISSING_GRACE_SECS	10
 #define PPP_WORKER_MISSING_LOG_SECS		60
+
+/*
+ * LOG of a rescue admission (superuser of pg_pass_policy.rescue_roles
+ * authenticated by peer during the start-up window): at most once per
+ * PPP_RESCUE_LOG_SECS for the whole instance.
+ */
+#define PPP_RESCUE_LOG_SECS				60
 
 /* ---- Mémoire partagée (remplie par le worker, lue par le hook auth) ------- */
 typedef struct pppRoleKey
@@ -256,12 +264,15 @@ typedef struct pppSharedState
 	 * LOG of the hook when no worker has published its PID
 	 * (worker_pid = 0) PPP_WORKER_MISSING_GRACE_SECS after it: the worker
 	 * was never started (max_worker_processes exhausted) or cannot connect
-	 * (pg_pass_policy.database does not exist).
+	 * (pg_pass_policy.database does not exist).  rescue_logged_at limits to
+	 * one per minute the LOG of a rescue admission (superuser of
+	 * pg_pass_policy.rescue_roles authenticated by peer during the window).
 	 */
 	bool		locks_loaded;
 	TimestampTz not_loaded_logged_at;
 	TimestampTz shmem_init_at;
 	TimestampTz worker_missing_logged_at;
+	TimestampTz rescue_logged_at;
 
 	/*
 	 * Last time an eviction scan in PPP_ENTER_COUNT mode found nothing to
@@ -313,6 +324,7 @@ extern HTAB *ppp_role_hash;
 /* ---- pg_pass_policy.c -------------------------------------------------- */
 extern Size ppp_shmem_size(void);
 extern bool ppp_role_is_exempt(const char *rolename);
+extern bool ppp_role_is_rescue(const char *rolename);
 /*
  * State of the pg_pass_policy extension in the current database.  Trusted
  * only if it is installed, its objects live in schema PPP_SCHEMA and that

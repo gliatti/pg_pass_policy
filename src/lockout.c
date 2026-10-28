@@ -647,29 +647,17 @@ ppp_auth_method_checks_secret(const Port *port)
 }
 
 /*
- * Did the connection authenticate with a local method that checks no
- * secret: peer (Unix-domain socket only), or trust over a Unix-domain
- * socket?  Only someone with a shell account on the server host gets there
- * (the socket permissions and the pg_hba.conf line decide), which makes it
- * the emergency administration path of the start-up window (SPEC 6.3,
- * "Démarrage").  trust over TCP, even on 127.0.0.1, does not qualify: any
- * local process or forwarded port reaches it.
+ * Did the connection authenticate with peer (Unix-domain socket only)?  It
+ * ties the role to an OS account of the server host, which makes it the
+ * emergency administration path of the start-up window, for the superusers
+ * of pg_pass_policy.rescue_roles only (SPEC 6.3, "Démarrage").  trust does
+ * not qualify, even over a Unix-domain socket: it checks nothing, and any
+ * local account allowed on the socket gets any role name.
  */
 static bool
-ppp_auth_is_local_secretless(const Port *port)
+ppp_auth_is_peer(const Port *port)
 {
-	if (port->hba == NULL)
-		return false;
-
-	switch (port->hba->auth_method)
-	{
-		case uaPeer:
-			return true;
-		case uaTrust:
-			return port->raddr.addr.ss_family == AF_UNIX;
-		default:
-			return false;
-	}
+	return port->hba != NULL && port->hba->auth_method == uaPeer;
 }
 
 /*
@@ -702,11 +690,11 @@ ppp_auth_is_local_secretless(const Port *port)
  *   published PPP_WORKER_MISSING_GRACE_SECS after the shared memory
  *   initialisation): they then get the real answer and their failures are
  *   counted, so that an installation whose worker never starts can still be
- *   administered; or they authenticated successfully by a local method that
- *   checks no secret (peer, trust over a Unix-domain socket:
- *   ppp_auth_is_local_secretless), the emergency path when the window stays
- *   closed (worker running but unable to load the locks).  A lock present
- *   in shared memory still applies to them (SPEC 6.3, "Démarrage").
+ *   administered; or they are listed in pg_pass_policy.rescue_roles and
+ *   authenticated successfully by peer (ppp_auth_is_peer), the emergency
+ *   path when the window stays closed (worker running but unable to load
+ *   the locks).  A lock present in shared memory still applies to them
+ *   (SPEC 6.3, "Démarrage").
  */
 static void
 ppp_client_auth_hook(Port *port, int status)
@@ -718,6 +706,7 @@ ppp_client_auth_hook(Port *port, int status)
 	bool		not_loaded = false;
 	bool		log_not_loaded = false;
 	bool		log_worker_missing = false;
+	bool		log_rescue = false;
 	bool		check_window;
 	bool		worker_missing = false;
 	bool		local_admin = false;
@@ -802,15 +791,19 @@ ppp_client_auth_hook(Port *port, int status)
 	 * logged at most once per PPP_WORKER_MISSING_LOG_SECS for the whole
 	 * instance.
 	 *
-	 * A superuser that authenticated successfully by a local method that
-	 * checks no secret (peer, trust over a Unix-domain socket) is let
-	 * through whatever the worker state: the window may stay closed
-	 * indefinitely with a worker running (reload failing: extension not
-	 * trusted, hash full...), and that local access is then the only way
-	 * left to administer the instance.  Only someone who may already act as
-	 * that OS account gets there; a failed peer check (status not OK) keeps
-	 * the 57P03 answer, so that it does not tell a superuser name from
-	 * another one.
+	 * A superuser listed in pg_pass_policy.rescue_roles that authenticated
+	 * successfully by peer is let through whatever the worker state: the
+	 * window may stay closed indefinitely with a worker running (reload
+	 * failing: extension not trusted, hash full...), and that local access
+	 * is then the only way left to administer the instance besides
+	 * exempt_roles.  A lock of role_state is not known here (no catalog
+	 * access but the syscache), so the access cannot depend on it: it is
+	 * restricted instead to roles the administrator listed on purpose
+	 * (empty by default: no rescue access) and to peer, which ties the role
+	 * to an OS account of the server host (trust checks nothing, even over
+	 * a Unix-domain socket).  A failed peer check (status not OK) keeps the
+	 * 57P03 answer, so that it does not tell a superuser name from another
+	 * one.
 	 */
 	if (check_window && !ppp_shared->locks_loaded)
 	{
@@ -818,7 +811,8 @@ ppp_client_auth_hook(Port *port, int status)
 						  TimestampDifferenceExceeds(ppp_shared->shmem_init_at, now,
 													 PPP_WORKER_MISSING_GRACE_SECS * 1000));
 		local_admin = (is_superuser && status == STATUS_OK &&
-					   ppp_auth_is_local_secretless(port));
+					   ppp_auth_is_peer(port) &&
+					   ppp_role_is_rescue(rolename));
 		if (!(is_superuser && worker_missing) && !local_admin)
 		{
 			not_loaded = true;
@@ -930,6 +924,9 @@ ppp_client_auth_hook(Port *port, int status)
 	if (not_loaded)
 		log_not_loaded = ppp_log_due(&ppp_shared->not_loaded_logged_at, now,
 									 1000);
+	else if (local_admin && !refuse)
+		log_rescue = ppp_log_due(&ppp_shared->rescue_logged_at, now,
+								 PPP_RESCUE_LOG_SECS * 1000);
 
 	LWLockRelease(ppp_shared->lock);
 
@@ -947,11 +944,11 @@ ppp_client_auth_hook(Port *port, int status)
 				 errdetail("No pg_pass_policy background worker is running %d seconds after the shared memory initialisation; roles not listed in pg_pass_policy.exempt_roles are refused meanwhile, whatever the authentication method (at most one message per minute).",
 						   PPP_WORKER_MISSING_GRACE_SECS),
 				 errhint("Check max_worker_processes and pg_pass_policy.database; superusers and roles listed in pg_pass_policy.exempt_roles can still connect.")));
-	if (local_admin && !refuse)
+	if (log_rescue)
 		ereport(LOG,
-				(errmsg(PPP_LOG_PREFIX "superuser \"%s\" admitted by local %s authentication before the lock state is loaded",
-						rolename,
-						port->hba->auth_method == uaPeer ? "peer" : "trust")));
+				(errmsg(PPP_LOG_PREFIX "superuser \"%s\" admitted by peer authentication before the lock state is loaded",
+						rolename),
+				 errdetail("The role is listed in pg_pass_policy.rescue_roles; a lock it may hold in role_state is not known yet (at most one message per minute).")));
 	if (hash_full)
 		ereport(LOG,
 				(errmsg(PPP_LOG_PREFIX "cannot track authentication failures of role \"%s\": too many tracked roles",
@@ -994,7 +991,7 @@ ppp_client_auth_hook(Port *port, int status)
 			ereport(LOG,
 					(errmsg(PPP_LOG_PREFIX "refusing connections until the background worker has loaded the lock state"),
 					 errdetail("Roles not listed in pg_pass_policy.exempt_roles are refused, whatever the authentication method, until the persisted locks are re-injected from role_state (at most one message per second)."),
-					 errhint("Check that the pg_pass_policy background worker is running (pass_policy.worker_status()); roles listed in pg_pass_policy.exempt_roles can still connect, superusers through peer or trust on a Unix-domain socket, and any superuser once no worker has started for %d seconds.",
+					 errhint("Check that the pg_pass_policy background worker is running (pass_policy.worker_status()); roles listed in pg_pass_policy.exempt_roles can still connect, superusers listed in pg_pass_policy.rescue_roles through peer, and any superuser once no worker has started for %d seconds.",
 							 PPP_WORKER_MISSING_GRACE_SECS)));
 		ereport(FATAL,
 				(errcode(ERRCODE_CANNOT_CONNECT_NOW),
@@ -1742,25 +1739,29 @@ ppp_failed_attempts(PG_FUNCTION_ARGS)
 		rows[nrows].first_failure_at = entry->first_failure_at;
 		rows[nrows].last_failure_at = entry->last_failure_at;
 		rows[nrows].locked_until = locked ? entry->locked_until : 0;
+		rows[nrows].role_missing = false;	/* set below if !show_missing */
 		nrows++;
 	}
 	LWLockRelease(ppp_shared->lock);
-
-	/*
-	 * Does each name exist now?  Decided here, on the copy and outside the
-	 * LWLock, by a syscache lookup: the role_missing flag of the entry is
-	 * only refreshed by an authentication attempt, so a role created (or
-	 * renamed) under a name tried earlier would stay folded, and a role
-	 * renamed away would keep its old name visible, until the next attempt.
-	 */
-	for (i = 0; i < nrows; i++)
-		rows[i].role_missing =
-			!SearchSysCacheExists1(AUTHNAME, CStringGetDatum(rows[i].rolename));
 
 	/* fold the non-existent names (see above), outside the lock */
 	if (!show_missing)
 	{
 		int			kept = 0;
+
+		/*
+		 * Does each name exist now?  Decided here, on the copy and outside
+		 * the LWLock, by a syscache lookup, for the callers that see the
+		 * folded row only (a superuser sees every name, the flag is not
+		 * used for him): the role_missing flag of the entry is refreshed by
+		 * an authentication attempt and by the synchronisation pass of the
+		 * worker (ppp_sync_cleanup) only, so a role created (or renamed)
+		 * under a name tried earlier would stay folded, and a role renamed
+		 * away would keep its old name visible, until then.
+		 */
+		for (i = 0; i < nrows; i++)
+			rows[i].role_missing =
+				!SearchSysCacheExists1(AUTHNAME, CStringGetDatum(rows[i].rolename));
 
 		for (i = 0; i < nrows; i++)
 		{

@@ -19,11 +19,14 @@
 > - **Superutilisateur** : ajoutez `pg_pass_policy.exempt_roles = 'postgres'`
 >   (ou votre compte d'administration) pour ne pas vous verrouiller dehors :
 >   pendant la fenêtre de démarrage, tout rôle non exempté est refusé
->   (`57P03`), y compris par `trust` en TCP. Seule exception, la voie de
->   secours : un superutilisateur authentifié en `peer`, ou en `trust` sur
->   socket Unix, passe toujours (sauf verrou déjà en mémoire partagée) ;
->   gardez une telle ligne `local` dans `pg_hba.conf`. Un rôle exempté ne
->   peut être ni expiré ni verrouillé par l'extension.
+>   (`57P03`), quelle que soit la méthode (`trust` et `peer` compris). Seule
+>   exception, la voie de secours, désactivée par défaut : un
+>   superutilisateur listé dans `pg_pass_policy.rescue_roles` et authentifié
+>   en `peer` passe (sauf verrou déjà en mémoire partagée, mais **même s'il
+>   est verrouillé dans `role_state`** : ce verrou n'est pas encore connu) ;
+>   n'y listez qu'un compte d'administration lié à un compte système, avec
+>   une ligne `local … peer` dans `pg_hba.conf`. Un rôle exempté ne peut être
+>   ni expiré ni verrouillé par l'extension.
 
 Extension PostgreSQL (C + SQL) de gestion du cycle de vie des mots de passe des
 rôles, pour PostgreSQL **14 à 18** :
@@ -84,7 +87,7 @@ CREATE EXTENSION pg_pass_policy;
 ```
 
 Au démarrage, seuls les rôles de `exempt_roles` et les superutilisateurs
-authentifiés en `peer` ou en `trust` sur socket Unix passent tant que le
+de `rescue_roles` authentifiés en `peer` passent tant que le
 worker n'a pas chargé les verrous (les autres connexions, quelle que soit la
 méthode d'authentification, `trust` en TCP compris, et celles des
 superutilisateurs par mot de passe aussi, reçoivent `57P03`, voir
@@ -155,9 +158,10 @@ SELECT pass_policy.generate_password(32, 'applicatif');
 
 `check_password` répond comme le ferait `ALTER ROLE … PASSWORD` du même
 appelant (même évaluation que le hook, `min_age` d'un vérificateur pré-haché
-compris), à une exception près : elle ignore `superuser_bypass` et répond
-pour le profil du rôle, même appelée par un superutilisateur (un client qui
-vérifie un mot de passe pour autrui ne doit pas le croire conforme). Hors de la base `pg_pass_policy.database`,
+compris), à deux exceptions près : elle ignore `superuser_bypass` et
+contrôle `min_age` même pour un superutilisateur appelant : elle répond pour
+le profil du rôle, quel que soit l'appelant (un client qui vérifie un mot de
+passe pour autrui ne doit pas le croire conforme). Hors de la base `pg_pass_policy.database`,
 où la politique ne s'applique pas, `check_password` lève `PPP-003` et
 `generate_password` aussi avec `enforce_database = on` (sinon `WARNING`,
 mot de passe produit).
@@ -273,16 +277,19 @@ toutes les 5 secondes, y compris sur un standby, et
 `pass_policy.worker_status()` montre `locks_loaded` à faux. Le client, lui,
 ne reçoit que le `57P03`, sans détail sur l'état interne. Les rôles de
 `pg_pass_policy.exempt_roles` passent toujours : c'est le filet de sécurité
-de l'administrateur. Un **superutilisateur** authentifié par une méthode
-locale sans secret (`peer`, ou `trust` sur socket Unix) passe aussi, quel
-que soit l'état du worker : la fenêtre peut rester fermée indéfiniment
-(extension non fiable, verrous trop nombreux pour `max_tracked_roles`) et
-cet accès local est alors la seule voie d'administration ; il est refusé
-« locked » si un verrou est déjà en mémoire partagée, et le log en garde la
-trace (LOG « superuser … admitted by local peer authentication … »). Un rôle
-ordinaire en `peer` ou en `trust` local, un superutilisateur en `trust` par
-TCP (même sur 127.0.0.1) ou dont le contrôle `peer` échoue reçoivent le
-`57P03`. Une connexion de
+de l'administrateur. Un **superutilisateur** listé dans
+`pg_pass_policy.rescue_roles` (vide par défaut : pas d'accès de secours) et
+authentifié en `peer` passe aussi, quel que soit l'état du worker : la
+fenêtre peut rester fermée indéfiniment (extension non fiable, verrous trop
+nombreux pour `max_tracked_roles`) et cet accès local est alors la seule
+voie d'administration hors `exempt_roles`. Il est refusé « locked » si un
+verrou est déjà en mémoire partagée ; un verrou de `role_state` pas encore
+chargé, lui, n'est pas connu du hook et ne l'arrête pas : d'où la liste
+explicite et la seule méthode `peer`, qui lie le rôle à un compte système.
+Le log garde la trace des admissions (LOG « superuser … admitted by peer
+authentication … », au plus une ligne par minute). Un superutilisateur non
+listé, en `trust` (même sur socket Unix) ou dont le contrôle `peer` échoue,
+un rôle ordinaire (même listé) reçoivent le `57P03`. Une connexion de
 réplication d'un rôle non exempté est concernée de la même façon.
 Par mot de passe, les superutilisateurs ne passent que si le worker est
 absent (aucun worker 10 secondes après le démarrage : base inexistante,
@@ -387,6 +394,7 @@ Tous préfixés `pg_pass_policy.`. Contexte `postmaster` = redémarrage ;
 | `log_events` | bool | `on` | SIGHUP | une ligne `LOG: pg_pass_policy: …` par événement |
 | `notify_channel` | string | `pg_pass_policy` | SIGHUP | canal `NOTIFY` (charge utile JSON `event`/`role`/`at`/`details`) |
 | `exempt_roles` | liste | `''` | SIGHUP | rôles exemptés de la politique **et** du verrouillage, séparés par des virgules, règles des identifiants SQL : noms non cités mis en minuscules, noms entre guillemets conservés tels quels (`'postgres, "App User"'`). `rotate_password()`, `switch_rotation_pair()` et `run_maintenance()` ne posent pas de `VALID UNTIL` sur un rôle exempté : ils relèvent seulement une borne déjà passée posée par l'extension (`expire_password()`, borne de paire ; pour `run_maintenance()`, une fois le mot de passe changé), jamais un `VALID UNTIL` posé à la main pour désactiver le compte |
+| `rescue_roles` | liste | `''` | SIGHUP | superutilisateurs admis en `peer` pendant la fenêtre de démarrage, avant le chargement des verrous (voie de secours, voir « Verrouillage et déverrouillage ») ; mêmes règles d'écriture que `exempt_roles` ; vide : aucun accès de secours. Un rôle listé verrouillé dans `role_state` passe pendant la fenêtre : n'y mettre qu'un compte d'administration lié à un compte système |
 | `superuser_bypass` | bool | `off` | SIGHUP | `on` : les superutilisateurs échappent à la complexité dans le hook (pas à l'historique) ; ignoré par `check_password()` |
 | `require_scram` | bool | `on` | SIGHUP | refuse les mots de passe MD5 (`PPP-002`) |
 | `enforce_database` | bool | `on` | SIGHUP | hors de `database`, `ALTER ROLE … PASSWORD` est refusé (`PPP-003`), même si l'extension est installée dans la base courante ; `off` : accepté sans contrôle avec un `WARNING` |
@@ -418,7 +426,7 @@ transaction) : la trace est une ligne du log serveur,
 | `PPP-018` | présent dans le dictionnaire des mots de passe courants (`reject_dictionary`) |
 | `PPP-019` | trop de caractères identiques consécutifs (`max_repeat`) |
 | `PPP-020` | caractère de contrôle, ou espace en début ou en fin ; dans une base UTF8, aussi les caractères Unicode de contrôle, de format et d'espace invisibles (U+0080–U+009F, U+00A0, U+00AD, U+200B–U+200F, U+2028–U+202F, U+2060–U+206F, U+3000, U+FEFF…) |
-| `PPP-030` | changé trop récemment (`min_age` ; non appliqué à un superutilisateur) |
+| `PPP-030` | changé trop récemment (`min_age` ; non appliqué à un superutilisateur par `ALTER ROLE`, appliqué par `check_password()`) |
 | `PPP-031` | parmi les `history_count` derniers mots de passe, l'actuel compris (`history_days`) |
 
 Les caractères sont comptés en points de code UTF-8 ; tout caractère non ASCII
