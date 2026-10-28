@@ -136,14 +136,39 @@ typedef struct pppRoleEntry
 	 * OID of the role that bore this name when locked_until was last set
 	 * (authentication hook, PRE_COMMIT of shmem_lock_role(), re-injection
 	 * from role_state; InvalidOid if unknown, or for the pseudo-lock of a
-	 * non-existent name).  The authentication hook only applies the lock to
-	 * that role (or, InvalidOid, to a name that still has no role): another
-	 * role that bears the name since never inherits it.  Once the lock is
-	 * fully audited, the worker removes the entry when that OID no longer
-	 * bears the name (dropped, or renamed: the lock persisted in role_state
-	 * is then reloaded under the new name), see ppp_sync_cleanup.
+	 * non-existent name).  When in doubt the lock applies: the
+	 * authentication hook only lets it go for a role of another OID, or,
+	 * InvalidOid, for a role created since on the name of a pseudo-lock
+	 * (lock_on_missing); another role that bears the name since never
+	 * inherits it.  Once the lock is fully audited, the worker removes the
+	 * entry when that OID no longer exists, or bears another name and
+	 * role_state holds the lock for it on a primary (it is then reloaded
+	 * under the new name), see ppp_sync_cleanup.
 	 */
 	Oid			lock_role_oid;
+
+	/*
+	 * The lock locked_until was set by the authentication hook on a name
+	 * that had no role at that time (catalog lookup done, role missing):
+	 * a pseudo-lock, lock_role_oid InvalidOid.  Only such a lock yields to
+	 * a role created under the name since; any other lock whose
+	 * lock_role_oid is InvalidOid applies to whoever bears the name
+	 * (fail-closed, SPEC 12).  Cleared wherever locked_until is set
+	 * otherwise.
+	 */
+	bool		lock_on_missing;
+
+	/*
+	 * OID of the role whose failures failed_count / first_failure_at /
+	 * pending_failures hold (authentication hook, at every counted
+	 * failure; InvalidOid for a name without role or when the catalog
+	 * lookup was skipped).  A failure of another role (dropped role
+	 * recreated under the name) restarts a settled entry before it is
+	 * counted, so that the new role never inherits the counter; with
+	 * something pending, the connection is refused until the worker has
+	 * audited it (SPEC 12).
+	 */
+	Oid			owner_oid;
 
 	/*
 	 * When locked_until was last set to a new lock (authentication hook,

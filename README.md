@@ -248,30 +248,35 @@ rôle verrouillé est refusé **même avec le bon mot de passe** : le client re�
 `FATAL: role "x" is locked by pg_pass_policy`.
 
 Le compteur et le verrou automatique sont tenus par **nom** de rôle, et
-chaque verrou retient l'OID du rôle verrouillé : il ne s'applique qu'à ce
-rôle, jamais à un autre rôle qui porte le nom depuis (le pseudo-verrou d'un
-nom inexistant ne s'applique pas non plus au rôle créé ensuite sous ce nom).
-Après `ALTER ROLE … RENAME`, le nouveau nom repart de zéro : un verrou
-déjà recopié dans `role_state` (indexée par OID : `lock_role()`, ou verrou
-automatique déjà audité) suit le rôle, réinjecté sous le nouveau nom au
-tour suivant du worker (LOG « lock of role "…" renamed to "…": reloaded
-from role_state »). Un verrou que `role_state` n'a pas ne suit pas le rôle :
+chaque verrou retient l'OID du rôle verrouillé, chaque compteur celui du rôle
+dont il compte les échecs. Dans le doute, le verrou s'applique (fail-closed) :
+un verrou ne cède que s'il appartient certainement à un autre rôle (OID
+différent, ou pseudo-verrou posé sur un nom qui n'avait pas de rôle quand un
+rôle porte maintenant ce nom). Après `ALTER ROLE … RENAME`, le nouveau nom
+repart de zéro : un verrou déjà recopié dans `role_state` (indexée par OID :
+`lock_role()`, ou verrou automatique déjà audité) suit le rôle, réinjecté sous
+le nouveau nom au tour suivant du worker (LOG « lock of role "…" renamed to
+"…": reloaded from role_state »). Un verrou que `role_state` n'a pas reste
+sous l'ancien nom, sans être perdu, mais ne s'applique pas au nouveau nom :
 verrou automatique que le worker n'a pas encore écrit (audité sous l'ancien
-nom, `role_locked`, `details.role_missing`, et `role_renamed` /
-`renamed_to` quand le nouveau nom est connu, sans être recopié), ou verrou
-local d'un standby (`shmem_lock_role()`). Pour garder un compte bloqué
-pendant un renommage, utiliser `lock_role()`. Un autre rôle créé ensuite
-sous l'ancien nom (`DROP ROLE` puis `CREATE ROLE`) se connecte, avant comme
-après le tour du worker (audit `role_recreated`) ; une fois le verrou
-audité, le worker retire de la mémoire partagée le verrou d'un rôle
-supprimé (LOG « lock of dropped role "…" released ») ou renommé. Tant que
-l'audit de l'ancien rôle est en attente, les échecs du nouveau ne sont pas
-comptés. Exception : un `DROP ROLE` suivi d'un `CREATE ROLE` du même nom
-avant le passage de `run_maintenance()`, indiscernable d'une restauration :
-la maintenance (étape a0) comme le rechargement (repli par nom, pour un
-rôle qui n'a pas de ligne `role_state` à son propre OID) rattachent alors
-au nouvel OID, par le nom, les lignes de `role_state` de l'ancien, et le
-nouveau rôle hérite d'un verrou déjà persisté.
+nom, `role_locked`, `details.role_missing`, et `role_renamed` / `renamed_to`
+quand le nouveau nom est connu, sans être recopié), ou verrou local d'un
+standby (`shmem_lock_role()`). Pour garder un compte bloqué pendant un
+renommage, utiliser `lock_role()`. Un autre rôle créé ensuite sous l'ancien
+nom (`DROP ROLE` puis `CREATE ROLE`) n'hérite ni du verrou ni des compteurs
+de l'ancien (audit `role_recreated`) ; mais tant que l'audit de l'ancien rôle
+est en attente (un tour du worker sur un primaire, jusqu'à la promotion sur
+un standby), sa connexion est **refusée comme verrouillée**, bon mot de passe
+compris : la disponibilité est sacrifiée à la sûreté. Une fois le verrou
+audité, le worker retire de la mémoire partagée le verrou d'un rôle supprimé
+(LOG « lock of dropped role "…" released ») ou d'un rôle renommé dont le
+verrou est persisté. Exception : un `DROP ROLE` suivi d'un `CREATE ROLE` du
+même nom avant le passage de `run_maintenance()`, indiscernable d'une
+restauration : la maintenance (étape a0) comme le rechargement (repli par
+nom, pour un rôle qui n'a pas de ligne `role_state` à son propre OID)
+rattachent alors au nouvel OID, par le nom, les lignes de `role_state` de
+l'ancien, et le nouveau rôle hérite d'un verrou déjà persisté (fail-closed :
+`unlock_role()` le lève).
 
 Seuls les échecs des méthodes où le client présente un mot de passe ou un
 secret sont comptés : `password`, `md5`, `scram-sha-256`, `ldap`, `pam`,

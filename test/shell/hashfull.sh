@@ -246,18 +246,24 @@ for i in $(seq 1 "$MAX"); do psql_admin "DROP ROLE regress_pk$i"; done
 psql_admin "SELECT pass_policy.drop_profile('p_perm')" >/dev/null
 kick || fail "pas de tour du worker après la suppression des rôles regress_pk*"
 
-# --- pseudo-verrou d'un nom inventé, rôle créé ensuite sous ce nom (vérification 13)
+# --- pseudo-verrou d'un nom inventé, rôle créé ensuite sous ce nom (vérifications 13 et 14)
 # Cinq échecs (profil default) sur un nom inexistant : pseudo-verrou, sans
-# OID. Le rôle est créé sous ce nom : le hook n'applique un verrou sans OID
-# qu'à un nom qui n'a toujours pas de rôle, la connexion réussit. Avant
-# correction, elle était refusée, et ce refus pouvait remettre role_missing
-# à faux : verrou d'un vrai rôle sans OID, jamais libéré.
+# OID, posé sur un nom sans rôle (lock_on_missing). Le rôle est créé sous ce
+# nom. Tant que l'audit du pseudo-verrou est en attente, la connexion est
+# refusée comme verrouillée (vérification 14 : verrou sans OID sur un rôle
+# existant, fail-closed ; avec 63a6575 elle passait sans rien compter). Une
+# fois l'entrée auditée, le pseudo-verrou certain cède au rôle créé : la
+# connexion réussit (vérification 13 : avant, ce refus pouvait remettre
+# role_missing à faux, verrou d'un vrai rôle sans OID jamais libéré).
 for i in 1 2 3 4 5; do psql_as regress_inv "$BAD" >/dev/null || true; done
 out=$(psql_as regress_inv "$GOOD") || true
 check_contains "nom inventé : pseudo-verrouillé après 5 échecs" "is locked by pg_pass_policy" "$out"
 psql_admin "CREATE ROLE regress_inv LOGIN PASSWORD '$GOOD'"
 out=$(psql_as regress_inv "$GOOD" "SELECT current_user") || true
-check_eq "nom inventé pseudo-verrouillé puis créé : connexion réussie" "regress_inv" "$out"
+check_contains "verrou sans OID sur un rôle existant, audit en attente : refusé" "is locked by pg_pass_policy" "$out"
+kick || fail "pas de tour du worker après la création de regress_inv"
+out=$(psql_as regress_inv "$GOOD" "SELECT current_user") || true
+check_eq "pseudo-verrou audité puis rôle créé : connexion réussie" "regress_inv" "$out"
 psql_admin "DROP ROLE regress_inv"
 
 # --- toutes les entrées sont des verrous de vrais rôles : ERROR 53400 -------
@@ -435,7 +441,7 @@ fi
 out=$(psql_as regress_h3 "$GOOD" "SELECT current_user") || true
 check_eq "constat 2 : fenêtre fermée, connexion acceptée" "regress_h3" "$out"
 
-# --- rechargement seul, sans maintenance préalable (vérifications 12 et 13) ---
+# --- rechargement seul, sans maintenance préalable (vérifications 12 à 14) ---
 # worker_interval = 0 : le worker ne fait que synchroniser la mémoire partagée
 # (aucun run_maintenance(), donc ni remappage ni purge de role_state). Trois
 # lignes verrouillées écrites à la main : l'une d'un OID et d'un nom
@@ -444,8 +450,10 @@ check_eq "constat 2 : fenêtre fermée, connexion acceptée" "regress_h3" "$out"
 # (restauration avant remappage) : réinjectée par le nom, sous l'OID du rôle
 # trouvé ; la dernière d'un OID périmé portant le nom d'un rôle qui a sa
 # propre ligne, non verrouillée : ignorée (la ligne réelle l'emporte). Renommé,
-# le rôle trouvé par le nom est reconnu par cet OID : son entrée est retirée
-# (LOG) et le rechargement du même tour ne réinjecte rien, la ligne
+# le rôle trouvé par le nom est reconnu par cet OID, mais role_state n'a pas
+# de verrou pour cet OID (la ligne porte l'OID périmé) : le nettoyage ne
+# retire pas l'entrée de l'ancien nom (vérification 14, aucun LOG de
+# retrait) ; le rechargement ne réinjecte rien sous le nouveau nom, la ligne
 # role_state portant toujours l'OID périmé et l'ancien nom, qu'aucun rôle ne
 # porte plus (même limite que l'étape a0).
 psql_admin "CREATE ROLE regress_rest LOGIN PASSWORD '$GOOD'"
@@ -472,12 +480,10 @@ out=$(psql_as regress_rest "$GOOD") || true
 check_contains "OID périmé, nom existant : verrou réinjecté par le nom" "is locked by pg_pass_policy" "$out"
 out=$(psql_as regress_rest3 "$GOOD" "SELECT current_user") || true
 check_eq "OID périmé, nom d'un rôle qui a sa ligne : pas de repli par le nom" "regress_rest3" "$out"
-renamed='lock of role "regress_rest" renamed to "regress_rest2": reloaded from role_state'
+renamed='lock of role "regress_rest" renamed to'
 psql_admin "ALTER ROLE regress_rest RENAME TO regress_rest2" 2>/dev/null
 kick || fail "pas de tour du worker après le renommage de regress_rest"
-check_eq "rôle renommé : LOG « renamed to » (OID du rôle trouvé)" "1" "$(n_log "$renamed")"
-check_eq "rôle renommé : plus d'entrée sous l'ancien nom" "0" \
-	"$(psql_admin "SELECT count(*) FROM pass_policy.failed_attempts() WHERE role_name = 'regress_rest'")"
+check_eq "rôle renommé, verrou non persisté pour son OID : aucun LOG de retrait" "0" "$(n_log "$renamed")"
 out=$(psql_as regress_rest2 "$GOOD" "SELECT current_user") || true
 check_eq "rôle renommé : ligne périmée sous l'ancien nom, rien à réinjecter (limite a0)" "regress_rest2" "$out"
 

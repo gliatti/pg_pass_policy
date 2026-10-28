@@ -90,15 +90,18 @@ SELECT pass_policy.shmem_reload();
 SELECT ppp_test.try($$SELECT pass_policy.shmem_lock_role('regress_no_such_role', NULL)$$) AS shmem_lock_missing;
 SELECT count(*) AS missing_tracked FROM pass_policy.failed_attempts()
  WHERE role_name = 'regress_no_such_role';
--- Rôle renommé dans la même transaction : refusé au COMMIT (vérification 13)
+-- Rôle renommé dans la même transaction : COMMIT accepté, verrou posé sous
+-- l'ancien nom avec l'OID capturé à l'appel (vérification 14) ; le nettoyage
+-- du worker gère ensuite le renommage
 CREATE ROLE regress_lock_ren;
 BEGIN;
 SELECT pass_policy.shmem_lock_role('regress_lock_ren', NULL);
 ALTER ROLE regress_lock_ren RENAME TO regress_lock_ren2;
 COMMIT;
-SELECT count(*) AS renamed_tracked FROM pass_policy.failed_attempts()
+SELECT role_name, locked_until = 'infinity' AS locked FROM pass_policy.failed_attempts()
  WHERE role_name IN ('regress_lock_ren', 'regress_lock_ren2');
-DROP ROLE regress_lock_ren;
+SELECT pass_policy.shmem_unlock_role('regress_lock_ren', false);
+DROP ROLE regress_lock_ren2;
 
 -- failed_attempts() : colonnes attendues
 SELECT count(*) >= 0 AS callable

@@ -873,6 +873,7 @@ typedef struct pppMissingRow
 	uint64		generation;		/* entry->generation when copied */
 	uint32		update_seq;		/* entry->update_seq when copied */
 	Oid			lock_role_oid;	/* locked entry: OID of the lock's role */
+	TimestampTz locked_until;	/* locked entry: its locked_until */
 	char		newname[NAMEDATALEN];	/* renamed role: its name now */
 } pppMissingRow;
 
@@ -896,6 +897,33 @@ ppp_lock_may_be_released(const pppRoleEntry *entry, TimestampTz now)
 {
 	return ppp_entry_settled(entry) && ppp_is_locked(entry, now) &&
 		OidIsValid(entry->lock_role_oid);
+}
+
+/*
+ * Does role_state hold, for that OID, a lock that covers locked_until (the
+ * lock of a shared memory entry)?  Then the reload re-injects it under the
+ * current name of the role.  Called by ppp_sync_cleanup() inside its
+ * transaction, SPI connected.
+ */
+static bool
+ppp_lock_persisted(Oid roleid, TimestampTz locked_until)
+{
+	Oid			argtypes[2] = {OIDOID, TIMESTAMPTZOID};
+	Datum		values[2];
+	int			ret;
+	bool		found;
+
+	values[0] = ObjectIdGetDatum(roleid);
+	values[1] = TimestampTzGetDatum(locked_until);
+	PushActiveSnapshot(GetLatestSnapshot());
+	ret = SPI_execute_with_args("SELECT 1 FROM pass_policy.role_state "
+								"WHERE role_oid = $1 AND locked_until >= $2",
+								2, argtypes, values, NULL, true, 1);
+	if (ret != SPI_OK_SELECT)
+		elog(ERROR, "reading role_state returned SPI code %d", ret);
+	found = SPI_processed > 0;
+	PopActiveSnapshot();
+	return found;
 }
 
 /*
@@ -957,10 +985,13 @@ ppp_sync_cleanup(void)
 	 *	 it): once its lock is audited, the entry is removed when the role
 	 *	 of lock_role_oid no longer bears the name, so that a role created
 	 *	 since under the name starts from a clean entry (SPEC 12).  Renamed
-	 *	 (the OID exists under another name), a reload is requested: the
-	 *	 lock persisted in role_state is re-injected by OID under the new
-	 *	 name.  A lock that role_state does not hold (not written before
-	 *	 the rename, or local to a standby) is not carried over.
+	 *	 (the OID exists under another name), the entry is removed only if
+	 *	 role_state holds a lock covering it for that OID, on a primary
+	 *	 (ppp_lock_persisted): a reload is then requested, which re-injects
+	 *	 it by OID under the new name.  Otherwise (lock not written before
+	 *	 the rename, or local to a standby) the entry stays under the old
+	 *	 name: no lock is lost, and the authentication hook does not apply
+	 *	 it to another role that bears the old name (lock_role_oid).
 	 * Hence only the entries whose flag is false, or locked, are looked up
 	 * (no repeated negative syscache lookups for the ghosts).  Copied under
 	 * a shared lock (name, incarnation, update counter, OID of the lock),
@@ -990,15 +1021,27 @@ ppp_sync_cleanup(void)
 		mrows[nmrows].generation = entry->generation;
 		mrows[nmrows].update_seq = entry->update_seq;
 		mrows[nmrows].lock_role_oid = locked ? entry->lock_role_oid : InvalidOid;
+		mrows[nmrows].locked_until = locked ? entry->locked_until : 0;
 		nmrows++;
 	}
 	LWLockRelease(ppp_shared->lock);
 
-	/* keep only the rows whose role is gone */
+	/*
+	 * Keep only the rows whose role is gone.  A renamed role keeps its lock
+	 * under the old name unless the reload can re-inject it under the new
+	 * one: role_state holds a lock covering it for that OID, and this is not
+	 * a standby (whose local locks are not in role_state; SPEC 12).  No lock
+	 * is ever lost on a rename.
+	 */
 	for (i = 0; i < nmrows; i++)
 	{
 		if (!ppp_role_gone(mrows[i].rolename, mrows[i].lock_role_oid,
 						   mrows[i].newname))
+			continue;
+		if (mrows[i].newname[0] != '\0' &&
+			(in_recovery ||
+			 !ppp_lock_persisted(mrows[i].lock_role_oid,
+								 mrows[i].locked_until)))
 			continue;
 		if (nchanged != i)
 			mrows[nchanged] = mrows[i];
@@ -1023,7 +1066,8 @@ ppp_sync_cleanup(void)
 			ghosts++;
 		}
 		else if (locked && ppp_lock_may_be_released(entry, now) &&
-				 entry->lock_role_oid == mrows[i].lock_role_oid)
+				 entry->lock_role_oid == mrows[i].lock_role_oid &&
+				 entry->locked_until == mrows[i].locked_until)
 		{
 			hash_search(ppp_role_hash, &key, HASH_REMOVE, NULL);
 			/* renamed: reload its persisted lock under the new name */
@@ -1364,6 +1408,7 @@ ppp_sync_reload(void)
 			entry->lock_set_at = now;
 		entry->locked_until = locks[i].locked_until;
 		entry->lock_role_oid = locks[i].role_oid;
+		entry->lock_on_missing = false;
 		entry->lock_from_state = true;
 	}
 
