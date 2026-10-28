@@ -873,6 +873,7 @@ typedef struct pppMissingRow
 	uint64		generation;		/* entry->generation when copied */
 	uint32		update_seq;		/* entry->update_seq when copied */
 	Oid			lock_role_oid;	/* locked entry: OID of the lock's role */
+	char		newname[NAMEDATALEN];	/* renamed role: its name now */
 } pppMissingRow;
 
 /*
@@ -913,24 +914,27 @@ ppp_lock_may_be_released(const pppRoleEntry *entry, TimestampTz now)
 }
 
 /*
- * Does no role of that OID bear that name any more (dropped, or renamed)?
- * OID unknown: does no role bear the name?
+ * Does no role of that OID bear that name any more?  Dropped (the OID no
+ * longer exists: newname left empty) or renamed (its current name is copied
+ * to newname).  OID unknown: does no role bear the name?
  */
 static bool
-ppp_role_gone(const char *rolename, Oid roleid)
+ppp_role_gone(const char *rolename, Oid roleid, char *newname)
 {
 	HeapTuple	tup;
-	bool		gone;
 
+	newname[0] = '\0';
 	if (!OidIsValid(roleid))
 		return !SearchSysCacheExists1(AUTHNAME, CStringGetDatum(rolename));
 	tup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(roleid));
 	if (!HeapTupleIsValid(tup))
 		return true;
-	gone = strcmp(NameStr(((Form_pg_authid) GETSTRUCT(tup))->rolname),
-				  rolename) != 0;
+	if (strcmp(NameStr(((Form_pg_authid) GETSTRUCT(tup))->rolname),
+			   rolename) != 0)
+		strlcpy(newname, NameStr(((Form_pg_authid) GETSTRUCT(tup))->rolname),
+				NAMEDATALEN);
 	ReleaseSysCache(tup);
-	return gone;
+	return newname[0] != '\0';
 }
 
 static void
@@ -965,9 +969,10 @@ ppp_sync_cleanup(void)
 	 *	 and the attempts made under a name before its role was created stay
 	 *	 ghost attempts until then, SPEC 12);
 	 * - a locked entry never becomes a ghost (invented names could evict
-	 *	 it): once its lock is audited, the entry is removed when no role of
-	 *	 lock_role_oid bears the name any more, so that a role created since
-	 *	 under the name starts from a clean entry (SPEC 12).
+	 *	 it): once its lock is audited, the entry is removed when the role
+	 *	 of lock_role_oid no longer exists, or moved under the new name of
+	 *	 that role when it was renamed, so that a role created since under
+	 *	 the name starts from a clean entry (SPEC 12).
 	 * Hence only the entries whose flag is false, or locked, are looked up
 	 * (no repeated negative syscache lookups for the ghosts).  Copied under
 	 * a shared lock (name, incarnation, update counter, OID of the lock),
@@ -1004,7 +1009,8 @@ ppp_sync_cleanup(void)
 	/* keep only the rows whose role is gone */
 	for (i = 0; i < nmrows; i++)
 	{
-		if (!ppp_role_gone(mrows[i].rolename, mrows[i].lock_role_oid))
+		if (!ppp_role_gone(mrows[i].rolename, mrows[i].lock_role_oid,
+						   mrows[i].newname))
 			continue;
 		if (nchanged != i)
 			mrows[nchanged] = mrows[i];
@@ -1031,8 +1037,52 @@ ppp_sync_cleanup(void)
 		else if (locked && ppp_lock_may_be_released(entry, now) &&
 				 entry->lock_role_oid == mrows[i].lock_role_oid)
 		{
+			pppRoleEntry *dst = NULL;
+			pppRoleEntry old;
+
+			if (mrows[i].newname[0] != '\0')
+			{
+				pppRoleKey	nkey;
+
+				/*
+				 * Renamed role: its lock follows it under the new name,
+				 * merged into the entry already there (the longest lock
+				 * wins).  An entry there with something at stake keeps the
+				 * lock under the old name until a later cycle.
+				 */
+				ppp_make_key(&nkey, mrows[i].newname);
+				dst = (pppRoleEntry *) hash_search(ppp_role_hash, &nkey,
+												   HASH_FIND, NULL);
+				if (dst != NULL && !ppp_entry_settled(dst))
+					continue;
+			}
+			old = *entry;
 			hash_search(ppp_role_hash, &key, HASH_REMOVE, NULL);
-			/* the released rows are logged below */
+			if (mrows[i].newname[0] != '\0')
+			{
+				pppEviction ev;
+
+				/* the removal above made room: no eviction, never NULL */
+				if (dst == NULL)
+					dst = ppp_enter_role(mrows[i].newname, PPP_ENTER_PRIORITY,
+										 now, in_recovery, &ev);
+				if (dst != NULL &&
+					(!ppp_is_locked(dst, now) ||
+					 dst->locked_until < old.locked_until))
+				{
+					dst->locked_until = old.locked_until;
+					dst->lock_set_at = old.lock_set_at;
+					dst->lock_role_oid = old.lock_role_oid;
+					dst->lock_from_state = old.lock_from_state;
+					dst->lock_seq = old.lock_seq;
+				}
+				if (dst != NULL)
+				{
+					dst->role_missing = false;
+					dst->update_seq++;
+				}
+			}
+			/* the released or moved rows are logged below */
 			mrows[released++] = mrows[i];
 		}
 	}
@@ -1108,10 +1158,15 @@ ppp_sync_cleanup(void)
 	LWLockRelease(ppp_shared->lock);
 
 	for (i = 0; i < released; i++)
-		ereport(LOG,
+		if (mrows[i].newname[0] != '\0')
+			ereport(LOG,
+					(errmsg(PPP_LOG_PREFIX "lock of role \"%s\" follows its rename to \"%s\"",
+							mrows[i].rolename, mrows[i].newname)));
+		else
+			ereport(LOG,
 				(errmsg(PPP_LOG_PREFIX "lock of dropped role \"%s\" released",
 						mrows[i].rolename),
-				 errdetail("No role of OID %u bears this name any more (dropped or renamed); the lock is audited and a role created under this name starts from a clean entry.",
+				 errdetail("The role of OID %u no longer exists; the lock is audited and a role created under this name starts from a clean entry.",
 						   mrows[i].lock_role_oid)));
 	pfree(mrows);
 
@@ -1253,14 +1308,19 @@ ppp_sync_reload(void)
 
 	/*
 	 * persisted active locks ('infinity' comes back as DT_NOEND), of
-	 * existing roles only: the row of a dropped role (purged by
-	 * run_maintenance()) would otherwise put its lock back under its old
-	 * name at every reload
+	 * existing roles only: by OID, or, OID unknown (restore before
+	 * run_maintenance() remaps it, step a0), by name; a row matching
+	 * neither (dropped role, purged by run_maintenance()) would otherwise
+	 * put its lock back under its old name at every reload
 	 */
-	ret = SPI_execute("SELECT r.rolname::text, s.locked_until, r.oid "
+	ret = SPI_execute("SELECT COALESCE(r.rolname, n.rolname)::text, s.locked_until, "
+					  "COALESCE(r.oid, n.oid) "
 					  "FROM pass_policy.role_state s "
-					  "JOIN pg_catalog.pg_roles r ON r.oid = s.role_oid "
-					  "WHERE s.locked_until IS NOT NULL AND s.locked_until > now()",
+					  "LEFT JOIN pg_catalog.pg_roles r ON r.oid = s.role_oid "
+					  "LEFT JOIN pg_catalog.pg_roles n "
+					  "ON r.oid IS NULL AND n.rolname = s.role_name "
+					  "WHERE s.locked_until IS NOT NULL AND s.locked_until > now() "
+					  "AND COALESCE(r.oid, n.oid) IS NOT NULL",
 					  true, 0);
 	if (ret != SPI_OK_SELECT)
 		elog(ERROR, "reading role_state returned SPI code %d", ret);
@@ -1469,6 +1529,8 @@ ppp_step_sync(void)
 	/* kept pending when some persisted locks could not be loaded */
 	if (ppp_reload_pending && ppp_sync_reload())
 		ppp_reload_pending = false;
+	/* again: a start-up window closed by this reload is flushed at once */
+	ppp_flush_rescue_log();
 }
 
 /*

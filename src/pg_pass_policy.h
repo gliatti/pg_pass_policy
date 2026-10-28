@@ -136,9 +136,10 @@ typedef struct pppRoleEntry
 	 * OID of the role that bore this name when locked_until was last set
 	 * (authentication hook, PRE_COMMIT of shmem_lock_role(), re-injection
 	 * from role_state; InvalidOid if unknown).  Once the lock is fully
-	 * audited, the worker removes the entry when no role of that OID bears
-	 * the name any more (ppp_sync_cleanup): a locked entry never becomes a
-	 * ghost, and a role created since under the name starts afresh.
+	 * audited, the worker removes the entry when that OID no longer exists,
+	 * or moves the lock under the new name of a renamed role
+	 * (ppp_sync_cleanup): a locked entry never becomes a ghost, and a role
+	 * created since under the name starts afresh.
 	 */
 	Oid			lock_role_oid;
 

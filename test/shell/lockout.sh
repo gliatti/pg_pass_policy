@@ -626,7 +626,8 @@ check_eq "rôle supprimé : plus aucune entrée profil pour lui après rechargem
 # Renommé avant le passage du worker (worker_interval = 0 : il ne tourne que
 # sur demande), le rôle n'a plus de ligne pg_roles sous l'ancien nom : l'audit
 # role_locked est écrit sous l'ancien nom avec role_missing / role_renamed /
-# renamed_to, une seule fois, et le verrou n'est pas transféré au nouveau nom.
+# renamed_to, une seule fois ; le verrou n'est pas recopié dans role_state,
+# mais il suit ensuite le rôle sous son nouveau nom en mémoire partagée.
 psql_admin "CREATE ROLE regress_ren LOGIN PASSWORD '$GOOD'" >/dev/null
 # profil assigné : la ligne role_profile garde l'ancien nom, ce qui permet au
 # worker de nommer le nouveau (renamed_to) ; sans elle ni ligne role_state,
@@ -649,8 +650,13 @@ check_eq "renommage : verrou non recopié dans role_state" "0" "$out"
 reload_sync || true
 out=$(psql_admin "SELECT count(*) FROM pass_policy.audit_log WHERE event_type = 'role_locked' AND role_name IN ('regress_ren', 'regress_ren2')")
 check_eq "renommage : acquitté, audité une seule fois (pas de réécriture à chaque tour)" "1" "$out"
+# Une fois audité et acquitté, le verrou suit le renommage (vérification 12) :
+# le worker le déplace sous le nouveau nom, au lieu de le libérer comme
+# celui d'un rôle supprimé
+n=$(grep -c 'lock of role "regress_ren" follows its rename to "regress_ren2"' "$PPP_TMP/server.log" || true)
+check_eq "renommage : LOG « follows its rename »" "1" "$n"
 out=$(psql_as regress_ren2 "$GOOD" "SELECT current_user") || true
-check_eq "renommage : le nouveau nom repart de zéro (connexion acceptée)" "regress_ren2" "$out"
+check_contains "renommage : le verrou audité suit le nouveau nom" "is locked by pg_pass_policy" "$out"
 psql_admin "DROP ROLE regress_ren2" >/dev/null
 
 # --- (vérification 3) verrou automatique, DROP ROLE puis CREATE ROLE sous le

@@ -975,13 +975,14 @@ ppp_client_auth_hook(Port *port, int status)
 		/*
 		 * Refreshed at every failure: a role created after its name was
 		 * first tried loses the flag.  A successful authentication proves
-		 * that the role exists.  Not while the entry is locked: a locked
+		 * that the role exists.  Never while the entry is locked (the
+		 * connection is refused, a pseudo-lock is not handed over): a locked
 		 * entry never becomes a ghost (evictable), the worker removes the
 		 * lock of a dropped role itself (ppp_sync_cleanup).
 		 */
 		if (count_failure && !refuse)
 			entry->role_missing = role_missing;
-		else if (status == STATUS_OK)
+		else if (status == STATUS_OK && !refuse)
 			entry->role_missing = false;
 		/* tells ppp_sync_cleanup() that its catalog lookup may be stale */
 		if (count_failure || status == STATUS_OK)
@@ -2046,6 +2047,8 @@ ppp_shmem_lock_role(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
 				 errmsg("role name must not be NULL")));
 	ppp_text_to_rolename(PG_GETARG_TEXT_PP(0), rolename);
+	/* ERROR 42704: a lock without a role (lock_role_oid unknown) never goes */
+	(void) get_role_oid(rolename, false);
 
 	if (PG_ARGISNULL(1))
 		until = DT_NOEND;

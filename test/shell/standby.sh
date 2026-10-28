@@ -303,6 +303,31 @@ for i in $(seq 1 24); do sb_as "phantom_sb_$i" "$BAD" >/dev/null || true; done
 out=$(sb_admin "SELECT count(*) FROM pass_policy.failed_attempts() WHERE role_name = 'regress_sb_gone' AND locked_until IS NOT NULL")
 check_eq "vérification 9 : l'entrée du rôle supprimé, verrou en attente d'audit, n'est pas évincée" "1" "$out"
 
+# --- standby : verrou local d'un rôle renommé (vérification 12) --------------
+# Verrou local posé par shmem_lock_role() sur le standby (ni role_state ni
+# audit en attente), puis rôle renommé sur le primaire et un nouveau rôle créé
+# sous l'ancien nom : le worker du standby déplace le verrou sous le nouveau
+# nom (LOG). Le rôle renommé reste refusé, le rôle recréé n'hérite de rien.
+# Avant correction, le renommage était traité comme une suppression : le
+# verrou était libéré.
+psql_admin "CREATE ROLE regress_sb_ren LOGIN PASSWORD '$GOOD'"
+sb_catch_up || fail "vérification 12 : le standby n'a pas rejoué regress_sb_ren"
+sb_admin "SELECT pass_policy.shmem_lock_role('regress_sb_ren', NULL)" >/dev/null
+out=$(sb_as regress_sb_ren "$GOOD") || true
+check_contains "vérification 12 : regress_sb_ren verrouillé localement sur le standby" "is locked by pg_pass_policy" "$out"
+psql_admin "ALTER ROLE regress_sb_ren RENAME TO regress_sb_ren2" 2>/dev/null
+# autre mot de passe : l'historique refuserait le même (PPP-031)
+psql_admin "CREATE ROLE regress_sb_ren LOGIN PASSWORD 'Standby-Other#2025'"
+sb_catch_up || fail "vérification 12 : le standby n'a pas rejoué le renommage"
+sleep 3 # au moins un tour du worker du standby (ppp_sync_cleanup)
+n=$(grep -c 'lock of role "regress_sb_ren" follows its rename to "regress_sb_ren2"' "$PPP_TMP/standby.log" || true)
+check_eq "vérification 12 : LOG « follows its rename »" "1" "$n"
+out=$(sb_as regress_sb_ren2 "$GOOD") || true
+check_contains "vérification 12 : le rôle renommé reste verrouillé" "is locked by pg_pass_policy" "$out"
+out=$(sb_as regress_sb_ren 'Standby-Other#2025' "SELECT current_user") || true
+check_eq "vérification 12 : le rôle recréé sous l'ancien nom n'hérite pas du verrou" "regress_sb_ren" "$out"
+sb_admin "SELECT pass_policy.shmem_unlock_role('regress_sb_ren2')" >/dev/null
+
 # --- lecture seule : aucune erreur d'écriture du worker du standby -----------
 n=$(tail -n "+$((sb_log0 + 1))" "$PPP_TMP/standby.log" | grep -cE 'pg_pass_policy: worker .* failed|read-only transaction' || true)
 check_eq "standby : aucun échec de cycle du worker (aucune écriture tentée)" "0" "$n"

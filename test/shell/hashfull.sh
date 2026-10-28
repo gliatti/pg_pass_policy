@@ -235,15 +235,31 @@ psql_admin "DROP ROLE regress_pkx"
 psql_admin "CREATE ROLE regress_perm LOGIN PASSWORD '$GOOD'"
 out=$(psql_as regress_perm "$GOOD" "SELECT current_user") || true
 check_eq "rôle recréé sous le même nom : connexion réussie" "regress_perm" "$out"
+# La ligne role_state de l'ancien regress_perm a déjà été purgée par la
+# maintenance du tour précédent : ce rechargement n'a rien à réinjecter (le
+# rechargement seul, sans maintenance, est vérifié en fin de script).
 kick || fail "pas de rechargement après la recréation de regress_perm"
-out=$(psql_as regress_perm "$GOOD" "SELECT current_user") || true
-check_eq "rôle recréé : le rechargement ne réinjecte pas le verrou orphelin" "regress_perm" "$out"
 check_eq "rôle recréé : aucun verrou hérité en mémoire partagée" "0" \
 	"$(psql_admin "SELECT count(*) FROM pass_policy.failed_attempts() WHERE role_name = 'regress_perm' AND locked_until IS NOT NULL")"
 psql_admin "DROP ROLE regress_perm"
 for i in $(seq 1 "$MAX"); do psql_admin "DROP ROLE regress_pk$i"; done
 psql_admin "SELECT pass_policy.drop_profile('p_perm')" >/dev/null
 kick || fail "pas de tour du worker après la suppression des rôles regress_pk*"
+
+# --- pseudo-verrou d'un nom inventé, rôle créé ensuite sous ce nom (vérification 12)
+# Cinq échecs (profil default) sur un nom inexistant : pseudo-verrou. Le rôle
+# est créé sous ce nom ; sa connexion avec le bon mot de passe est refusée
+# (le pseudo-verrou tient), mais l'entrée reste un fantôme (role_missing) :
+# des noms inventés l'évincent. Avant correction, ce succès refusé remettait
+# role_missing à faux : verrou d'un vrai rôle sans OID, jamais libéré.
+for i in 1 2 3 4 5; do psql_as regress_inv "$BAD" >/dev/null || true; done
+psql_admin "CREATE ROLE regress_inv LOGIN PASSWORD '$GOOD'"
+out=$(psql_as regress_inv "$GOOD") || true
+check_contains "nom inventé pseudo-verrouillé puis créé : connexion refusée" "is locked by pg_pass_policy" "$out"
+flood ghost11 24
+out=$(psql_as regress_inv "$GOOD" "SELECT current_user") || true
+check_eq "pseudo-verrou resté fantôme : évincé par des noms inventés, aucun verrou hérité" "regress_inv" "$out"
+psql_admin "DROP ROLE regress_inv"
 
 # --- toutes les entrées sont des verrous de vrais rôles : ERROR 53400 -------
 flood ghost6 24
@@ -419,6 +435,41 @@ else
 fi
 out=$(psql_as regress_h3 "$GOOD" "SELECT current_user") || true
 check_eq "constat 2 : fenêtre fermée, connexion acceptée" "regress_h3" "$out"
+
+# --- rechargement seul, sans maintenance préalable (vérification 12) ---------
+# worker_interval = 0 : le worker ne fait que synchroniser la mémoire partagée
+# (aucun run_maintenance(), donc ni remappage ni purge de role_state). Deux
+# lignes verrouillées écrites à la main : l'une d'un OID et d'un nom
+# inexistants (orphelin réel : ignorée, la fenêtre se ferme), l'autre d'un
+# OID périmé portant le nom d'un rôle existant (restauration avant
+# remappage) : réinjectée par le nom, sous l'OID du rôle trouvé. Renommé, ce
+# rôle est reconnu par cet OID : le verrou suit le renommage (LOG) au lieu
+# d'être libéré comme celui d'un rôle supprimé. Le rechargement du même tour
+# le lève ensuite : la ligne role_state porte toujours l'OID périmé et
+# l'ancien nom, qu'aucun rôle ne porte plus (même limite que l'étape a0).
+psql_admin "CREATE ROLE regress_rest LOGIN PASSWORD '$GOOD'"
+psql_admin "INSERT INTO pass_policy.role_state (role_oid, role_name, locked_until, locked_by)
+            VALUES (4000000001, 'regress_orphan_x', 'infinity', 'manual'),
+                   (4000000002, 'regress_rest', 'infinity', 'manual')"
+psql_admin "ALTER SYSTEM SET pg_pass_policy.worker_interval = 0" >/dev/null
+"$PPP_BINDIR/pg_ctl" -D "$PPP_TMP/data" -l "$PPP_TMP/server.log" -o "-p $PPP_PORT" -w -t 60 restart >/dev/null
+if wait_for 30 "SELECT locks_loaded FROM pass_policy.worker_status()"; then
+	ok "rechargement seul : ligne orpheline ignorée, fenêtre fermée"
+else
+	fail "rechargement seul : fenêtre restée ouverte"
+fi
+check_eq "rechargement seul : aucune entrée pour l'orphelin" "0" \
+	"$(psql_admin "SELECT count(*) FROM pass_policy.failed_attempts() WHERE role_name = 'regress_orphan_x'")"
+check_eq "rechargement seul : role_state non remappé (aucune maintenance)" "4000000002" \
+	"$(psql_admin "SELECT role_oid FROM pass_policy.role_state WHERE role_name = 'regress_rest'")"
+out=$(psql_as regress_rest "$GOOD") || true
+check_contains "OID périmé, nom existant : verrou réinjecté par le nom" "is locked by pg_pass_policy" "$out"
+followed='lock of role "regress_rest" follows its rename to "regress_rest2"'
+psql_admin "ALTER ROLE regress_rest RENAME TO regress_rest2" 2>/dev/null
+kick || fail "pas de tour du worker après le renommage de regress_rest"
+check_eq "rôle renommé : LOG « follows its rename » (OID du rôle trouvé)" "1" "$(n_log "$followed")"
+check_eq "rôle renommé : plus d'entrée sous l'ancien nom" "0" \
+	"$(psql_admin "SELECT count(*) FROM pass_policy.failed_attempts() WHERE role_name = 'regress_rest'")"
 
 check_eq "aucun échec de cycle du worker dans le log" "0" "$(n_log 'pg_pass_policy: worker .* failed')"
 

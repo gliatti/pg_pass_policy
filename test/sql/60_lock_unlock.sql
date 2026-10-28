@@ -86,6 +86,10 @@ SELECT pass_policy.shmem_reset_failures('regress_lock');
 SELECT count(*) AS shmem_locked FROM pass_policy.failed_attempts()
  WHERE role_name = 'regress_lock' AND locked_until IS NOT NULL;
 SELECT pass_policy.shmem_reload();
+-- Nom sans rôle : refusé (vérification 12), aucune entrée créée
+SELECT ppp_test.try($$SELECT pass_policy.shmem_lock_role('regress_no_such_role', NULL)$$) AS shmem_lock_missing;
+SELECT count(*) AS missing_tracked FROM pass_policy.failed_attempts()
+ WHERE role_name = 'regress_no_such_role';
 
 -- failed_attempts() : colonnes attendues
 SELECT count(*) >= 0 AS callable

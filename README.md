@@ -253,13 +253,16 @@ déjà recopié dans `role_state` (indexée par OID) suit le rôle au rechargeme
 suivant, mais un verrou que le worker n'a pas encore écrit reste attaché à
 l'ancien nom ; il est audité (`role_locked`, `details.role_missing`, et
 `role_renamed` / `renamed_to` quand le nouveau nom est connu) sans être
-transféré. Pour garder un compte bloqué pendant un renommage, utiliser
+recopié dans `role_state`, puis suit le rôle sous son nouveau nom en mémoire
+partagée seulement (perdu au redémarrage). Pour garder un compte bloqué pendant un renommage, utiliser
 `lock_role()`. Un autre rôle créé ensuite sous l'ancien nom (`DROP ROLE` puis
 `CREATE ROLE`) ne reçoit pas ce verrou dans `role_state` : le hook mémorise
 l'OID du rôle verrouillé (audit `role_recreated`). Une fois le verrou
 audité, le tour suivant du worker retire de la mémoire partagée le verrou
-d'un rôle supprimé ou renommé (LOG « lock of dropped role "…" released ») :
-un rôle recréé sous le même nom part d'une entrée propre. Exception : un
+d'un rôle supprimé (LOG « lock of dropped role "…" released ») et déplace
+sous le nouveau nom celui d'un rôle renommé (LOG « lock of role "…" follows
+its rename to "…" ») : le rôle renommé reste verrouillé, un rôle recréé
+sous l'ancien nom part d'une entrée propre. Exception : un
 `DROP ROLE` suivi d'un `CREATE ROLE` du même nom avant le passage de
 `run_maintenance()`, que celle-ci prend pour une restauration (lignes de
 `role_state` rattachées au nouvel OID par le nom) : le nouveau rôle hérite
