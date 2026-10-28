@@ -38,6 +38,20 @@ SELECT ppp_test.try($$SELECT pass_policy.create_profile('p_bad', '{"min_length":
 SELECT pass_policy.drop_profile('p_bad');
 SELECT ppp_test.try($$SELECT pass_policy.create_profile('p_bad', '{"min_digit": 128}')$$) AS classes_over_max_length;
 SELECT ppp_test.try($$SELECT pass_policy.create_profile('p_bad', '{"min_lower": 2000000000, "min_upper": 2000000000}')$$) AS classes_sum_no_overflow;
+-- (vérification 2) profile_classes_fit suit le besoin réel du générateur
+-- (_generator_minimum : une minuscule, une majuscule et un chiffre au moins,
+-- plus un spécial si min_classes l'exige), pas la simple somme des minima
+SELECT pass_policy._generator_minimum(0, 0, 30, 0, 3) AS gen_min_digit30,
+       pass_policy._generator_minimum(0, 0, 30, 0, 4) AS gen_min_classes4,
+       pass_policy._generator_minimum(2, 0, 0, 3, 4) AS gen_min_special,
+       pass_policy._generator_minimum(2000000000, 2000000000, 0, 0, 0) AS gen_min_capped,
+       pass_policy._max_generated_length() AS max_generated;
+-- somme 30 <= 31, mais le générateur en demande 32 : refusé
+SELECT ppp_test.try($$SELECT pass_policy.create_profile('p_bad', '{"min_lower": 0, "min_upper": 0, "min_digit": 30, "min_special": 0, "min_classes": 3, "max_length": 31}')$$) AS gen_min_over_max;
+SELECT ppp_test.try($$SELECT pass_policy.create_profile('p_bad', '{"min_lower": 0, "min_upper": 0, "min_digit": 30, "min_special": 0, "min_classes": 4, "max_length": 32}')$$) AS gen_min_classes_over_max;
+SELECT ppp_test.try($$SELECT pass_policy.create_profile('p_bad', '{"min_lower": 0, "min_upper": 0, "min_digit": 30, "min_special": 0, "min_classes": 3, "max_length": 32}')$$) AS gen_min_fits;
+SELECT ppp_test.try($$SELECT pass_policy.alter_profile('p_bad', '{"min_classes": 4}')$$) AS alter_gen_min_over_max;
+SELECT pass_policy.drop_profile('p_bad');
 SELECT count(*) AS p_bad_rows FROM pass_policy.profile WHERE name = 'p_bad';
 
 -- alter_profile

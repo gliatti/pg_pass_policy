@@ -64,6 +64,7 @@ static bool ppp_in_hook = false;
 
 /* Generated passwords: lengths accepted by generate_password() */
 #define PPP_GEN_MIN_LENGTH	8
+/* PPP_GEN_MAX_LENGTH: also pass_policy._max_generated_length() (SQL script) */
 #define PPP_GEN_MAX_LENGTH	512
 #define PPP_GEN_MAX_TRIES	100
 
@@ -1577,6 +1578,11 @@ ppp_generate_password(PG_FUNCTION_ARGS)
 					 errdetail("The profile requires between %d and %d characters.",
 							   prof.min_length, prof.max_length)));
 
+		/*
+		 * Same computation as pass_policy._generator_minimum() (SQL
+		 * script), used by the profile_classes_fit constraint and by
+		 * _rotate_role(): keep both in step.
+		 */
 		need_lower = Max(prof.min_lower, 1);
 		need_upper = Max(prof.min_upper, 1);
 		need_digit = Max(prof.min_digit, 1);

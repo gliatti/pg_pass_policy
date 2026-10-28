@@ -123,9 +123,14 @@ SELECT pass_policy.generate_password(32, 'applicatif');
 `generate_password` respecte `min_length`/`max_length` du profil :
 `generate_password(8)` échoue avec le profil `default` (minimum 12). Les
 bornes d'un profil ne dépassent jamais 512 caractères, la limite de
-`generate_password` (contraintes `CHECK`), et la somme des minima de classes
-(`min_lower + min_upper + min_digit + min_special`) ne dépasse pas
-`max_length`.
+`generate_password` (contraintes `CHECK`), et la longueur minimale que le
+générateur peut construire pour les minima de classes ne dépasse pas
+`max_length` : `generate_password` tire toujours au moins une minuscule, une
+majuscule et un chiffre, `min_special` caractères spéciaux, et un spécial de
+plus si les trois autres classes n'atteignent pas `min_classes`
+(`pass_policy._generator_minimum()`). Sans longueur explicite,
+`rotate_password()` et `switch_rotation_pair()` génèrent 24 caractères,
+relevés au `min_length` du profil et à cette longueur minimale.
 
 ### Rotation
 

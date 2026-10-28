@@ -73,6 +73,7 @@
 #include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"
 #include "utils/timestamp.h"
 
 #include "pg_pass_policy.h"
@@ -116,12 +117,15 @@ typedef struct pppPendingRow
 	TimestampTz locked_until;
 	TimestampTz audit_locked_until; /* lock to audit (lock_pending_audit) */
 	uint32		audit_lock_seq; /* its episode number */
+	TimestampTz audit_lock_set_at;	/* when that lock was set */
 	uint32		lost_episodes;	/* earlier episodes overwritten unaudited */
 	uint64		lock_seq;		/* entry->lock_seq when copied */
 	bool		state_written;	/* role_state upserted with locked_until */
 	bool		role_missing;	/* non-existent user name (authentication hook) */
 	bool		role_gone;		/* existing name when locked, no longer in
 								 * pg_roles (renamed or dropped since) */
+	bool		gone_confirmed; /* role_gone, and still no such role after
+								 * the commit (ppp_recheck_gone_roles) */
 } pppPendingRow;
 
 /* lockout parameters of an existing role, read from the profiles */
@@ -384,6 +388,7 @@ ppp_sync_pending(void)
 		rows[nrows].locked_until = entry->locked_until;
 		rows[nrows].audit_locked_until = entry->audit_locked_until;
 		rows[nrows].audit_lock_seq = entry->audit_lock_seq;
+		rows[nrows].audit_lock_set_at = entry->audit_lock_set_at;
 		rows[nrows].lost_episodes = 0;
 
 		/*
@@ -400,6 +405,7 @@ ppp_sync_pending(void)
 		rows[nrows].state_written = false;
 		rows[nrows].role_missing = entry->role_missing;
 		rows[nrows].role_gone = false;
+		rows[nrows].gone_confirmed = false;
 		nrows++;
 	}
 	LWLockRelease(ppp_shared->lock);
@@ -489,15 +495,17 @@ ppp_sync_pending(void)
 			values[6] = (Datum) 0;
 			lookup_value[0] = CStringGetTextDatum(r->rolename);
 			ret = SPI_execute_with_args(
-										"SELECT EXISTS (SELECT FROM pg_catalog.pg_roles r "
-										"WHERE r.rolname OPERATOR(pg_catalog.=) $1), "
+										"SELECT g.found, CASE WHEN NOT g.found THEN "
 										"(SELECT r.rolname::pg_catalog.text FROM ("
 										"SELECT s.role_oid FROM pass_policy.role_state s "
 										"WHERE s.role_name OPERATOR(pg_catalog.=) $1 "
 										"UNION SELECT rp.role_oid FROM pass_policy.role_profile rp "
 										"WHERE rp.role_name OPERATOR(pg_catalog.=) $1) o "
 										"JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) o.role_oid "
-										"ORDER BY 1 LIMIT 1)",
+										"ORDER BY 1 LIMIT 1) END "
+										"FROM (SELECT EXISTS (SELECT FROM pg_catalog.pg_roles r "
+										"WHERE r.rolname OPERATOR(pg_catalog.=) $1) AS found "
+										"OFFSET 0) g",
 										1, lookup_type, lookup_value, NULL, false, 1);
 			if (ret != SPI_OK_SELECT || SPI_processed != 1)
 				elog(ERROR, "role lookup of \"%s\" returned SPI code %d", r->rolename, ret);
@@ -662,6 +670,28 @@ ppp_sync_pending(void)
 }
 
 /*
+ * Run in its own transaction by ppp_ack_pending(), after the commit of
+ * ppp_sync_pending(): is a role found gone by that step still unknown?  The
+ * syscache is read in a fresh transaction (invalidations accepted at its
+ * start), outside ppp_shared->lock.  A role renamed away and back since the
+ * lookup is alive again: its entry must not be turned into a ghost.
+ */
+static void
+ppp_recheck_gone_roles(void)
+{
+	int			i;
+
+	for (i = 0; i < ppp_pending_nrows; i++)
+	{
+		pppPendingRow *r = &ppp_pending_rows[i];
+
+		if (r->role_gone)
+			r->gone_confirmed = !SearchSysCacheExists1(AUTHNAME,
+													   CStringGetDatum(r->rolename));
+	}
+}
+
+/*
  * Acknowledge in shared memory what ppp_sync_pending() wrote, once its
  * transaction has committed.  Failures counted by the hook meanwhile stay
  * pending for the next cycle; a lock set again since (different
@@ -674,6 +704,22 @@ ppp_ack_pending(void)
 
 	if (ppp_pending_nrows <= 0)
 		return;
+
+	/*
+	 * Rows of roles found gone: check again, after the commit, that they
+	 * still are.  If that check fails (error turned into a WARNING,
+	 * extension no longer trusted), gone_confirmed stays false: the entry
+	 * is acknowledged but not turned into a ghost, the conservative choice
+	 * (a ghost can be evicted, a real lock must not).
+	 */
+	for (i = 0; i < ppp_pending_nrows; i++)
+	{
+		if (ppp_pending_rows[i].role_gone)
+		{
+			(void) ppp_run_in_xact("role existence check", ppp_recheck_gone_roles);
+			break;
+		}
+	}
 
 	LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
 	for (i = 0; i < ppp_pending_nrows; i++)
@@ -694,12 +740,15 @@ ppp_ack_pending(void)
 		 * behind the copied one, or the same number for another lock) is
 		 * left as it is: what it holds was not written, and it is written
 		 * at the next cycle.  audit_acked_seq thus never gets ahead of
-		 * audit_lock_seq, and lost_episodes stays meaningful.
+		 * audit_lock_seq, and lost_episodes stays meaningful.  "Another
+		 * lock" is told by its end and by when it was set: two locks until
+		 * manual unlock (DT_NOEND) have the same end.
 		 */
 		if ((int32) (entry->audit_lock_seq - r->audit_lock_seq) < 0 ||
 			(r->lock_pending_audit &&
 			 entry->audit_lock_seq == r->audit_lock_seq &&
-			 entry->audit_locked_until != r->audit_locked_until))
+			 (entry->audit_locked_until != r->audit_locked_until ||
+			  entry->audit_lock_set_at != r->audit_lock_set_at)))
 			continue;
 
 		entry->pending_failures -= r->pending_failures;
@@ -724,8 +773,12 @@ ppp_ack_pending(void)
 			 * Renamed or dropped role: its lock was audited with
 			 * role_missing and not persisted; the name no longer logs in,
 			 * the entry becomes a ghost (evictable, purged once inactive).
+			 * Only if the name is still unknown after the commit
+			 * (gone_confirmed): renamed a -> b and back b -> a in the
+			 * meantime, the role is alive and its lock is real, it must
+			 * not become evictable.
 			 */
-			if (r->role_gone && same_lock)
+			if (r->gone_confirmed && same_lock)
 				entry->role_missing = true;
 		}
 	}
@@ -818,6 +871,13 @@ ppp_sync_cleanup(void)
 			purged++;
 		}
 	}
+
+	/*
+	 * Entries purged: room is free again, a series of fruitless eviction
+	 * scans of the authentication hook (ppp_enter_role) is over.
+	 */
+	if (purged > 0 || purged_missing > 0)
+		ppp_shared->evict_fruitless_active = false;
 	LWLockRelease(ppp_shared->lock);
 
 	if (purged > 0 || purged_missing > 0)

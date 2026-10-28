@@ -98,6 +98,7 @@ ppp_init_entry(pppRoleEntry *entry)
 	entry->audit_locked_until = 0;
 	entry->audit_lock_seq = 0;
 	entry->audit_acked_seq = 0;
+	entry->audit_lock_set_at = 0;
 	entry->lock_set_at = 0;
 	entry->lock_from_state = false;
 	entry->lock_inflight = 0;
@@ -420,8 +421,12 @@ ppp_enter_role(const char *rolename, pppEnterMode mode, TimestampTz now,
 			}
 			return NULL;
 		}
-		if (mode == PPP_ENTER_COUNT)
-			ppp_shared->evict_fruitless_active = false;
+
+		/*
+		 * A victim found, by either mode: the hash has changed, the series
+		 * of fruitless scans (if any) no longer describes it.
+		 */
+		ppp_shared->evict_fruitless_active = false;
 
 		if (ev)
 		{
@@ -439,6 +444,16 @@ ppp_enter_role(const char *rolename, pppEnterMode mode, TimestampTz now,
 			memcpy(&ev->victim, victim, sizeof(pppRoleEntry));
 		}
 		hash_search(ppp_role_hash, &victim->key, HASH_REMOVE, NULL);
+	}
+	else
+	{
+		/*
+		 * No scan: the hash is not full.  A series of fruitless scans
+		 * started earlier is over (entries have left since); a later one
+		 * starts afresh instead of completing a tour over a hash that has
+		 * changed in between.
+		 */
+		ppp_shared->evict_fruitless_active = false;
 	}
 
 	entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key,
@@ -843,6 +858,7 @@ ppp_client_auth_hook(Port *port, int status)
 					entry->audit_lock_seq++;
 					entry->lock_pending_audit = true;
 					entry->audit_locked_until = entry->locked_until;
+					entry->audit_lock_set_at = now;
 					entry->lock_set_at = now;
 					entry->lock_from_state = false;
 					just_locked = true;

@@ -100,6 +100,15 @@ typedef struct pppRoleEntry
 	uint32		audit_acked_seq;
 
 	/*
+	 * When the automatic lock audit_locked_until was set (authentication
+	 * hook).  Tells two locks of the same episode number and the same
+	 * audit_locked_until apart (an entry evicted and entered again, locked
+	 * again until manual unlock: DT_NOEND both times) when the worker
+	 * acknowledges its copy (ppp_ack_pending).
+	 */
+	TimestampTz audit_lock_set_at;
+
+	/*
 	 * When locked_until was last set to a new lock (authentication hook,
 	 * PRE_COMMIT of shmem_lock_role(), re-injection by the worker).  An
 	 * unlock committed afterwards only lifts a lock set before it was

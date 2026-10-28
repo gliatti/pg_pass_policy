@@ -47,15 +47,52 @@ $roles$;
 -------------------------------------------------------------------------------
 
 -- 3.1 profile
+/*
+ * Bounds of the generator, used by the CHECK constraints of profile and by
+ * _rotate_role().  Both are SQL-standard bodies (parsed once, at CREATE
+ * EXTENSION: the caller's search_path plays no part) and IMMUTABLE.
+ *
+ * _max_generated_length(): PPP_GEN_MAX_LENGTH (policy.c), the longest
+ * password that generate_password() produces; the only copy of the value
+ * on the SQL side (a profile whose bounds exceed it could never be
+ * rotated).  Keep both values in step.
+ */
+CREATE FUNCTION _max_generated_length()
+RETURNS int
+LANGUAGE sql IMMUTABLE PARALLEL SAFE
+RETURN 512;
+COMMENT ON FUNCTION _max_generated_length() IS 'Internal: longest password generate_password() produces (PPP_GEN_MAX_LENGTH)';
+
+/*
+ * _generator_minimum(): the shortest password generate_password() can build
+ * for these class minima, the same computation as policy.c: at least one
+ * lower-case letter, one upper-case letter and one digit are always drawn
+ * (Max(min_x, 1)), min_special specials, and one special when the three
+ * other classes do not reach min_classes on their own.  Computed in bigint
+ * and capped to int4 so that four large minima are refused by the CHECK
+ * (23514) instead of overflowing (22003).
+ */
+CREATE FUNCTION _generator_minimum(p_min_lower int, p_min_upper int, p_min_digit int,
+                                   p_min_special int, p_min_classes int)
+RETURNS int
+LANGUAGE sql IMMUTABLE PARALLEL SAFE
+RETURN least(
+           greatest(p_min_lower, 1)::bigint
+           + greatest(p_min_upper, 1)
+           + greatest(p_min_digit, 1)
+           + CASE WHEN 3 + (p_min_special > 0)::int < p_min_classes THEN 1
+                  ELSE greatest(p_min_special, 0) END,
+           2147483647)::int;
+COMMENT ON FUNCTION _generator_minimum(int, int, int, int, int) IS 'Internal: shortest password generate_password() can build for these class minima (min_lower, min_upper, min_digit, min_special, min_classes)';
+
 CREATE TABLE profile (
     profile_id        serial PRIMARY KEY,
     name              text NOT NULL UNIQUE
                       CHECK (name ~ '^[A-Za-z0-9_.-]{1,63}$'),
-    -- 512 = PPP_GEN_MAX_LENGTH (policy.c), the longest password that
-    -- generate_password() produces: a profile whose bounds exceed it could
-    -- never be rotated.  Keep both values in step.
-    min_length        int NOT NULL DEFAULT 12  CHECK (min_length BETWEEN 8 AND 512),
-    max_length        int NOT NULL DEFAULT 128 CHECK (max_length <= 512),
+    -- upper bound: max_length <= _max_generated_length() and
+    -- profile_length_range (min_length <= max_length)
+    min_length        int NOT NULL DEFAULT 12  CHECK (min_length >= 8),
+    max_length        int NOT NULL DEFAULT 128 CHECK (max_length <= pass_policy._max_generated_length()),
     min_lower         int NOT NULL DEFAULT 1   CHECK (min_lower   >= 0),
     min_upper         int NOT NULL DEFAULT 1   CHECK (min_upper   >= 0),
     min_digit         int NOT NULL DEFAULT 1   CHECK (min_digit   >= 0),
@@ -81,8 +118,9 @@ CREATE TABLE profile (
     created_at        timestamptz NOT NULL DEFAULT now(),
     updated_at        timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT profile_length_range CHECK (max_length >= min_length),
-    -- bigint: the sum of four large minima must not overflow int4
-    CONSTRAINT profile_classes_fit  CHECK (min_lower::bigint + min_upper + min_digit + min_special <= max_length)
+    -- what generate_password() really needs, not the plain sum of the minima
+    CONSTRAINT profile_classes_fit  CHECK (pass_policy._generator_minimum(min_lower, min_upper, min_digit,
+                                                                          min_special, min_classes) <= max_length)
 );
 COMMENT ON TABLE profile IS 'Password policy profiles; "default" applies to every role without an assignment';
 
@@ -1186,10 +1224,12 @@ COMMENT ON FUNCTION unassign_profile(name) IS 'Removes the profile assignment of
  * hook did not run.
  *
  * Length: p_length NULL (default of the callers) = 24 characters, raised
- * to the min_length of the profile and to the sum of its class minima
- * (min_lower + min_upper + min_digit + min_special), capped by its
- * max_length (profile_classes_fit keeps the sum within it); an
- * explicit p_length outside [min_length, max_length] is refused (22023).
+ * to the min_length of the profile and to the shortest length the
+ * generator can build for its class minima (_generator_minimum(): one
+ * lower-case, one upper-case and one digit at least, plus a special when
+ * min_classes needs it), capped by its max_length (profile_classes_fit
+ * keeps that minimum within it); an explicit p_length outside
+ * [min_length, max_length] is refused (22023).
  */
 CREATE FUNCTION _rotate_role(p_role name, p_oid oid, p_length int,
                              OUT password text, OUT profile text)
@@ -1204,7 +1244,8 @@ DECLARE
 BEGIN
     -- read once: the caller's audit row names the profile actually used
     SELECT p.name, p.min_length, p.max_length,
-           p.min_lower + p.min_upper + p.min_digit + p.min_special
+           pass_policy._generator_minimum(p.min_lower, p.min_upper, p.min_digit,
+                                          p.min_special, p.min_classes)
       INTO profile, v_min, v_max, v_cls
       FROM pass_policy.effective_profile(p_role) p;
     IF p_length IS NULL THEN
@@ -1213,7 +1254,7 @@ BEGIN
         RAISE EXCEPTION 'pg_pass_policy: password length % is outside the bounds of profile "%"', p_length, profile
               USING ERRCODE = 'invalid_parameter_value',
                     DETAIL = format('Profile "%s" requires %s to %s characters.', profile, v_min, v_max),
-                    HINT = 'Omit the length to use the default (24 characters, raised to min_length and to the sum of the class minima).';
+                    HINT = 'Omit the length to use the default (24 characters, raised to min_length and to the length the class minima require).';
     ELSE
         v_len := p_length;
     END IF;
@@ -1244,6 +1285,8 @@ COMMENT ON FUNCTION _rotate_role(name, oid, int) IS 'Internal: generates, sets a
  * and never stored or logged.
  */
 -- length NULL (default) = 24 characters, raised to the profile min_length
+-- and to the length its class minima require (_generator_minimum()), capped
+-- by its max_length
 CREATE FUNCTION rotate_password(role name, length int DEFAULT NULL)
 RETURNS text
 LANGUAGE plpgsql SECURITY DEFINER
@@ -1444,6 +1487,8 @@ $$;
 COMMENT ON FUNCTION create_rotation_pair(text, name, name, name) IS 'Declares a rotation pair, creating missing login roles as members of the group';
 
 -- length NULL (default) = 24 characters, raised to the profile min_length
+-- and to the length its class minima require (_generator_minimum()), capped
+-- by its max_length
 CREATE FUNCTION switch_rotation_pair(pair text, length int DEFAULT NULL)
 RETURNS TABLE (active_role text, password text, previous_role text, previous_valid_until timestamptz)
 LANGUAGE plpgsql SECURITY DEFINER

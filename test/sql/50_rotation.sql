@@ -101,6 +101,25 @@ INSERT INTO ppp_test.secrets
   SELECT 'rotcls64', pass_policy.rotate_password('regress_rotcls');
 SELECT length(pwd) AS len_classes_max FROM ppp_test.secrets WHERE label = 'rotcls64';
 
+-- (vérification 2) Longueur par défaut relevée au besoin réel du générateur :
+-- min_digit = 30, autres minima à 0, min_classes = 3 : somme 30, mais
+-- generate_password() tire toujours une minuscule et une majuscule (32)
+CREATE ROLE regress_rotgen LOGIN;
+SELECT pass_policy.create_profile('p_rotgen', '{"min_lower": 0, "min_upper": 0, "min_digit": 30, "min_special": 0, "min_classes": 3, "min_length": 8, "max_length": 64, "min_age": "0"}') > 0 AS created;
+SELECT pass_policy.assign_profile('regress_rotgen', 'p_rotgen');
+INSERT INTO ppp_test.secrets
+  SELECT 'rotgen', pass_policy.rotate_password('regress_rotgen');
+SELECT length(pwd) AS len_gen,
+       length(regexp_replace(pwd, '[^0-9]', '', 'g')) >= 30 AS digits_ok
+  FROM ppp_test.secrets WHERE label = 'rotgen';
+-- min_classes = 4 : un spécial forcé en plus (33)
+SELECT pass_policy.alter_profile('p_rotgen', '{"min_classes": 4}');
+INSERT INTO ppp_test.secrets
+  SELECT 'rotgen4', pass_policy.rotate_password('regress_rotgen');
+SELECT length(pwd) AS len_gen4 FROM ppp_test.secrets WHERE label = 'rotgen4';
+-- profil impossible pour le générateur refusé (33 > 32)
+SELECT ppp_test.try($$SELECT pass_policy.alter_profile('p_rotgen', '{"max_length": 32}')$$) AS gen_impossible;
+
 -- (clôture) _record_done() : drapeau posé par le hook pour la transaction
 -- courante ; une seule ligne d'historique par rotation (pas de doublon par
 -- _ensure_recorded())
