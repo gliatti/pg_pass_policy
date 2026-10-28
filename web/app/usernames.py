@@ -57,14 +57,14 @@ INVISIBLE_CODE_POINTS = frozenset(
     | set(range(0xE0100, 0xE01F0))
 )
 
-# the rule in one line, quoted by the startup error on PGPP_WEB_BASIC_USERS,
-# built from the constants above so that it cannot drift from them
+# the rule in one line, quoted by the startup error on PGPP_WEB_BASIC_USERS
+# (the length from USER_MAX_LENGTH, the rest in words)
 USER_NAME_RULE = (
-    f"1 to {USER_MAX_LENGTH} characters, in Unicode NFC and NFKC forms, no leading"
-    " combining mark, no character of categories"
-    f" {' '.join(sorted(REFUSED_CATEGORIES))} but the ASCII space inside the name,"
-    f" none of the {len(INVISIBLE_CODE_POINTS)} invisible code points of"
-    " app.usernames.INVISIBLE_CODE_POINTS (variation selectors, fillers...)"
+    f"1 to {USER_MAX_LENGTH} characters, in Unicode NFC and NFKC forms (no"
+    " decomposed accent, no compatibility form), no leading combining mark,"
+    " no control, format, surrogate, private use or unassigned character, no"
+    " Unicode line, paragraph or space separator but the ASCII space inside the"
+    " name, no invisible character (variation selectors, fillers...)"
 )
 
 

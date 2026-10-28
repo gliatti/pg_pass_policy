@@ -6,6 +6,7 @@ already refused by NFKC."""
 
 from __future__ import annotations
 
+import json
 import logging
 import unicodedata
 from datetime import UTC, datetime
@@ -69,7 +70,7 @@ def test_one_ipv6_64_shares_one_window(monkeypatch, caplog):
         client = TestClient(app, client=(f"2001:db8:1:2::{i:x}", 40000))
         assert client.get("/_whoami", headers={"X-Remote-User": "carol"}).status_code == 403
     assert [r.getMessage() for r in caplog.records] == [
-        "proxy header refused from untrusted peer 2001:db8:1:2::1"
+        "proxy header refused from untrusted peer 2001:db8:1:2::1 (2001:db8:1:2::/64)"
     ]
     assert list(app.state.auth_warnings.untrusted_proxy_peer._windows) == ["2001:db8:1:2::/64"]
 
@@ -143,15 +144,23 @@ def test_a_scan_of_many_peers_writes_at_most_the_cap(monkeypatch, caplog):
 )
 def test_a_claimed_name_is_always_quoted(name):
     logged = auth._loggable(name)
-    assert logged == ascii(name)
+    assert logged == json.dumps(name)
     assert logged.isascii()
-    assert logged[0] in "'\"" and logged[-1] == logged[0]
+    assert logged[0] == logged[-1] == '"'
+    assert json.loads(logged) == name
 
 
 def test_a_long_name_is_cut_before_escaping():
-    name = "​" * 200
+    # the longest escape: a character outside the BMP, two \\uXXXX
+    name = "\U0001f600" * 200
     logged = auth._loggable(name)
-    assert logged == ascii("​" * 128) + "…"
+    assert logged == json.dumps(name[: auth.LOGGED_NAME_MAX]) + "..."
+    assert logged.isascii()
+    assert len(logged) == 6 * 2 * auth.LOGGED_NAME_MAX + 2 + 3
+
+
+def test_del_is_escaped():
+    assert auth._loggable("a\x7fb") == '"a\\u007fb"'
 
 
 def test_a_name_cannot_forge_the_peer_in_the_basic_failure_line(unit_client, caplog):
@@ -160,7 +169,7 @@ def test_a_name_cannot_forge_the_peer_in_the_basic_failure_line(unit_client, cap
     caplog.set_level(logging.WARNING)
     header = "Basic " + base64.b64encode(b"x from 10.6.6.6:pw").decode()
     assert unit_client.get("/_whoami", headers={"Authorization": header}).status_code == 401
-    assert "basic authentication failed for user 'x from 10.6.6.6' from testclient" in caplog.text
+    assert 'basic authentication failed for user "x from 10.6.6.6" from testclient' in caplog.text
 
 
 # --- 3: a refused proxy user name is logged, throttled per peer ------------------------------
@@ -177,13 +186,13 @@ def test_a_refused_proxy_name_is_logged_with_its_reason(monkeypatch, caplog):
             auth.user_from_proxy(_proxy_request("bob️".encode(), warnings), settings)
         assert refused.value.status_code == 401
     assert [r.getMessage() for r in caplog.records] == [
-        "proxy header user name 'bob\\ufe0f' refused from peer 127.0.0.1:"
+        'proxy header user name "bob\\ufe0f" refused from peer 127.0.0.1:'
         " character U+FE0F not allowed (invisible)"
     ]
     caplog.clear()
     warnings.flush()
     assert [r.getMessage() for r in caplog.records] == [
-        "proxy header user name refused from peer 127.0.0.1:"
+        'proxy header user name refused "bob\\ufe0f":'
         " 2 similar warnings suppressed since 2026-05-06T07:08:09+00:00"
     ]
     assert warnings.refused_proxy_user in warnings.all()
@@ -195,8 +204,8 @@ def test_a_refused_proxy_name_is_logged_with_its_reason(monkeypatch, caplog):
 def test_the_rule_quotes_the_constants():
     rule = usernames.USER_NAME_RULE
     assert f"1 to {usernames.USER_MAX_LENGTH} characters" in rule
-    assert " ".join(sorted(usernames.REFUSED_CATEGORIES)) in rule
-    assert f"{len(usernames.INVISIBLE_CODE_POINTS)} invisible code points" in rule
+    # in words, no Python constant name
+    assert "_" not in rule and "app." not in rule
 
 
 # --- 6: no invisible code point already refused by NFKC ----------------------------------------
@@ -211,3 +220,48 @@ def test_no_invisible_code_point_is_refused_by_nfkc():
 def test_the_hangul_fillers_are_refused_by_nfkc(code_point):
     assert code_point not in usernames.INVISIBLE_CODE_POINTS
     assert "not in Unicode NFKC form" in usernames.user_name_problem(f"bob{chr(code_point)}")
+
+
+# --- 4, 5, 8: flush() capped, earliest since kept, refused names keyed by name -------------
+
+
+def test_flush_writes_at_most_the_cap_per_key(monkeypatch, caplog):
+    caplog.set_level(logging.WARNING)
+    _clock(monkeypatch)
+    _fixed_now(monkeypatch)
+    throttled = auth._ThrottledWarning("probe")
+    for key in "abcde":
+        throttled.warning("w", key=key)
+        throttled.warning("w", key=key)  # suppressed: one pending per key
+    caplog.clear()
+    throttled.max_lines = 3
+    throttled.flush()
+    assert [r.getMessage() for r in caplog.records] == [
+        *(
+            f"probe {k}: 1 similar warnings suppressed since 2026-05-06T07:08:09+00:00"
+            for k in "abc"
+        ),
+        "probe (all sources): 2 similar warnings suppressed since 2026-05-06T07:08:09+00:00",
+    ]
+
+
+def test_the_earliest_since_is_kept():
+    window = auth._Window()
+    later = datetime(2026, 5, 6, 8, 0, 0, tzinfo=UTC)
+    earlier = datetime(2026, 5, 6, 7, 0, 0, tzinfo=UTC)
+    window.add(1, later)
+    window.add(1, earlier)
+    assert window.take() == (2, earlier)
+
+
+def test_refused_proxy_names_are_keyed_by_name(monkeypatch, caplog):
+    caplog.set_level(logging.WARNING)
+    _clock(monkeypatch)
+    warnings = auth.AuthWarnings()
+    settings = make_settings(auth="proxy", basic_users="", proxy_header="X-Remote-User")
+    for name in ("bob️", "eve​"):
+        with pytest.raises(HTTPException):
+            auth.user_from_proxy(_proxy_request(name.encode(), warnings), settings)
+    # one proxy, two names: two lines
+    assert len(caplog.records) == 2
+    assert list(warnings.refused_proxy_user._windows) == ['"bob\\ufe0f"', '"eve\\u200b"']

@@ -8,6 +8,7 @@ import functools
 import hashlib
 import hmac
 import ipaddress
+import json
 import threading
 import time
 from collections import OrderedDict
@@ -21,7 +22,7 @@ from app.config import Settings, bcrypt_cost
 from app.hashpw import BCRYPT_MAX_BYTES
 from app.logfilter import get_logger
 from app.security import route_path
-from app.usernames import USER_MAX_LENGTH, user_name_problem, valid_user_name
+from app.usernames import user_name_problem, valid_user_name
 
 log = get_logger("auth")
 
@@ -82,17 +83,22 @@ def _decode_basic(authorization: str | None) -> tuple[bytes, bytes] | None:
     return user_b, password_b
 
 
+# characters of a claimed user name kept in a log line
+LOGGED_NAME_MAX = 64
+
+
 def _loggable(user: str | None) -> str:
     """A claimed user name safe for a log line, valid or not: cut to
-    USER_MAX_LENGTH characters, then escaped and quoted by ascii() (every
-    non-ASCII character as \\x, \\u or \\U, a quote or a line break
-    escaped), followed by "…" when cut.  Always quoted, so that no name can
-    forge the " from <address>" that follows it in a log line, nor slip an
-    invisible or look-alike character into the log."""
+    LOGGED_NAME_MAX characters, then quoted and escaped by json.dumps()
+    (always double quotes, " and \\ escaped, every control or non-ASCII
+    character escaped as \\n or \\uXXXX, DEL too), followed by "..." when cut.  Pure
+    ASCII, at most 6 * 2 * LOGGED_NAME_MAX + 5 characters.  Always quoted,
+    so that no name can forge the " from <address>" that follows it in a
+    log line, nor slip an invisible or look-alike character into the log."""
     if user is None:
         return "<none>"
-    cut = user[:USER_MAX_LENGTH]
-    return ascii(cut) + ("…" if len(user) > USER_MAX_LENGTH else "")
+    quoted = json.dumps(user[:LOGGED_NAME_MAX]).replace("\x7f", "\\u007f")
+    return quoted + ("..." if len(user) > LOGGED_NAME_MAX else "")
 
 
 def verify_basic(authorization: str | None, users: dict[str, bytes]) -> str | None:
@@ -276,6 +282,8 @@ class _Window:
             return
         if not self.suppressed:
             self.since = since or _utcnow()
+        elif since is not None:
+            self.since = min(self.since or since, since)
         self.suppressed += count
 
     def take(self) -> tuple[int, datetime | None]:
@@ -377,11 +385,16 @@ class _ThrottledWarning:
         log.warning(message, *args)
 
     def flush(self) -> None:
-        """Log the counts of warnings suppressed and not reported yet, if any."""
+        """Log the counts of warnings suppressed and not reported yet, if any:
+        one line for each of the first `max_lines` keys, the others added to
+        the global count."""
         with self._lock:
             pending = [(key, *window.take()) for key, window in self._windows.items()]
+            pending = [entry for entry in pending if entry[1]]
+            for _, suppressed, since in pending[self.max_lines :]:
+                self._global.add(suppressed, since)
             global_pending = self._global.take()
-        for key, suppressed, since in pending:
+        for key, suppressed, since in pending[: self.max_lines]:
             self._log_pending(self._subject(key), suppressed, since)
         self._log_pending(self._global_subject(), *global_pending)
 
@@ -409,9 +422,9 @@ class AuthWarnings:
         )
         # a proxy header holding a name refused by app.usernames (NFKC,
         # invisible character...): the reason and the escaped name, per
-        # peer as above
+        # escaped name (the peer is the trusted proxy, nearly always one)
         self.refused_proxy_user = _ThrottledWarning(
-            "proxy header user name refused from peer", max_keys=UNTRUSTED_PEERS_TRACKED
+            "proxy header user name refused", max_keys=UNTRUSTED_PEERS_TRACKED
         )
 
     def all(self) -> tuple[_ThrottledWarning, ...]:
@@ -426,8 +439,13 @@ class AuthWarnings:
 def user_from_proxy(request: Request, settings: Settings) -> str:
     warnings: AuthWarnings = request.app.state.auth_warnings
     if not _client_is_trusted(request, settings):
+        peer, key = _peer(request), _peer_key(request)
+        # the key too when it differs (an IPv6 /64), so that the count
+        # suppressed with this line is credited to the key
         warnings.untrusted_proxy_peer.warning(
-            "proxy header refused from untrusted peer %s", _peer(request), key=_peer_key(request)
+            "proxy header refused from untrusted peer %s",
+            peer if key == peer else f"{peer} ({key})",
+            key=key,
         )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -466,12 +484,13 @@ def user_from_proxy(request: Request, settings: Settings) -> str:
         ) from None
     problem = user_name_problem(user)
     if problem is not None:
+        logged = _loggable(user)
         warnings.refused_proxy_user.warning(
             "proxy header user name %s refused from peer %s: %s",
-            _loggable(user),
+            logged,
             _peer(request),
             problem,
-            key=_peer_key(request),
+            key=logged,
         )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

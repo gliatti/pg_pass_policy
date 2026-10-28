@@ -6,6 +6,7 @@ on PGPP_WEB_BASIC_USERS naming the rule."""
 
 from __future__ import annotations
 
+import json
 import logging
 import unicodedata
 from datetime import UTC, datetime
@@ -229,12 +230,12 @@ def test_plain_names_are_still_accepted(name):
 )
 def test_a_refused_name_is_logged_in_ascii(name):
     logged = auth._loggable(name)
-    if len(name) > 128:
+    assert logged.isascii()
+    if len(name) > auth.LOGGED_NAME_MAX:
         # cut before escaping, then marked as cut
-        assert logged == ascii(name[:128]) + "…"
+        assert logged == json.dumps(name[: auth.LOGGED_NAME_MAX]) + "..."
     else:
-        assert logged == ascii(name)
-        assert logged.isascii()
+        assert logged == json.dumps(name)
 
 
 # --- 4: the startup error names the escaped name, the reason and the rule ----------------
