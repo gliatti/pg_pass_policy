@@ -8,6 +8,7 @@ import psycopg
 import pytest
 
 from tests.conftest import (
+    CSRF_HX_HEADERS,
     T_GROUP,
     T_PAIR,
     T_PROFILE,
@@ -35,7 +36,8 @@ def test_dashboard(client):
     for status in ("ok", "warning", "grace", "expired", "locked", "never expires", "unknown"):
         assert status in body
     assert "Background worker" in body
-    assert 'name="csrf-token"' in body
+    assert CSRF_HX_HEADERS.search(body), "token in hx-headers"
+    assert 'name="csrf-token"' not in body, "no redundant meta"
     assert "no-store" in response.headers["Cache-Control"]
     assert "'nonce-" in response.headers["Content-Security-Policy"]
     assert "signed in as <strong>admin</strong>" in body

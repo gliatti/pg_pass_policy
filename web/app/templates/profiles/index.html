@@ -19,8 +19,9 @@
     <td>{{ p.lock_duration or 'manual unlock' }}</td>
     <td>{{ p.assigned_roles }}</td>
     <td>{% if p.name != 'default' %}
-      <form hx-post="{{ path_for('profile_delete', name=p.name) }}" hx-target="#profile-alerts" hx-swap="innerHTML"
-            hx-confirm="Delete profile {{ p.name }}?"><button class="btn btn-warn">Delete</button></form>
+      <form method="post" action="{{ path_for('profile_delete', name=p.name) }}"
+            hx-post="{{ path_for('profile_delete', name=p.name) }}" hx-target="#profile-alerts" hx-swap="innerHTML"
+            hx-confirm="Delete profile {{ p.name }}?"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="btn btn-warn">Delete</button></form>
     {% endif %}</td>
   </tr>
   {% endfor %}

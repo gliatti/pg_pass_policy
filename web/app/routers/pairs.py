@@ -16,8 +16,8 @@ log = get_logger("pairs")
 
 REREAD_WARNING = reread_warning("The pair was switched", "the pair list")
 NO_ROW_WARNING = (
-    "Pair {}: the switch was applied but returned no row, so its new password"
-    " cannot be shown; the pair list below shows its current state."
+    "Pair {}: the switch was applied but returned no row or no password, so its new"
+    " password cannot be shown; the pair list below shows its current state."
 )
 
 
@@ -98,12 +98,15 @@ def pair_switch(
     result, error = db.run_action(conn, db.switch_pair, pair, length)
     if error is not None:
         return _content(request, conn, "pairs/_content.html", error=error)
-    if result is None:
-        # committed, but switch_rotation_pair() returned no row: no password
-        # to show, said as such (200: the action did happen, it must not be
-        # retried blindly) rather than a TypeError (500) after the commit;
-        # no password to protect, so the list is read the normal way
-        log.error("pair %s: switch applied but no row returned", pair)
+    if result is None or not result.get("password"):
+        # committed, but switch_rotation_pair() returned no row, or a row
+        # whose password is NULL or empty: no password to show, said as such
+        # (200: the action did happen, it must not be retried blindly)
+        # rather than a TypeError (500) after the commit or a password
+        # displayed as "None"; no password to protect, so the list is read
+        # the normal way
+        what = "no row" if result is None else "no password"
+        log.error("pair %s: switch applied but %s returned", pair, what)
         return _content(request, conn, "pairs/_content.html", warning=NO_ROW_WARNING.format(pair))
     # the password is in this response only (no-store); never logged nor stored
     return _content(request, conn, "pairs/_content.html", switched={"pair": pair, **result})

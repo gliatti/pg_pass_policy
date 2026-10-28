@@ -17,7 +17,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from app import __version__
 from app.auth import dummy_hash, require_user
 from app.config import Settings
-from app.csrf import verify_csrf
+from app.csrf import InvalidCsrfToken, verify_csrf
 from app.db import ExtensionUnavailable, extension_unavailable, make_pool
 from app.logfilter import get_logger, install_log_masking
 from app.routers import audit, dashboard, maintenance, pairs, profiles, roles
@@ -84,7 +84,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # itself (fastapi.HTTPException is a subclass)
     @app.exception_handler(StarletteHTTPException)
     async def http_exception(request: Request, exc: StarletteHTTPException) -> Any:
-        return _error_response(request, exc.status_code, str(exc.detail), exc.headers)
+        headers = exc.headers
+        if isinstance(exc, InvalidCsrfToken) and is_hx(request):
+            # a stale token (lost session): reload the page for a fresh one
+            headers = {**(headers or {}), "HX-Refresh": "true"}
+        return _error_response(request, exc.status_code, str(exc.detail), headers)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request: Request, exc: RequestValidationError) -> Any:

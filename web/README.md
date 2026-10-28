@@ -70,7 +70,7 @@ Tout passe par des variables d'environnement préfixées `PGPP_WEB_`.
 | `PGPP_WEB_TRUSTED_PROXIES` | `127.0.0.1,::1` | mode `proxy` : adresses ou réseaux (CIDR) autorisés à poser l'en-tête ; `unix` pour un socket Unix ; `*` pour tout accepter (déconseillé) |
 | `PGPP_WEB_SESSION_HTTPS_ONLY` | `false` | marque le cookie de session `Secure` et le nomme `__Host-pgpp_session` : **obligatoire derrière HTTPS** (voir Sécurité) |
 | `PGPP_WEB_REALM` | `pg_pass_policy` | realm HTTP basic |
-| `PGPP_WEB_POOL_MIN` / `PGPP_WEB_POOL_MAX` | `1` / `4` | taille du pool de connexions |
+| `PGPP_WEB_POOL_MIN` / `PGPP_WEB_POOL_MAX` | `1` / `4` | taille du pool de connexions (chaque connexion est vérifiée à sa sortie du pool et remplacée si le serveur l'a fermée) |
 | `PGPP_WEB_POOL_TIMEOUT` | `10` | attente maximale (s) d'une connexion du pool |
 | `PGPP_WEB_PAGE_SIZE` | `50` | taille de page de l'audit |
 | `PGPP_WEB_APP_NAME` | `pgpp-web` | préfixe de l'`application_name` PostgreSQL |
@@ -90,6 +90,10 @@ pgpp-web-hash alice
 # alice:$2b$12$...
 export PGPP_WEB_BASIC_USERS='alice:$2b$12$...,bob:$2b$12$...'
 ```
+
+Une empreinte tronquée ou abîmée (coupée par le shell, une apostrophe, un
+retour à la ligne) est refusée au démarrage : une empreinte bcrypt compte
+60 caractères, `$2b$NN$` puis 53 caractères de `[./A-Za-z0-9]`.
 
 Le nom de l'utilisateur web est enregistré dans `pass_policy.audit_log`
 (colonne `application_name`, valeur `pgpp-web:alice`) : chaque action reste
@@ -199,6 +203,11 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
   n'est émis sur les pages 401/403 affichées avant l'authentification. Une
   requête marquée `Sec-Fetch-Site: cross-site` ou `same-site` est refusée : le
   back-office n'a pas d'appelant légitime sur un autre sous-domaine ou port.
+  Un jeton absent ou périmé (session perdue : cookie expiré ou effacé,
+  `PGPP_WEB_SECRET` changé) donne un 403 « reload the page » ; pour une
+  requête htmx, la réponse porte `HX-Refresh: true` et la page est rechargée
+  avec un jeton neuf. Le jeton n'est publié que dans `hx-headers` (pas de
+  balise `<meta>`).
 - **En-têtes** : `Content-Security-Policy` sans script inline (nonce par
   requête, `script-src 'self'`, `frame-ancestors 'none'`, `form-action 'self'`),
   `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`,
@@ -295,7 +304,9 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
   exist », appel d'une fonction `pass_policy.*`), reconnu directement, ou en
   `42P01` (vue `pass_policy.*` absente) : ce dernier cas pouvant aussi venir
   d'une extension installée mais décalée, l'application vérifie alors
-  `pg_extension` avant d'afficher la page dédiée (sinon page 500). Le
+  `pg_extension` avant d'afficher la page dédiée (sinon page 500). Seul le
+  SQLSTATE compte, jamais le texte du message, que le serveur traduit
+  selon `lc_messages` (« le schéma « pass_policy » n'existe pas »). Le
   `55000` « pg_pass_policy is not installed in this database » du serveur
   donne la même page.
 - **Noms dans les URL** : un nom de rôle ou de paire peut contenir `/` ; il est

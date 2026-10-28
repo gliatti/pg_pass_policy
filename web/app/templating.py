@@ -61,12 +61,15 @@ def is_hx(request: Request) -> bool:
 
 
 def fmt_ts(value: Any) -> str:
+    """A timestamp to the minute, with its UTC offset ("2026-10-28 14:05+01:00"):
+    psycopg returns timestamptz values in the TimeZone of the session, which
+    is the server's unless set otherwise, not necessarily the reader's."""
     if value is None:
         return "—"
     if isinstance(value, str):
         return "∞ (manual)" if value == INFINITY else value
     if isinstance(value, datetime):
-        return value.strftime("%Y-%m-%d %H:%M")
+        return value.isoformat(sep=" ", timespec="minutes")
     return str(value)
 
 

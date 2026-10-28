@@ -28,6 +28,19 @@ SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 REFUSED_FETCH_SITES = frozenset({"cross-site", "same-site"})
 
 
+class InvalidCsrfToken(HTTPException):
+    """403 of a missing or stale token.  A page opened before its session
+    was lost (cookie expired or cleared, PGPP_WEB_SECRET changed, another
+    identity) sends a stale token on every htmx request: main.py asks htmx
+    to reload the page (HX-Refresh), which issues a fresh token, instead of
+    failing each action."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            status.HTTP_403_FORBIDDEN, "CSRF token missing or invalid: reload the page"
+        )
+
+
 def get_csrf_token(request: Request) -> str:
     user = getattr(request.state, "user", None)
     token = request.session.get(SESSION_KEY)
@@ -69,4 +82,4 @@ async def verify_csrf(request: Request) -> None:
         # bytes: compare_digest() raises TypeError on non-ASCII str
         or not hmac.compare_digest(expected.encode(), supplied.encode())
     ):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "CSRF token missing or invalid")
+        raise InvalidCsrfToken()

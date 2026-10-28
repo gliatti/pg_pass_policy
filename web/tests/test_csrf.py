@@ -146,7 +146,7 @@ def test_anonymous_page_issues_no_token(unit_app):
     # the 401 page (minimal, without base.html) carries no token and sets no
     # session cookie
     assert "set-cookie" not in response.headers
-    assert re.search(r'<meta name="csrf-token"', response.text) is None
+    assert "X-CSRF-Token" not in response.text
     assert not client.cookies
     # whatever was obtained anonymously (nothing) is refused with bob's credentials
     headers = {"X-CSRF-Token": "", **_basic(BOB, TEST_PASSWORD)}

@@ -11,6 +11,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _BCRYPT_PREFIXES = ("$2a$", "$2b$", "$2y$")
 _BCRYPT_COST_RE = re.compile(rb"^\$2[aby]\$([0-9]{2})\$")
+# a whole bcrypt hash: $2b$NN$, then 22 characters of salt and 31 of digest
+# in bcrypt's base64 alphabet (60 characters in all)
+_BCRYPT_HASH_RE = re.compile(rb"\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}")
 MIN_SECRET_LENGTH = 32
 
 
@@ -19,6 +22,14 @@ def bcrypt_cost(digest: bytes) -> int | None:
     match = _BCRYPT_COST_RE.match(digest)
     cost = int(match.group(1)) if match else None
     return cost if cost is not None and 4 <= cost <= 31 else None
+
+
+def _malformed_hash(user: str, digest: str) -> str:
+    return (
+        f"PGPP_WEB_BASIC_USERS: the bcrypt hash of {user!r} is truncated or malformed"
+        f" ({len(digest)} characters, 60 expected: $2b$NN$ then 53 characters"
+        " of [./A-Za-z0-9]): rehash with pgpp-web-hash"
+    )
 
 
 class Settings(BaseSettings):
@@ -92,6 +103,8 @@ class Settings(BaseSettings):
             user, sep, digest = entry.partition(":")
             if not sep or not user or not digest.startswith(_BCRYPT_PREFIXES):
                 raise ValueError("PGPP_WEB_BASIC_USERS entries must be user:bcrypt-hash")
+            if not digest.isascii():
+                raise ValueError(_malformed_hash(user, digest))
             users[user] = digest.encode("ascii")
         # one cost for every hash: an unknown user is checked against a dummy
         # hash of that cost (auth.dummy_hash()), a user whose hash had another
@@ -104,6 +117,12 @@ class Settings(BaseSettings):
                 "PGPP_WEB_BASIC_USERS: every bcrypt hash must have the same cost"
                 f" (found {', '.join(str(c) for c in sorted(costs))}): rehash with pgpp-web-hash"
             )
+        # a truncated or mangled hash (cut by a shell, a quote, a line wrap)
+        # would be accepted above and make bcrypt.checkpw() raise "Invalid
+        # salt" at the first login of that user: refused at startup instead
+        for user, digest in users.items():
+            if not _BCRYPT_HASH_RE.fullmatch(digest):
+                raise ValueError(_malformed_hash(user, digest.decode("ascii")))
         return users
 
     def _parse_trusted_networks(self) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:

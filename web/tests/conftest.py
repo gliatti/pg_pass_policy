@@ -69,17 +69,18 @@ def unit_client(unit_app):
     return TestClient(unit_app)
 
 
-CSRF_META = re.compile(r'<meta name="csrf-token" content="([^"]+)"')
+# the token is only in hx-headers on <body> (base.html), sent by htmx
+CSRF_HX_HEADERS = re.compile(r"""hx-headers='\{"X-CSRF-Token": "([^"]+)"\}'""")
 
 
 def csrf_token(client: TestClient, path: str = "/healthz") -> str:
     """Fetch a page to obtain the session cookie and read the CSRF token from it."""
     response = client.get(path)
     assert response.status_code == 200, response.text
-    match = CSRF_META.search(response.text)
+    match = CSRF_HX_HEADERS.search(response.text)
     if match:
         return match.group(1)
-    # a page without the meta (e.g. /healthz): read the token through the whoami probe
+    # a page without base.html (e.g. /healthz): read the token through the probe
     response = client.get("/_csrf")
     assert response.status_code == 200
     return response.json()["token"]

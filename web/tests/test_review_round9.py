@@ -32,8 +32,7 @@ def test_missing_schema_is_not_installed():
     found = db.extension_unavailable(psycopg.errors.InvalidSchemaName(MISSING_SCHEMA))
     assert found is not None and found.reason == "not_installed"
     assert found.message == MISSING_SCHEMA
-    other = psycopg.errors.InvalidSchemaName('schema "elsewhere" does not exist')
-    assert db.extension_unavailable(other) is None
+    # the SQLSTATE alone decides (see test_review_round10: translated messages)
     # a missing relation alone is not enough (get_conn() checks pg_extension)
     assert db.extension_unavailable(psycopg.errors.UndefinedTable(MISSING_VIEW)) is None
 
@@ -68,9 +67,8 @@ def test_missing_extension_error(installed):
 @pytest.mark.parametrize(
     "exc",
     [
-        psycopg.errors.UndefinedTable('relation "public.other" does not exist'),
-        psycopg.errors.UndefinedTable("relation x does not exist"),
         psycopg.errors.SyntaxError("pass_policy.v_role_status"),
+        psycopg.errors.UndefinedColumn('column "x" of relation "pass_policy.profile"'),
     ],
 )
 def test_missing_extension_error_ignores_other_errors(exc):

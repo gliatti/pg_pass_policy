@@ -92,6 +92,10 @@ def make_pool(settings: Settings) -> ConnectionPool:
         timeout=settings.pool_timeout,
         open=False,
         name="pgpp-web",
+        # a connection closed by the server (restart, idle timeout, network
+        # cut) is detected and replaced when it leaves the pool, instead of
+        # failing the request that gets it
+        check=ConnectionPool.check_connection,
         kwargs={"row_factory": dict_row, "application_name": settings.app_name},
         configure=_configure,
     )
@@ -177,9 +181,6 @@ class ExtensionUnavailable:
 
 
 NOT_INSTALLED_MESSAGE = "pg_pass_policy is not installed in this database"
-EXTENSION_SCHEMA = "pass_policy"
-_MISSING_SCHEMA_MESSAGE = f'schema "{EXTENSION_SCHEMA}" does not exist'
-_EXTENSION_RELATION = re.compile(rf'\brelation "{EXTENSION_SCHEMA}\.[^"]*" does not exist')
 
 
 def extension_unavailable(exc: BaseException) -> ExtensionUnavailable | None:
@@ -192,18 +193,20 @@ def extension_unavailable(exc: BaseException) -> ExtensionUnavailable | None:
       (InvalidSchemaName, 'schema "pass_policy" does not exist', the error
       of any pass_policy.* function call without the extension), or the
       55000 "pg_pass_policy is not installed in this database" (raised by
-      the server itself, and by get_conn() for a 42P01 on a pass_policy.*
-      relation once it has checked that the extension is absent, see
-      missing_extension_error()).
+      the server itself, and by get_conn() for a 42P01 once it has checked
+      that the extension is absent, see missing_extension_error()).
+
+    The 3F000 is recognised by its SQLSTATE alone, never by its text: the
+    server translates its messages (lc_messages), 'le schéma « pass_policy »
+    n'existe pas' in French.  Every query of the back-office names the
+    pass_policy schema or pg_catalog only, so a missing schema is the
+    extension's.
 
     None for anything else: another 55000 (PPP-004 "schema is not trusted"
-    included), a 42P01 on a pass_policy.* relation alone (the extension may
-    be installed and out of step with the back-office: get_conn() decides)."""
+    included), a 42P01 alone (the extension may be installed and out of
+    step with the back-office: get_conn() decides)."""
     if isinstance(exc, psycopg.errors.InvalidSchemaName):
-        message = error_message(exc)
-        if message.startswith(_MISSING_SCHEMA_MESSAGE):
-            return ExtensionUnavailable("not_installed", message, exc.diag.message_hint)
-        return None
+        return ExtensionUnavailable("not_installed", error_message(exc), exc.diag.message_hint)
     if not isinstance(exc, psycopg.errors.ObjectNotInPrerequisiteState):
         return None
     message = error_message(exc)
@@ -217,19 +220,19 @@ def extension_unavailable(exc: BaseException) -> ExtensionUnavailable | None:
 
 
 def missing_extension_error(conn: Connection, exc: BaseException) -> psycopg.Error | None:
-    """For an error that may come from a missing extension (42P01 on a
-    pass_policy.* relation), the 55000 "not installed in this database" to raise
-    instead when the extension is indeed absent from the database, None
-    otherwise (another error, the extension installed: a back-office out of
-    step with it, the generic 500 page; the check itself failing).
+    """For an error that may come from a missing extension (42P01), the
+    55000 "not installed in this database" to raise instead when the
+    extension is indeed absent from the database, None otherwise (another
+    error, the extension installed: a back-office out of step with it, the
+    generic 500 page; the check itself failing).
 
     The first query of most pages reads a view (pass_policy.v_role_status):
     without the extension it fails with 42P01, which a missing view of an
     installed extension would raise too, hence the check of pg_extension.
-    The failed transaction is rolled back first (the request is over)."""
+    The SQLSTATE alone selects the error, never its text (translated by the
+    server with lc_messages): the check of pg_extension decides.  The failed
+    transaction is rolled back first (the request is over)."""
     if not isinstance(exc, psycopg.errors.UndefinedTable):
-        return None
-    if not _EXTENSION_RELATION.search(error_message(exc)):
         return None
     try:
         conn.rollback()

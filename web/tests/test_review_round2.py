@@ -135,7 +135,7 @@ def test_anonymous_error_page_is_minimal(app, method, path, status):
     assert f"Error {status}" in response.text
     assert "<nav>" not in response.text and "Dashboard" not in response.text
     assert 'href="/roles"' not in response.text
-    assert 'name="csrf-token"' not in response.text
+    assert "X-CSRF-Token" not in response.text
     assert "set-cookie" not in response.headers
 
 
