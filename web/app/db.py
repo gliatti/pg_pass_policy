@@ -27,7 +27,16 @@ from app.logfilter import get_logger
 
 log = get_logger("db")
 
-STATUSES = ("ok", "warning", "grace", "expired", "locked", "never_expires", "unknown")
+STATUSES = (
+    "ok",
+    "warning",
+    "grace",
+    "expired",
+    "locked",
+    "exempt",
+    "never_expires",
+    "unknown",
+)
 EVENT_TYPES = (
     "password_changed",
     "password_rejected",

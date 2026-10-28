@@ -286,14 +286,17 @@ LANGUAGE plpgsql
 SET search_path = pg_catalog, pass_policy, pg_temp
 AS $$
 BEGIN
+    -- a NULL word (direct INSERT or COPY; load_dictionary() filters them)
+    -- is skipped like an empty one instead of aborting the whole statement
+    -- on the primary key's NOT NULL constraint
     NEW.word := lower(btrim(NEW.word));
-    IF NEW.word = '' OR EXISTS (SELECT FROM pass_policy.dictionary d WHERE d.word = NEW.word) THEN
+    IF NEW.word IS NULL OR NEW.word = '' OR EXISTS (SELECT FROM pass_policy.dictionary d WHERE d.word = NEW.word) THEN
         RETURN NULL;
     END IF;
     RETURN NEW;
 END
 $$;
-COMMENT ON FUNCTION _dictionary_trg() IS 'Internal: lower-cases dictionary words and skips duplicates';
+COMMENT ON FUNCTION _dictionary_trg() IS 'Internal: lower-cases dictionary words and skips NULL, empty and duplicate words';
 CREATE TRIGGER dictionary_normalize BEFORE INSERT ON dictionary
     FOR EACH ROW EXECUTE FUNCTION _dictionary_trg();
 
@@ -471,12 +474,21 @@ SELECT a.oid AS role_oid, a.rolname::text AS role_name, p.*
                        (SELECT d.profile_id FROM profile d WHERE d.name = 'default'));
 COMMENT ON VIEW _role_effective_profile IS 'Internal: effective profile of every role';
 
-CREATE FUNCTION _is_admin()
+CREATE FUNCTION _session_is_superuser()
 RETURNS bool
 LANGUAGE sql STABLE
 SET search_path = pg_catalog, pg_temp
 AS $$
     SELECT coalesce((SELECT r.rolsuper FROM pg_catalog.pg_roles r WHERE r.rolname = session_user), false)
+$$;
+COMMENT ON FUNCTION _session_is_superuser() IS 'Internal: true if session_user is a superuser (false for a missing role)';
+
+CREATE FUNCTION _is_admin()
+RETURNS bool
+LANGUAGE sql STABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+    SELECT pass_policy._session_is_superuser()
         -- pg_has_role() by name raises "role does not exist" once
         -- pass_policy_admin has been dropped: look the role up first and
         -- pass its OID (a superuser keeps access through rolsuper)
@@ -544,7 +556,7 @@ BEGIN
         RAISE EXCEPTION 'pg_pass_policy: role "%" does not exist', p_role
               USING ERRCODE = 'undefined_object';
     END IF;
-    IF coalesce((SELECT x.rolsuper FROM pg_catalog.pg_roles x WHERE x.rolname = session_user), false) THEN
+    IF pass_policy._session_is_superuser() THEN
         RETURN r.oid;
     END IF;
     -- The target and its ancestors only, walked up pg_auth_members: the
@@ -722,9 +734,12 @@ COMMENT ON FUNCTION _refresh_role_state(oid) IS 'Internal: recomputes expires_at
  *             never overrides a shorter value set manually ;
  *   'force'   rotation: always writes coalesce(desired, 'infinity') ;
  *   'unblock' manage_valid_until = off, or exempt role: writes only if the
- *             current VALID UNTIL is already in the past, and then
- *             'infinity' (bounded by a rotation pair only): the extension
- *             does not manage the expiry, it only lifts a block it caused.
+ *             current VALID UNTIL is already in the past and was written by
+ *             the extension (= valid_until_synced: expire_password(), pair
+ *             bound, former sync), and then 'infinity' (bounded by a
+ *             rotation pair only): the extension does not manage the
+ *             expiry, it only lifts a block it caused; a past VALID UNTIL
+ *             set by hand (to disable the account) is left alone.
  * Returns a jsonb description of the change, or NULL if nothing was done.
  * Step d of run_maintenance() computes the same target value for all roles
  * at once, to call this function only for those whose VALID UNTIL differs
@@ -756,7 +771,10 @@ BEGIN
     IF p_mode = 'force' THEN
         v_new := coalesce(v_desired, 'infinity');
     ELSIF p_mode = 'unblock' THEN
-        IF r.rolvaliduntil IS NULL OR r.rolvaliduntil > now() THEN
+        IF r.rolvaliduntil IS NULL OR r.rolvaliduntil > now()
+           -- not written by us: a manual VALID UNTIL (account disabled by
+           -- hand) is respected, as in step d of run_maintenance()
+           OR r.rolvaliduntil IS DISTINCT FROM r.valid_until_synced THEN
             RETURN NULL;
         END IF;
         -- not grace_until: with manage_valid_until = off nothing would ever
@@ -847,15 +865,13 @@ BEGIN
     EXCEPTION WHEN OTHERS THEN
         GET STACKED DIAGNOSTICS v_state = RETURNED_SQLSTATE, v_msg = MESSAGE_TEXT,
                                 v_detail = PG_EXCEPTION_DETAIL, v_hint = PG_EXCEPTION_HINT;
-        IF v_pgss IS NOT NULL THEN
-            PERFORM set_config('pg_stat_statements.track_utility', v_pgss, true);
-        END IF;
         RAISE EXCEPTION USING ERRCODE = v_state, MESSAGE = v_msg,
               DETAIL = coalesce(v_detail, ''), HINT = coalesce(v_hint, '');
     END;
-    IF v_pgss IS NOT NULL THEN
-        PERFORM set_config('pg_stat_statements.track_utility', v_pgss, true);
-    END IF;
+    -- No explicit restoration of pg_stat_statements.track_utility (nor of
+    -- the other parameters): the SET clause of the function restores the
+    -- caller's values at exit, normal or by error (the set_config(..., true)
+    -- calls are local to the function's GUC nesting level).
 END
 $$;
 COMMENT ON FUNCTION _set_password(name, text) IS 'Internal: ALTER ROLE PASSWORD without leaking the password in logs or error context';
@@ -1284,9 +1300,10 @@ BEGIN
     PERFORM pass_policy._refresh_role_state(p_oid);
     -- run_maintenance() step d never synchronises an exempt role (it only
     -- lifts a past VALID UNTIL, 'unblock'): a VALID UNTIL written here would
-    -- never be updated again, so only a past one is lifted, as with
-    -- manage_valid_until = off (this also lifts the bound left by a
-    -- previous switch_rotation_pair())
+    -- never be updated again, so only a past one written by the extension
+    -- (valid_until_synced) is lifted, as with manage_valid_until = off (this
+    -- also lifts the bound left by a previous switch_rotation_pair()); a
+    -- past VALID UNTIL set by hand is kept
     PERFORM pass_policy._apply_valid_until(p_oid,
               CASE WHEN pass_policy._guc_on('pg_pass_policy.manage_valid_until', true)
                         AND NOT pass_policy._is_exempt(p_role)
@@ -1390,8 +1407,9 @@ LANGUAGE plpgsql SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
-    v_role name := $1;
-    v_oid  oid;
+    v_role   name := $1;
+    v_oid    oid;
+    v_locked bool;
 BEGIN
     PERFORM pass_policy._require_admin();
     v_oid := pass_policy._require_target_allowed(v_role);
@@ -1405,15 +1423,31 @@ BEGIN
     -- stamps lock_seq before the row lock is released: the worker sees the
     -- stamp and gives up its copy (see SPEC 6.3).
     PERFORM pass_policy._ensure_state(v_oid);
+    -- Was the role locked?  In role_state (row locked by _ensure_state()),
+    -- even with an expired lock not yet cleaned by run_maintenance(), or in
+    -- shared memory only (automatic lock still waiting for the worker).
+    -- shmem_unlock_role() without expired_only always queues the unlock and
+    -- returns true: failed_attempts() is read instead.
+    v_locked := (SELECT s.locked_until IS NOT NULL FROM pass_policy.role_state s
+                  WHERE s.role_oid = v_oid)
+                OR EXISTS (SELECT FROM pass_policy.failed_attempts() f
+                            WHERE f.role_name = v_role::text AND f.locked_until IS NOT NULL);
     UPDATE pass_policy.role_state s
        SET locked_until = NULL, locked_by = NULL, lock_reason = NULL
      WHERE s.role_oid = v_oid;
+    -- queued in any case (harmless without a lock); the failure counter is
+    -- reset even if the role was not locked
     PERFORM pass_policy._shmem('unlock', v_role::text);
     PERFORM pass_policy._shmem('reset', v_role::text);
+    -- no audit row nor NOTIFY when there was nothing to unlock
+    IF NOT coalesce(v_locked, false) THEN
+        RAISE NOTICE 'pg_pass_policy: role "%" is not locked', v_role;
+        RETURN;
+    END IF;
     PERFORM pass_policy._audit('role_unlocked', v_role, jsonb_build_object('unlocked_by', 'manual'));
 END
 $$;
-COMMENT ON FUNCTION unlock_role(name) IS 'Unlocks a role and resets its failure counter';
+COMMENT ON FUNCTION unlock_role(name) IS 'Unlocks a role and resets its failure counter (audited only if the role was locked)';
 
 CREATE FUNCTION purge_audit(older_than interval DEFAULT '365 days')
 RETURNS bigint
@@ -1970,7 +2004,7 @@ DECLARE
     v_purged  int := 0;
 BEGIN
     PERFORM pass_policy._require_admin();
-    IF NOT coalesce((SELECT x.rolsuper FROM pg_catalog.pg_roles x WHERE x.rolname = session_user), false) THEN
+    IF NOT pass_policy._session_is_superuser() THEN
         RAISE EXCEPTION 'pg_pass_policy: permission denied'
               USING ERRCODE = 'insufficient_privilege',
                     HINT = 'rebind_restored_roles() requires a superuser.';
@@ -2077,6 +2111,9 @@ SELECT q.role_name, q.profile, q.password_changed_at, q.expires_at, q.grace_unti
        q.locked_until, q.failed_count,
        CASE
            WHEN q.locked_until > now()                         THEN 'locked'
+           -- exempt_roles: no expiry is enforced (a lock, which applies again as
+           -- soon as the role leaves the list, is still shown as such)
+           WHEN q.exempt                                       THEN 'exempt'
            WHEN q.must_change AND now() < q.grace_until        THEN 'grace'   -- previous role of a pair, still usable until its bound
            WHEN q.must_change                                  THEN 'expired'
            WHEN q.max_age IS NULL                              THEN 'never_expires'
@@ -2088,6 +2125,7 @@ SELECT q.role_name, q.profile, q.password_changed_at, q.expires_at, q.grace_unti
        END AS status,
        q.role_oid
   FROM (SELECT r.oid AS role_oid, r.rolname::text AS role_name, e.name AS profile, e.max_age, e.warn_before,
+               pass_policy._is_exempt(r.rolname) AS exempt,
                s.password_changed_at, coalesce(s.must_change, false) AS must_change,
                CASE WHEN s.must_change THEN s.expires_at
                     ELSE s.password_changed_at + e.max_age END AS expires_at,
@@ -2100,11 +2138,12 @@ SELECT q.role_name, q.profile, q.password_changed_at, q.expires_at, q.grace_unti
           LEFT JOIN role_state s ON s.role_oid = r.oid
           LEFT JOIN failed_attempts() f ON f.role_name = r.rolname
          WHERE r.rolcanlogin) q;
-COMMENT ON VIEW v_role_status IS 'Password and lock status of every login role (role_oid: join key for role_state)';
+COMMENT ON VIEW v_role_status IS 'Password and lock status of every login role (status exempt: listed in exempt_roles; role_oid: join key for role_state)';
 
+-- exempt roles (status 'exempt') are left out: their expiry is not enforced
 CREATE VIEW v_expiring AS
 SELECT * FROM v_role_status WHERE status IN ('warning', 'grace', 'expired');
-COMMENT ON VIEW v_expiring IS 'Login roles whose password is about to expire, in grace period or expired';
+COMMENT ON VIEW v_expiring IS 'Login roles whose password is about to expire, in grace period or expired (exempt roles excluded)';
 
 -- Joined by OID: role_state.role_name may still hold the former name after
 -- ALTER ROLE ... RENAME (until run_maintenance() or the next lock_role()).
@@ -2138,7 +2177,8 @@ COMMENT ON VIEW v_recent_audit IS 'Last 1000 audit events';
  * - admin: member of viewer + EXECUTE on the administration API ;
  * - shmem_* and internal _* functions: no grant (called by SECURITY DEFINER
  *   code only), except the three pure generator bounds used by the CHECK
- *   constraints of profile (granted to PUBLIC below).
+ *   constraints of profile (granted to PUBLIC below), and _is_privileged()
+ *   and _is_exempt() (viewer and admin: clients, v_role_status).
  */
 REVOKE ALL ON SCHEMA pass_policy FROM PUBLIC;
 GRANT USAGE ON SCHEMA pass_policy TO pass_policy_viewer, pass_policy_admin;
@@ -2165,6 +2205,9 @@ GRANT EXECUTE ON FUNCTION effective_profile(name), failed_attempts(), worker_sta
 -- _is_privileged(): exposed so that clients (web, CLI) can filter their role
 -- lists with the very predicate _require_target_allowed() enforces
 GRANT EXECUTE ON FUNCTION _is_privileged(oid) TO pass_policy_viewer, pass_policy_admin;
+-- _is_exempt(): called by v_role_status (functions of a view run with the
+-- privileges of its user); pg_pass_policy.exempt_roles is readable by all
+GRANT EXECUTE ON FUNCTION _is_exempt(text) TO pass_policy_viewer, pass_policy_admin;
 -- record_password_change(): no grant (called by the C hook as superuser only)
 
 GRANT EXECUTE ON FUNCTION

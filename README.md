@@ -153,7 +153,7 @@ SELECT pass_policy.expire_password('app_user');
 
 ```sql
 SELECT * FROM pass_policy.v_role_status;   -- un rôle LOGIN par ligne
-SELECT * FROM pass_policy.v_expiring;      -- status IN (warning, grace, expired)
+SELECT * FROM pass_policy.v_expiring;      -- status IN (warning, grace, expired), sans les rôles exemptés
 SELECT * FROM pass_policy.v_locked;
 SELECT * FROM pass_policy.v_recent_audit;  -- 1000 derniers événements
 SELECT * FROM pass_policy.failed_attempts();  -- compteurs d'échecs en mémoire partagée
@@ -162,10 +162,13 @@ SELECT * FROM pass_policy.worker_status();    -- pid, last_run, last_reload, tra
 
 `v_role_status.status` vaut `ok`, `warning` (expiration dans moins de
 `warn_before`), `grace` (expiré, période de grâce en cours), `expired`,
-`locked`, `never_expires` (`max_age` NULL) ou `unknown` (aucune date de
-changement connue : rôle antérieur à l'extension, ou créé par `CREATE ROLE …
-PASSWORD`, tant que `run_maintenance()` n'a pas créé son état ; la
-réconciliation prend alors la date du jour comme date de changement).
+`locked`, `exempt` (rôle de `pg_pass_policy.exempt_roles` : aucune expiration
+ne lui est appliquée ; ce statut passe avant tous les autres sauf `locked`, et
+ces rôles n'apparaissent pas dans `v_expiring`), `never_expires` (`max_age`
+NULL) ou `unknown` (aucune date de changement connue : rôle antérieur à
+l'extension, ou créé par `CREATE ROLE … PASSWORD`, tant que
+`run_maintenance()` n'a pas créé son état ; la réconciliation prend alors la
+date du jour comme date de changement).
 La dernière colonne, `role_oid`, sert à joindre `pass_policy.role_state` :
 après `ALTER ROLE … RENAME`, `role_state.role_name` garde l'ancien nom
 jusqu'au passage suivant de la maintenance ou au prochain `lock_role()`,
@@ -248,6 +251,9 @@ expiré avant le passage du worker est journalisé normalement (sans
 `lifted_before_audit`), même si un `run_maintenance()` passe entre-temps.
 Quand `run_maintenance()` trouve ainsi un verrou plus récent en mémoire
 partagée, il n'écrit pas de ligne `role_unlocked` (le rôle reste verrouillé).
+`unlock_role()` sur un rôle qui n'était pas verrouillé (ni dans `role_state`, ni
+en mémoire partagée) remet le compteur d'échecs à zéro sans écrire de ligne
+`role_unlocked` ni envoyer de NOTIFY (simple NOTICE).
 Clés de `details` : `role_locked` porte `locked_by` (`auto` / `manual`),
 `locked_until` et `reason` ; `role_unlocked` porte `unlocked_by` (`auto` pour
 l'expiration levée par `run_maintenance()`, `manual` pour `unlock_role()`). Les échecs sur des noms de
@@ -311,7 +317,7 @@ Tous préfixés `pg_pass_policy.`. Contexte `postmaster` = redémarrage ;
 | `manage_valid_until` | bool | `on` | SIGHUP | le worker écrit `pg_authid.rolvaliduntil` |
 | `log_events` | bool | `on` | SIGHUP | une ligne `LOG: pg_pass_policy: …` par événement |
 | `notify_channel` | string | `pg_pass_policy` | SIGHUP | canal `NOTIFY` (charge utile JSON `event`/`role`/`at`/`details`) |
-| `exempt_roles` | liste | `''` | SIGHUP | rôles exemptés de la politique **et** du verrouillage, séparés par des virgules, règles des identifiants SQL : noms non cités mis en minuscules, noms entre guillemets conservés tels quels (`'postgres, "App User"'`). `rotate_password()`, `switch_rotation_pair()` et `run_maintenance()` ne posent pas de `VALID UNTIL` sur un rôle exempté : ils relèvent seulement une borne déjà passée (pour `run_maintenance()` : une borne posée par l'extension, `expire_password()` par exemple, une fois le mot de passe changé) |
+| `exempt_roles` | liste | `''` | SIGHUP | rôles exemptés de la politique **et** du verrouillage, séparés par des virgules, règles des identifiants SQL : noms non cités mis en minuscules, noms entre guillemets conservés tels quels (`'postgres, "App User"'`). `rotate_password()`, `switch_rotation_pair()` et `run_maintenance()` ne posent pas de `VALID UNTIL` sur un rôle exempté : ils relèvent seulement une borne déjà passée posée par l'extension (`expire_password()`, borne de paire ; pour `run_maintenance()`, une fois le mot de passe changé), jamais un `VALID UNTIL` posé à la main pour désactiver le compte |
 | `superuser_bypass` | bool | `off` | SIGHUP | `on` : les superutilisateurs échappent à la complexité (pas à l'historique) |
 | `require_scram` | bool | `on` | SIGHUP | refuse les mots de passe MD5 (`PPP-002`) |
 | `enforce_database` | bool | `on` | SIGHUP | hors de `database`, `ALTER ROLE … PASSWORD` est refusé (`PPP-003`), même si l'extension est installée dans la base courante ; `off` : accepté sans contrôle avec un `WARNING` |
@@ -449,7 +455,8 @@ compte comme « spécial ».
   changé ; sans cela le rôle resterait bloqué indéfiniment après un
   `ALTER ROLE … PASSWORD` classique. `rotate_password()` et
   `switch_rotation_pair()` ne posent alors pas non plus de `VALID UNTIL` sur
-  le rôle dont le mot de passe change.
+  le rôle dont le mot de passe change : ils relèvent seulement une borne
+  passée posée par l'extension, jamais un `VALID UNTIL` posé à la main.
 - **Propriétaire du schéma** : le schéma `pass_policy` doit appartenir à un
   superutilisateur (celui qui a fait `CREATE EXTENSION`). S'il est cédé à un
   autre rôle (`ALTER SCHEMA … OWNER TO`) ou si son propriétaire perd l'attribut

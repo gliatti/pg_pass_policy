@@ -21,6 +21,12 @@ SELECT pass_policy.load_dictionary(ARRAY['Back\Slash-Word9']) AS loaded_backslas
 SELECT bool_and(word_sha256 = sha256(convert_to(word, current_setting('server_encoding')))) AS digests_ok,
        count(DISTINCT word_sha256) = count(*) AS digests_unique
   FROM pass_policy.dictionary;
+-- (vérification 5) INSERT direct : le trigger ignore un mot NULL (comme un
+-- mot vide) au lieu de faire échouer toute l'instruction
+WITH ins AS (INSERT INTO pass_policy.dictionary (word)
+             VALUES (NULL), ('  '), ('Null-Word-Test9') RETURNING word)
+SELECT array_agg(word) AS inserted FROM ins;
+DELETE FROM pass_policy.dictionary WHERE word = 'null-word-test9';
 
 -- Audit avant les appels à check_password() (doit rester inchangé)
 CREATE TEMP TABLE audit_before AS

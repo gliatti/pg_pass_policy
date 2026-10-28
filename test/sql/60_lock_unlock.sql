@@ -38,8 +38,23 @@ SELECT coalesce(max(failed_count), 0) AS shmem_failures FROM pass_policy.failed_
  WHERE role_name = 'regress_lock';
 SELECT count(*) > 0 AS unlock_audited FROM pass_policy.audit_log
  WHERE event_type = 'role_unlocked' AND role_name = 'regress_lock';
--- Déverrouiller un rôle non verrouillé : pas d'erreur
+-- Déverrouiller un rôle non verrouillé : pas d'erreur, ni audit ni NOTIFY
+-- (vérification 5)
+SELECT count(*) AS unlock_rows FROM pass_policy.audit_log
+ WHERE event_type = 'role_unlocked' AND role_name = 'regress_lock' \gset
 SELECT ppp_test.try($$SELECT pass_policy.unlock_role('regress_lock')$$) AS unlock_again;
+SELECT count(*) = :unlock_rows AS unlock_again_not_audited FROM pass_policy.audit_log
+ WHERE event_type = 'role_unlocked' AND role_name = 'regress_lock';
+-- Verrou présent en shmem seulement (verrou automatique que le worker n'a
+-- pas encore recopié dans role_state) : déverrouillé et audité
+SELECT pass_policy.shmem_lock_role('regress_lock', NULL);
+SELECT locked_until IS NULL AS state_not_locked
+  FROM pass_policy.role_state WHERE role_name = 'regress_lock';
+SELECT pass_policy.unlock_role('regress_lock');
+SELECT count(*) = :unlock_rows + 1 AS shmem_only_unlock_audited FROM pass_policy.audit_log
+ WHERE event_type = 'role_unlocked' AND role_name = 'regress_lock';
+SELECT count(*) AS shmem_locked FROM pass_policy.failed_attempts()
+ WHERE role_name = 'regress_lock' AND locked_until IS NOT NULL;
 
 -- Verrou temporaire (1 seconde), levé par run_maintenance après expiration
 SELECT pass_policy.lock_role('regress_lock', interval '1 second', 'short lock')

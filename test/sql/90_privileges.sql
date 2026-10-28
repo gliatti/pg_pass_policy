@@ -328,6 +328,27 @@ ALTER ROLE regress_exempt_u PASSWORD 'exempt-direct-change';
 SELECT action, details->>'reason' AS reason, details->>'mode' AS mode
   FROM pass_policy.run_maintenance() WHERE role_name = 'regress_exempt_u' ORDER BY action;
 SELECT rolvaliduntil = 'infinity' AS exempt_direct_unblocked FROM pg_roles WHERE rolname = 'regress_exempt_u';
+-- (vérification 5) Statut 'exempt' : prioritaire sur warning / grace /
+-- expired (expire_password() donnerait sinon 'expired'), rôle absent de
+-- v_expiring ; lisible par pass_policy_viewer (EXECUTE sur _is_exempt())
+SELECT pass_policy.expire_password('regress_exempt_u');
+SELECT status FROM pass_policy.v_role_status WHERE role_name = 'regress_exempt_u';
+SELECT count(*) AS exempt_in_v_expiring FROM pass_policy.v_expiring WHERE role_name = 'regress_exempt_u';
+SET SESSION AUTHORIZATION regress_viewer;
+SELECT status AS viewer_status FROM pass_policy.v_role_status WHERE role_name = 'regress_exempt_u';
+RESET SESSION AUTHORIZATION;
+-- (vérification 5) VALID UNTIL passé posé à la main (compte désactivé) :
+-- rotate_password() d'un rôle exempté (mode unblock) ne le lève pas, ni
+-- run_maintenance() ; seule une borne posée par l'extension est relevée
+ALTER ROLE regress_exempt_u VALID UNTIL '2020-01-01 00:00:00+00';
+INSERT INTO ppp_test.secrets SELECT 'exempt_rot3', pass_policy.rotate_password('regress_exempt_u');
+SELECT rolvaliduntil = '2020-01-01 00:00:00+00' AS exempt_manual_valid_until_kept
+  FROM pg_roles WHERE rolname = 'regress_exempt_u';
+SELECT count(*) AS exempt_manual_actions
+  FROM pass_policy.run_maintenance() WHERE role_name = 'regress_exempt_u';
+SELECT rolvaliduntil = '2020-01-01 00:00:00+00' AS exempt_manual_valid_until_kept_maint
+  FROM pg_roles WHERE rolname = 'regress_exempt_u';
+ALTER ROLE regress_exempt_u VALID UNTIL 'infinity';
 ALTER SYSTEM RESET pg_pass_policy.exempt_roles;
 SELECT pg_reload_conf();
 \set ECHO none

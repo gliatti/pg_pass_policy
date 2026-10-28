@@ -881,6 +881,62 @@ SELECT rolvaliduntil = 'infinity' AS exempt_direct_unblocked FROM pg_roles WHERE
  t
 (1 row)
 
+-- (vérification 5) Statut 'exempt' : prioritaire sur warning / grace /
+-- expired (expire_password() donnerait sinon 'expired'), rôle absent de
+-- v_expiring ; lisible par pass_policy_viewer (EXECUTE sur _is_exempt())
+SELECT pass_policy.expire_password('regress_exempt_u');
+ expire_password 
+-----------------
+ 
+(1 row)
+
+SELECT status FROM pass_policy.v_role_status WHERE role_name = 'regress_exempt_u';
+ status 
+--------
+ exempt
+(1 row)
+
+SELECT count(*) AS exempt_in_v_expiring FROM pass_policy.v_expiring WHERE role_name = 'regress_exempt_u';
+ exempt_in_v_expiring 
+----------------------
+                    0
+(1 row)
+
+SET SESSION AUTHORIZATION regress_viewer;
+SELECT status AS viewer_status FROM pass_policy.v_role_status WHERE role_name = 'regress_exempt_u';
+ viewer_status 
+---------------
+ exempt
+(1 row)
+
+RESET SESSION AUTHORIZATION;
+-- (vérification 5) VALID UNTIL passé posé à la main (compte désactivé) :
+-- rotate_password() d'un rôle exempté (mode unblock) ne le lève pas, ni
+-- run_maintenance() ; seule une borne posée par l'extension est relevée
+ALTER ROLE regress_exempt_u VALID UNTIL '2020-01-01 00:00:00+00';
+INSERT INTO ppp_test.secrets SELECT 'exempt_rot3', pass_policy.rotate_password('regress_exempt_u');
+SELECT rolvaliduntil = '2020-01-01 00:00:00+00' AS exempt_manual_valid_until_kept
+  FROM pg_roles WHERE rolname = 'regress_exempt_u';
+ exempt_manual_valid_until_kept 
+--------------------------------
+ t
+(1 row)
+
+SELECT count(*) AS exempt_manual_actions
+  FROM pass_policy.run_maintenance() WHERE role_name = 'regress_exempt_u';
+ exempt_manual_actions 
+-----------------------
+                     0
+(1 row)
+
+SELECT rolvaliduntil = '2020-01-01 00:00:00+00' AS exempt_manual_valid_until_kept_maint
+  FROM pg_roles WHERE rolname = 'regress_exempt_u';
+ exempt_manual_valid_until_kept_maint 
+--------------------------------------
+ t
+(1 row)
+
+ALTER ROLE regress_exempt_u VALID UNTIL 'infinity';
 ALTER SYSTEM RESET pg_pass_policy.exempt_roles;
 SELECT pg_reload_conf();
  pg_reload_conf 
