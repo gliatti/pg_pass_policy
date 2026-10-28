@@ -246,19 +246,18 @@ for i in $(seq 1 "$MAX"); do psql_admin "DROP ROLE regress_pk$i"; done
 psql_admin "SELECT pass_policy.drop_profile('p_perm')" >/dev/null
 kick || fail "pas de tour du worker après la suppression des rôles regress_pk*"
 
-# --- pseudo-verrou d'un nom inventé, rôle créé ensuite sous ce nom (vérification 12)
-# Cinq échecs (profil default) sur un nom inexistant : pseudo-verrou. Le rôle
-# est créé sous ce nom ; sa connexion avec le bon mot de passe est refusée
-# (le pseudo-verrou tient), mais l'entrée reste un fantôme (role_missing) :
-# des noms inventés l'évincent. Avant correction, ce succès refusé remettait
-# role_missing à faux : verrou d'un vrai rôle sans OID, jamais libéré.
+# --- pseudo-verrou d'un nom inventé, rôle créé ensuite sous ce nom (vérification 13)
+# Cinq échecs (profil default) sur un nom inexistant : pseudo-verrou, sans
+# OID. Le rôle est créé sous ce nom : le hook n'applique un verrou sans OID
+# qu'à un nom qui n'a toujours pas de rôle, la connexion réussit. Avant
+# correction, elle était refusée, et ce refus pouvait remettre role_missing
+# à faux : verrou d'un vrai rôle sans OID, jamais libéré.
 for i in 1 2 3 4 5; do psql_as regress_inv "$BAD" >/dev/null || true; done
-psql_admin "CREATE ROLE regress_inv LOGIN PASSWORD '$GOOD'"
 out=$(psql_as regress_inv "$GOOD") || true
-check_contains "nom inventé pseudo-verrouillé puis créé : connexion refusée" "is locked by pg_pass_policy" "$out"
-flood ghost11 24
+check_contains "nom inventé : pseudo-verrouillé après 5 échecs" "is locked by pg_pass_policy" "$out"
+psql_admin "CREATE ROLE regress_inv LOGIN PASSWORD '$GOOD'"
 out=$(psql_as regress_inv "$GOOD" "SELECT current_user") || true
-check_eq "pseudo-verrou resté fantôme : évincé par des noms inventés, aucun verrou hérité" "regress_inv" "$out"
+check_eq "nom inventé pseudo-verrouillé puis créé : connexion réussie" "regress_inv" "$out"
 psql_admin "DROP ROLE regress_inv"
 
 # --- toutes les entrées sont des verrous de vrais rôles : ERROR 53400 -------
@@ -436,21 +435,28 @@ fi
 out=$(psql_as regress_h3 "$GOOD" "SELECT current_user") || true
 check_eq "constat 2 : fenêtre fermée, connexion acceptée" "regress_h3" "$out"
 
-# --- rechargement seul, sans maintenance préalable (vérification 12) ---------
+# --- rechargement seul, sans maintenance préalable (vérifications 12 et 13) ---
 # worker_interval = 0 : le worker ne fait que synchroniser la mémoire partagée
-# (aucun run_maintenance(), donc ni remappage ni purge de role_state). Deux
+# (aucun run_maintenance(), donc ni remappage ni purge de role_state). Trois
 # lignes verrouillées écrites à la main : l'une d'un OID et d'un nom
 # inexistants (orphelin réel : ignorée, la fenêtre se ferme), l'autre d'un
-# OID périmé portant le nom d'un rôle existant (restauration avant
-# remappage) : réinjectée par le nom, sous l'OID du rôle trouvé. Renommé, ce
-# rôle est reconnu par cet OID : le verrou suit le renommage (LOG) au lieu
-# d'être libéré comme celui d'un rôle supprimé. Le rechargement du même tour
-# le lève ensuite : la ligne role_state porte toujours l'OID périmé et
-# l'ancien nom, qu'aucun rôle ne porte plus (même limite que l'étape a0).
+# OID périmé portant le nom d'un rôle existant sans ligne propre
+# (restauration avant remappage) : réinjectée par le nom, sous l'OID du rôle
+# trouvé ; la dernière d'un OID périmé portant le nom d'un rôle qui a sa
+# propre ligne, non verrouillée : ignorée (la ligne réelle l'emporte). Renommé,
+# le rôle trouvé par le nom est reconnu par cet OID : son entrée est retirée
+# (LOG) et le rechargement du même tour ne réinjecte rien, la ligne
+# role_state portant toujours l'OID périmé et l'ancien nom, qu'aucun rôle ne
+# porte plus (même limite que l'étape a0).
 psql_admin "CREATE ROLE regress_rest LOGIN PASSWORD '$GOOD'"
+psql_admin "CREATE ROLE regress_rest3 LOGIN PASSWORD '$GOOD'"
 psql_admin "INSERT INTO pass_policy.role_state (role_oid, role_name, locked_until, locked_by)
             VALUES (4000000001, 'regress_orphan_x', 'infinity', 'manual'),
-                   (4000000002, 'regress_rest', 'infinity', 'manual')"
+                   (4000000002, 'regress_rest', 'infinity', 'manual'),
+                   (4000000003, 'regress_rest3', 'infinity', 'manual')"
+psql_admin "INSERT INTO pass_policy.role_state (role_oid, role_name)
+            SELECT oid, rolname FROM pg_roles WHERE rolname = 'regress_rest3'
+            ON CONFLICT (role_oid) DO UPDATE SET locked_until = NULL"
 psql_admin "ALTER SYSTEM SET pg_pass_policy.worker_interval = 0" >/dev/null
 "$PPP_BINDIR/pg_ctl" -D "$PPP_TMP/data" -l "$PPP_TMP/server.log" -o "-p $PPP_PORT" -w -t 60 restart >/dev/null
 if wait_for 30 "SELECT locks_loaded FROM pass_policy.worker_status()"; then
@@ -464,12 +470,16 @@ check_eq "rechargement seul : role_state non remappé (aucune maintenance)" "400
 	"$(psql_admin "SELECT role_oid FROM pass_policy.role_state WHERE role_name = 'regress_rest'")"
 out=$(psql_as regress_rest "$GOOD") || true
 check_contains "OID périmé, nom existant : verrou réinjecté par le nom" "is locked by pg_pass_policy" "$out"
-followed='lock of role "regress_rest" follows its rename to "regress_rest2"'
+out=$(psql_as regress_rest3 "$GOOD" "SELECT current_user") || true
+check_eq "OID périmé, nom d'un rôle qui a sa ligne : pas de repli par le nom" "regress_rest3" "$out"
+renamed='lock of role "regress_rest" renamed to "regress_rest2": reloaded from role_state'
 psql_admin "ALTER ROLE regress_rest RENAME TO regress_rest2" 2>/dev/null
 kick || fail "pas de tour du worker après le renommage de regress_rest"
-check_eq "rôle renommé : LOG « follows its rename » (OID du rôle trouvé)" "1" "$(n_log "$followed")"
+check_eq "rôle renommé : LOG « renamed to » (OID du rôle trouvé)" "1" "$(n_log "$renamed")"
 check_eq "rôle renommé : plus d'entrée sous l'ancien nom" "0" \
 	"$(psql_admin "SELECT count(*) FROM pass_policy.failed_attempts() WHERE role_name = 'regress_rest'")"
+out=$(psql_as regress_rest2 "$GOOD" "SELECT current_user") || true
+check_eq "rôle renommé : ligne périmée sous l'ancien nom, rien à réinjecter (limite a0)" "regress_rest2" "$out"
 
 check_eq "aucun échec de cycle du worker dans le log" "0" "$(n_log 'pg_pass_policy: worker .* failed')"
 

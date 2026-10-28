@@ -247,26 +247,31 @@ est verrouillé pour `lock_duration` (NULL = jusqu'à déverrouillage manuel). U
 rôle verrouillé est refusé **même avec le bon mot de passe** : le client reçoit
 `FATAL: role "x" is locked by pg_pass_policy`.
 
-Le compteur et le verrou automatique sont tenus par **nom** de rôle. Après
-`ALTER ROLE … RENAME`, le nouveau nom repart de zéro : un verrou automatique
-déjà recopié dans `role_state` (indexée par OID) suit le rôle au rechargement
-suivant, mais un verrou que le worker n'a pas encore écrit reste attaché à
-l'ancien nom ; il est audité (`role_locked`, `details.role_missing`, et
-`role_renamed` / `renamed_to` quand le nouveau nom est connu) sans être
-recopié dans `role_state`, puis suit le rôle sous son nouveau nom en mémoire
-partagée seulement (perdu au redémarrage). Pour garder un compte bloqué pendant un renommage, utiliser
-`lock_role()`. Un autre rôle créé ensuite sous l'ancien nom (`DROP ROLE` puis
-`CREATE ROLE`) ne reçoit pas ce verrou dans `role_state` : le hook mémorise
-l'OID du rôle verrouillé (audit `role_recreated`). Une fois le verrou
-audité, le tour suivant du worker retire de la mémoire partagée le verrou
-d'un rôle supprimé (LOG « lock of dropped role "…" released ») et déplace
-sous le nouveau nom celui d'un rôle renommé (LOG « lock of role "…" follows
-its rename to "…" ») : le rôle renommé reste verrouillé, un rôle recréé
-sous l'ancien nom part d'une entrée propre. Exception : un
-`DROP ROLE` suivi d'un `CREATE ROLE` du même nom avant le passage de
-`run_maintenance()`, que celle-ci prend pour une restauration (lignes de
-`role_state` rattachées au nouvel OID par le nom) : le nouveau rôle hérite
-alors d'un verrou déjà persisté.
+Le compteur et le verrou automatique sont tenus par **nom** de rôle, et
+chaque verrou retient l'OID du rôle verrouillé : il ne s'applique qu'à ce
+rôle, jamais à un autre rôle qui porte le nom depuis (le pseudo-verrou d'un
+nom inexistant ne s'applique pas non plus au rôle créé ensuite sous ce nom).
+Après `ALTER ROLE … RENAME`, le nouveau nom repart de zéro : un verrou
+déjà recopié dans `role_state` (indexée par OID : `lock_role()`, ou verrou
+automatique déjà audité) suit le rôle, réinjecté sous le nouveau nom au
+tour suivant du worker (LOG « lock of role "…" renamed to "…": reloaded
+from role_state »). Un verrou que `role_state` n'a pas ne suit pas le rôle :
+verrou automatique que le worker n'a pas encore écrit (audité sous l'ancien
+nom, `role_locked`, `details.role_missing`, et `role_renamed` /
+`renamed_to` quand le nouveau nom est connu, sans être recopié), ou verrou
+local d'un standby (`shmem_lock_role()`). Pour garder un compte bloqué
+pendant un renommage, utiliser `lock_role()`. Un autre rôle créé ensuite
+sous l'ancien nom (`DROP ROLE` puis `CREATE ROLE`) se connecte, avant comme
+après le tour du worker (audit `role_recreated`) ; une fois le verrou
+audité, le worker retire de la mémoire partagée le verrou d'un rôle
+supprimé (LOG « lock of dropped role "…" released ») ou renommé. Tant que
+l'audit de l'ancien rôle est en attente, les échecs du nouveau ne sont pas
+comptés. Exception : un `DROP ROLE` suivi d'un `CREATE ROLE` du même nom
+avant le passage de `run_maintenance()`, indiscernable d'une restauration :
+la maintenance (étape a0) comme le rechargement (repli par nom, pour un
+rôle qui n'a pas de ligne `role_state` à son propre OID) rattachent alors
+au nouvel OID, par le nom, les lignes de `role_state` de l'ancien, et le
+nouveau rôle hérite d'un verrou déjà persisté.
 
 Seuls les échecs des méthodes où le client présente un mot de passe ou un
 secret sont comptés : `password`, `md5`, `scram-sha-256`, `ldap`, `pam`,

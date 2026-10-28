@@ -627,7 +627,8 @@ check_eq "rôle supprimé : plus aucune entrée profil pour lui après rechargem
 # sur demande), le rôle n'a plus de ligne pg_roles sous l'ancien nom : l'audit
 # role_locked est écrit sous l'ancien nom avec role_missing / role_renamed /
 # renamed_to, une seule fois ; le verrou n'est pas recopié dans role_state,
-# mais il suit ensuite le rôle sous son nouveau nom en mémoire partagée.
+# et il ne suit pas le rôle sous son nouveau nom (vérification 13 : seul un
+# verrou persisté dans role_state le suit).
 psql_admin "CREATE ROLE regress_ren LOGIN PASSWORD '$GOOD'" >/dev/null
 # profil assigné : la ligne role_profile garde l'ancien nom, ce qui permet au
 # worker de nommer le nouveau (renamed_to) ; sans elle ni ligne role_state,
@@ -650,20 +651,66 @@ check_eq "renommage : verrou non recopié dans role_state" "0" "$out"
 reload_sync || true
 out=$(psql_admin "SELECT count(*) FROM pass_policy.audit_log WHERE event_type = 'role_locked' AND role_name IN ('regress_ren', 'regress_ren2')")
 check_eq "renommage : acquitté, audité une seule fois (pas de réécriture à chaque tour)" "1" "$out"
-# Une fois audité et acquitté, le verrou suit le renommage (vérification 12) :
-# le worker le déplace sous le nouveau nom, au lieu de le libérer comme
-# celui d'un rôle supprimé
-n=$(grep -c 'lock of role "regress_ren" follows its rename to "regress_ren2"' "$PPP_TMP/server.log" || true)
-check_eq "renommage : LOG « follows its rename »" "1" "$n"
+# Une fois audité et acquitté, l'entrée est retirée et le rechargement ne
+# trouve rien à réinjecter pour l'OID du rôle (vérification 13)
+n=$(grep -c 'lock of role "regress_ren" renamed to "regress_ren2": reloaded from role_state' "$PPP_TMP/server.log" || true)
+check_eq "renommage : LOG « renamed to … reloaded from role_state »" "1" "$n"
 out=$(psql_as regress_ren2 "$GOOD" "SELECT current_user") || true
-check_contains "renommage : le verrou audité suit le nouveau nom" "is locked by pg_pass_policy" "$out"
+check_eq "renommage : verrou non persisté, le nouveau nom repart de zéro" "regress_ren2" "$out"
 psql_admin "DROP ROLE regress_ren2" >/dev/null
+
+# --- (vérification 13) verrou automatique audité et persisté, puis renommage
+# Le verrou (p_manual : jusqu'au déverrouillage manuel) est écrit dans
+# role_state avant le renommage : le worker retire l'entrée de l'ancien nom
+# (LOG) et le rechargement le réinjecte par OID sous le nouveau nom. Un rôle
+# créé ensuite sous l'ancien nom se connecte : le hook ne lui applique pas le
+# verrou d'un autre OID.
+psql_admin "CREATE ROLE regress_mv LOGIN PASSWORD '$GOOD'" >/dev/null
+psql_admin "SELECT pass_policy.assign_profile('regress_mv', 'p_manual')" >/dev/null
+reload_sync || true
+for i in 1 2; do psql_as regress_mv "$BAD" >/dev/null || true; done
+reload_sync || fail "pas de tour du worker après le verrou de regress_mv"
+out=$(psql_admin "SELECT count(*) FROM pass_policy.role_state s JOIN pg_roles r ON r.oid = s.role_oid
+                   WHERE r.rolname = 'regress_mv' AND s.locked_until = 'infinity' AND s.locked_by = 'auto'")
+check_eq "verrou automatique audité : persisté dans role_state" "1" "$out"
+psql_admin "ALTER ROLE regress_mv RENAME TO regress_mv2" >/dev/null 2>&1
+GOOD_MV='Lockout-Renamed#2024'
+psql_admin "CREATE ROLE regress_mv LOGIN PASSWORD '$GOOD_MV'" >/dev/null
+reload_sync || fail "pas de tour du worker après le renommage de regress_mv"
+n=$(grep -c 'lock of role "regress_mv" renamed to "regress_mv2": reloaded from role_state' "$PPP_TMP/server.log" || true)
+check_eq "renommage d'un verrou persisté : LOG « renamed to »" "1" "$n"
+out=$(psql_as regress_mv2 "$GOOD") || true
+check_contains "renommage d'un verrou persisté : le nouveau nom reste verrouillé" "is locked by pg_pass_policy" "$out"
+out=$(psql_as regress_mv "$GOOD_MV" "SELECT current_user") || true
+check_eq "renommage d'un verrou persisté : le rôle recréé sous l'ancien nom se connecte" "regress_mv" "$out"
+psql_admin "SELECT pass_policy.unlock_role('regress_mv2')" >/dev/null
+psql_admin "DROP ROLE regress_mv; DROP ROLE regress_mv2" >/dev/null
+
+# --- (vérification 13) entrée réglée d'un autre OID rencontrée par le hook
+# Verrou posé par shmem_lock_role() (rien à auditer), DROP ROLE puis CREATE
+# ROLE du même nom, connexion avant tout tour du worker : le verrou n'est pas
+# celui du nouveau rôle, l'entrée repart de zéro et l'échec est compté.
+psql_admin "CREATE ROLE regress_rs LOGIN PASSWORD '$GOOD'" >/dev/null
+reload_sync || true
+psql_admin "SELECT pass_policy.shmem_lock_role('regress_rs', NULL)" >/dev/null
+out=$(psql_as regress_rs "$GOOD") || true
+check_contains "regress_rs verrouillé en mémoire partagée" "is locked by pg_pass_policy" "$out"
+GOOD_RS='Lockout-Restart#2024'
+psql_admin "DROP ROLE regress_rs; CREATE ROLE regress_rs LOGIN PASSWORD '$GOOD_RS'" >/dev/null
+psql_as regress_rs "$BAD" >/dev/null || true
+out=$(psql_admin "SELECT failed_count, locked_until IS NULL FROM pass_policy.failed_attempts() WHERE role_name = 'regress_rs'")
+check_eq "rôle recréé : entrée remise à zéro par le hook, échec compté" "1|t" "$out"
+out=$(psql_as regress_rs "$GOOD_RS" "SELECT current_user") || true
+check_eq "rôle recréé : connexion réussie" "regress_rs" "$out"
+psql_admin "DROP ROLE regress_rs" >/dev/null
 
 # --- (vérification 3) verrou automatique, DROP ROLE puis CREATE ROLE sous le
 # même nom avant le passage du worker (SPEC §12) : le hook mémorise l'OID du
 # rôle verrouillé, le worker ne recopie pas le verrou dans role_state pour le
 # nouveau rôle (autre OID) ; l'audit dit role_missing et role_recreated, et
-# l'entrée devient fantôme (verrou en mémoire jusqu'à son expiration, 5 s).
+# l'entrée est retirée une fois le verrou audité. Avant même ce tour du
+# worker, le nouveau rôle se connecte : le hook n'applique pas le verrou d'un
+# autre OID (vérification 13).
 # DROP et CREATE dans une seule transaction : le worker ne peut pas passer
 # entre les deux (il verrait seulement un rôle supprimé, cas déjà couvert).
 psql_admin "CREATE ROLE regress_rec LOGIN PASSWORD '$GOOD'" >/dev/null
@@ -679,6 +726,8 @@ check_eq "rôle recréé : verrou automatique pas encore audité" "0" "$out"
 # le nom (SPEC §11, C3)
 GOOD_REC='Lockout-Recreated#2024'
 psql_admin "DROP ROLE regress_rec; CREATE ROLE regress_rec LOGIN PASSWORD '$GOOD_REC'" >/dev/null
+out=$(psql_as regress_rec "$GOOD_REC" "SELECT current_user") || true
+check_eq "rôle recréé : connexion avant le tour du worker (verrou d'un autre OID)" "regress_rec" "$out"
 reload_sync || fail "pas de tour du worker après DROP ROLE / CREATE ROLE"
 out=$(psql_admin "SELECT details->>'role_missing', details->>'role_recreated', coalesce(details->>'renamed_to', 'null')
                     FROM pass_policy.audit_log WHERE event_type = 'role_locked' AND role_name = 'regress_rec'")
@@ -689,10 +738,8 @@ check_eq "rôle recréé : le verrou de l'ancien rôle n'est pas recopié dans r
 reload_sync || true
 out=$(psql_admin "SELECT count(*) FROM pass_policy.audit_log WHERE event_type = 'role_locked' AND role_name = 'regress_rec'")
 check_eq "rôle recréé : acquitté, audité une seule fois" "1" "$out"
-sleep 6
-reload_sync || true
 out=$(psql_admin "SELECT count(*) FROM pass_policy.failed_attempts() WHERE role_name = 'regress_rec' AND locked_until IS NOT NULL")
-check_eq "rôle recréé : plus de verrou en mémoire partagée après expiration" "0" "$out"
+check_eq "rôle recréé : plus de verrou en mémoire partagée une fois audité" "0" "$out"
 out=$(psql_admin "SELECT count(*) FROM pass_policy.role_state s JOIN pg_roles r ON r.oid = s.role_oid
                    WHERE r.rolname = 'regress_rec' AND s.locked_until IS NOT NULL")
 check_eq "rôle recréé : toujours aucun verrou dans role_state" "0" "$out"

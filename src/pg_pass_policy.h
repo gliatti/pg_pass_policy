@@ -135,11 +135,13 @@ typedef struct pppRoleEntry
 	/*
 	 * OID of the role that bore this name when locked_until was last set
 	 * (authentication hook, PRE_COMMIT of shmem_lock_role(), re-injection
-	 * from role_state; InvalidOid if unknown).  Once the lock is fully
-	 * audited, the worker removes the entry when that OID no longer exists,
-	 * or moves the lock under the new name of a renamed role
-	 * (ppp_sync_cleanup): a locked entry never becomes a ghost, and a role
-	 * created since under the name starts afresh.
+	 * from role_state; InvalidOid if unknown, or for the pseudo-lock of a
+	 * non-existent name).  The authentication hook only applies the lock to
+	 * that role (or, InvalidOid, to a name that still has no role): another
+	 * role that bears the name since never inherits it.  Once the lock is
+	 * fully audited, the worker removes the entry when that OID no longer
+	 * bears the name (dropped, or renamed: the lock persisted in role_state
+	 * is then reloaded under the new name), see ppp_sync_cleanup.
 	 */
 	Oid			lock_role_oid;
 
@@ -478,6 +480,23 @@ ppp_is_locked(const pppRoleEntry *entry, TimestampTz now)
 	if (entry->locked_until == DT_NOEND)
 		return true;
 	return entry->locked_until > now;
+}
+
+/*
+ * Nothing at stake in the entry: no lock audit pending or unacknowledged,
+ * no failure to audit, no uncommitted lock.  Such pending work belongs to
+ * the role that bore the name: the worker audits it itself (role_gone /
+ * role_renamed rows, ppp_ack_pending) before the entry may go or start
+ * afresh for another role (authentication hook).  Caller holds
+ * ppp_shared->lock.
+ */
+static inline bool
+ppp_entry_settled(const pppRoleEntry *entry)
+{
+	return !entry->lock_pending_audit &&
+		entry->pending_failures == 0 &&
+		entry->audit_acked_seq == entry->audit_lock_seq &&
+		entry->lock_inflight == 0;
 }
 
 /*

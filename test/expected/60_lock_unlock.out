@@ -283,6 +283,26 @@ SELECT count(*) AS missing_tracked FROM pass_policy.failed_attempts()
                0
 (1 row)
 
+-- Rôle renommé dans la même transaction : refusé au COMMIT (vérification 13)
+CREATE ROLE regress_lock_ren;
+BEGIN;
+SELECT pass_policy.shmem_lock_role('regress_lock_ren', NULL);
+ shmem_lock_role 
+-----------------
+ 
+(1 row)
+
+ALTER ROLE regress_lock_ren RENAME TO regress_lock_ren2;
+COMMIT;
+ERROR:  role "regress_lock_ren" does not exist
+SELECT count(*) AS renamed_tracked FROM pass_policy.failed_attempts()
+ WHERE role_name IN ('regress_lock_ren', 'regress_lock_ren2');
+ renamed_tracked 
+-----------------
+               0
+(1 row)
+
+DROP ROLE regress_lock_ren;
 -- failed_attempts() : colonnes attendues
 SELECT count(*) >= 0 AS callable
   FROM pass_policy.failed_attempts() AS f(role_name, failed_count, first_failure_at,
