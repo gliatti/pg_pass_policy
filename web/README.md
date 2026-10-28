@@ -216,6 +216,32 @@ enregistré dans `application_name` et donc dans le journal d'audit. Un
 mandataire qui envoie du latin-1 doit déclarer
 `PGPP_WEB_PROXY_HEADER_ENCODING=latin-1`.
 
+Le nom décodé doit ensuite être un nom d'utilisateur valide (règle de
+`app/usernames.py`, appliquée aussi aux noms de `PGPP_WEB_BASIC_USERS`, qui
+sont refusés au démarrage avec le motif) : 1 à 128 caractères, ni espace
+ASCII en tête ou en fin, forme Unicode NFC, pas de marque combinante en
+tête, et aucun caractère des catégories Unicode Cc (contrôles), Cf (format :
+surcharges bidirectionnelles, espaces de largeur nulle, trait d'union
+conditionnel), Cs (demi-codets), Co (usage privé), Cn (non attribués), Zl,
+Zp (séparateurs de ligne et de paragraphe) et Zs (espaces), l'espace ASCII
+U+0020 excepté à l'intérieur du nom. Un nom refusé donne un 401 (`proxy
+header not a valid user name`). Changements de comportement : les espaces
+Unicode autres que l'espace ASCII (espace insécable U+00A0, espace
+idéographique U+3000, espaces typographiques…) sont refusés, de même que
+les caractères non attribués dans la version Unicode du Python qui exécute
+l'application (`unicodedata.unidata_version`) : un caractère ajouté par une
+version d'Unicode plus récente est refusé tant que Python ne le connaît
+pas. Les accents décomposés sont refusés, pas normalisés : `É` doit arriver
+sous sa forme précomposée U+00C9, `E` suivi de l'accent combinant U+0301
+donne un 401. Normaliser ferait de deux suites d'octets distinctes un même
+nom, indiscernable dans le journal.
+
+Les avertissements répétitifs (en-tête indécodable, en-tête reçu d'un pair
+hors de `PGPP_WEB_TRUSTED_PROXIES`) sont écrits au plus une fois par
+minute ; la ligne suivante indique combien ont été omis depuis quand
+(`3 similar warnings suppressed since 2026-10-28T09:30:05+00:00`), et un
+compte encore en attente est écrit à l'arrêt de l'application.
+
 Derrière HTTPS, `PGPP_WEB_SESSION_HTTPS_ONLY=true` est requis : le cookie de
 session devient `__Host-pgpp_session` (`Secure`, `Path=/`, sans `Domain`),
 qu'aucune autre origine du même site (autre sous-domaine, autre port, réponse
@@ -499,6 +525,7 @@ web/
 │   ├── config.py            Settings (pydantic-settings, préfixe PGPP_WEB_)
 │   ├── db.py                pool psycopg et requêtes (fonctions et vues pass_policy)
 │   ├── auth.py              HTTP basic (bcrypt) / en-tête de reverse proxy
+│   ├── usernames.py         règle des noms d'utilisateur (en-tête et PGPP_WEB_BASIC_USERS)
 │   ├── csrf.py              jeton de session et vérification
 │   ├── security.py          en-têtes de sécurité (CSP avec nonce, no-store…)
 │   ├── logfilter.py         masquage des mots de passe dans les journaux

@@ -753,6 +753,12 @@ def list_audit(
     count(*) OVER () would instead compute the whole match before LIMIT, on
     every page."""
     where, params = _audit_where(role, event_type, since)
+    # Named parameters are reused (the filters of `where` twice, %(offset)s
+    # in OFFSET and in the CASE): psycopg sends each name once, as a single
+    # $n, so each reused name must keep one type in every place it appears
+    # (offset: an integer in both; since: a timestamptz or an interval
+    # string, the same in both copies of `where`).  Covered on a server
+    # with prepared statements by test_list_audit_prepared_with_since_and_offset.
     result = conn.execute(
         f"WITH p AS (SELECT {_AUDIT_COLUMNS} FROM pass_policy.audit_log"
         f"           WHERE {where} ORDER BY id DESC LIMIT %(limit1)s OFFSET %(offset)s),"

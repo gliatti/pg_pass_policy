@@ -11,6 +11,7 @@ import ipaddress
 import threading
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 import bcrypt
 from fastapi import HTTPException, Request, status
@@ -19,6 +20,7 @@ from app.config import Settings, bcrypt_cost
 from app.hashpw import BCRYPT_MAX_BYTES
 from app.logfilter import get_logger
 from app.security import route_path
+from app.usernames import valid_user_name
 
 log = get_logger("auth")
 
@@ -46,22 +48,10 @@ def dummy_hash(users: dict[str, bytes]) -> bytes:
     return _dummy_hash_of_cost(cost or DEFAULT_COST)
 
 
-# longest accepted user name, in characters
-USER_MAX_LENGTH = 128
-
-
 def _valid_user(name: str) -> bool:
-    """A user name: 1 to USER_MAX_LENGTH printable characters, no leading or
-    trailing space.  str.isprintable() refuses the C0 and C1 control
-    characters (U+0000-U+001F, U+007F-U+009F, NEL U+0085 included), the
-    format characters (bidirectional overrides, zero-width joiners, soft
-    hyphen) and every space or separator but the ASCII space (no-break space
-    U+00A0, ideographic space U+3000, line / paragraph separators U+2028,
-    U+2029...): a log viewer or a terminal would render them as a line
-    break, as nothing, or as a plain space, so that two distinct names would
-    look alike.  Letters, marks and symbols of any script are accepted
-    ("Émilie", "日本")."""
-    return 0 < len(name) <= USER_MAX_LENGTH and name.isprintable() and name.strip(" ") == name
+    """A user name, under the rule of app.usernames (also applied to
+    PGPP_WEB_BASIC_USERS at startup)."""
+    return valid_user_name(name)
 
 
 # session key of the cached basic authentication (see _basic_fingerprint())
@@ -223,42 +213,89 @@ def _client_is_trusted(request: Request, settings: Settings) -> bool:
     return any(a in net for a in candidates for net in settings.trusted_networks())
 
 
-class _ThrottledWarning:
-    """A warning logged at most once per `interval` seconds; the next line
-    logged tells how many were suppressed in between (a flood of bad
-    requests must not flood the log)."""
+def _peer(request: Request) -> str:
+    """The peer of a request, for a log line: its address, "unix" for a
+    Unix socket peer (no client, or an empty host)."""
+    client = request.client
+    return client.host if client is not None and client.host else "unix"
 
-    def __init__(self, interval: float = 60.0):
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
+class _ThrottledWarning:
+    """A warning logged at most once per `interval` seconds (a flood of bad
+    requests must not flood the log).  The next line logged tells how many
+    were suppressed since the first suppressed one; flush() (at shutdown)
+    logs a count still pending."""
+
+    def __init__(self, label: str, interval: float = 60.0):
+        self.label = label
         self.interval = interval
         self._lock = threading.Lock()
         self._last: float | None = None
         self._suppressed = 0
+        self._since: datetime | None = None
 
     def reset(self) -> None:
         with self._lock:
-            self._last, self._suppressed = None, 0
+            self._last, self._suppressed, self._since = None, 0, None
+
+    def _take(self) -> tuple[int, datetime | None]:
+        # caller holds the lock
+        taken = self._suppressed, self._since
+        self._suppressed, self._since = 0, None
+        return taken
 
     def warning(self, message: str, *args: object) -> None:
         now = time.monotonic()
         with self._lock:
             if self._last is not None and now - self._last < self.interval:
+                if not self._suppressed:
+                    self._since = _utcnow()
                 self._suppressed += 1
                 return
-            suppressed, self._last, self._suppressed = self._suppressed, now, 0
-        if suppressed:
-            message += " (%d similar warnings suppressed in the last %d s)"
-            args = (*args, suppressed, int(self.interval))
+            self._last = now
+            suppressed, since = self._take()
+        if suppressed and since is not None:
+            message += " (%d similar warnings suppressed since %s)"
+            args = (*args, suppressed, since.isoformat(timespec="seconds"))
         log.warning(message, *args)
+
+    def flush(self) -> None:
+        """Log the count of warnings suppressed and not reported yet, if any."""
+        with self._lock:
+            suppressed, since = self._take()
+        if suppressed and since is not None:
+            log.warning(
+                "%s: %d similar warnings suppressed since %s",
+                self.label,
+                suppressed,
+                since.isoformat(timespec="seconds"),
+            )
 
 
 # a proxy header that cannot be decoded: a misconfigured reverse proxy or
 # PGPP_WEB_PROXY_HEADER_ENCODING, worth a trace (never the header itself)
-_undecodable_proxy_header = _ThrottledWarning(60.0)
+_undecodable_proxy_header = _ThrottledWarning("proxy header not decodable")
+# a proxy header sent by a peer outside PGPP_WEB_TRUSTED_PROXIES: logged
+# once per minute at most, a scan or a misrouted client would send one per
+# request
+_untrusted_proxy_peer = _ThrottledWarning("proxy header refused from untrusted peer")
+
+THROTTLED_WARNINGS = (_undecodable_proxy_header, _untrusted_proxy_peer)
+
+
+def flush_throttled_warnings() -> None:
+    """At shutdown: report the warnings suppressed since the last one logged."""
+    for throttled in THROTTLED_WARNINGS:
+        throttled.flush()
 
 
 def user_from_proxy(request: Request, settings: Settings) -> str:
     if not _client_is_trusted(request, settings):
-        log.warning("proxy header refused from untrusted peer %s", request.client)
+        _untrusted_proxy_peer.warning("proxy header refused from untrusted peer %s", _peer(request))
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Requests must come through the trusted reverse proxy",
@@ -288,7 +325,7 @@ def user_from_proxy(request: Request, settings: Settings) -> str:
             header,
             encoding,
             len(raw),
-            request.client.host if request.client and request.client.host else "unix",
+            _peer(request),
         )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -319,7 +356,7 @@ def require_user(request: Request) -> str:
                 log.warning(
                     "basic authentication failed for user %s from %s",
                     _loggable(result.claimed),
-                    request.client.host if request.client else "unix",
+                    _peer(request),
                 )
             raise _unauthorized(settings, "Not authenticated")
     else:

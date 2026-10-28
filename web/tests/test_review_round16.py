@@ -7,6 +7,7 @@ from __future__ import annotations
 import base64
 import inspect
 import logging
+from datetime import UTC, datetime
 
 import pytest
 from fastapi import HTTPException
@@ -73,6 +74,9 @@ def test_undecodable_proxy_headers_are_logged_once_per_minute(monkeypatch, caplo
     caplog.set_level(logging.WARNING)
     clock = [1000.0]
     monkeypatch.setattr(auth.time, "monotonic", lambda: clock[0])
+    first_suppressed = datetime(2026, 10, 28, 9, 30, 5, tzinfo=UTC)
+    wall = iter([first_suppressed, first_suppressed.replace(second=59)])
+    monkeypatch.setattr(auth, "_utcnow", lambda: next(wall))
     settings = _proxy_settings()
     for _ in range(5):
         _refused(b"bad\xff", settings)
@@ -85,7 +89,7 @@ def test_undecodable_proxy_headers_are_logged_once_per_minute(monkeypatch, caplo
     [record] = caplog.records
     assert record.getMessage() == (
         "proxy header x-remote-user not valid utf-8 (6 bytes) from 127.0.0.1"
-        " (4 similar warnings suppressed in the last 60 s)"
+        " (4 similar warnings suppressed since 2026-10-28T09:30:05+00:00)"
     )
     # a valid header is not affected and does not log
     caplog.clear()

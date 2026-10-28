@@ -77,6 +77,9 @@ def _proxy_request(raw: bytes) -> Request:
         "a\u200bb",
         "a\u202eb",
         "a\xadb",
+        # decomposed accent (not NFC), leading combining mark
+        "E\u0301milie",
+        "\u0301bob",
         # ASCII space at either end
         " bob",
         "bob ",
@@ -92,7 +95,7 @@ def test_c1_controls_and_separators_are_refused(name):
         assert response.status_code == 401
 
 
-@pytest.mark.parametrize("name", ["Émilie", "zoë", "E\u0301milie", "a b", "日本", "x" * 128])
+@pytest.mark.parametrize("name", ["\xc9milie", "zo\xeb", "a b", "日本", "x" * 128])
 def test_printable_names_are_accepted(name):
     assert auth._valid_user(name)
     assert auth._loggable(name) == name

@@ -9,6 +9,8 @@ from typing import Literal
 from pydantic import PrivateAttr, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.usernames import user_name_problem
+
 _BCRYPT_PREFIXES = ("$2a$", "$2b$", "$2y$")
 _BCRYPT_COST_RE = re.compile(rb"^\$2[aby]\$([0-9]{2})\$")
 # a whole bcrypt hash: $2b$NN$, then 22 characters of salt and 31 of digest
@@ -138,6 +140,11 @@ class Settings(BaseSettings):
             user, sep, digest = entry.partition(":")
             if not sep or not user or not digest.startswith(_BCRYPT_PREFIXES):
                 raise ValueError("PGPP_WEB_BASIC_USERS entries must be user:bcrypt-hash")
+            # the rule of the proxy header (app.usernames): a name that
+            # could never be told apart from another one in a log line
+            problem = user_name_problem(user)
+            if problem is not None:
+                raise ValueError(f"PGPP_WEB_BASIC_USERS: user name {user!r} refused: {problem}")
             if not digest.isascii():
                 raise ValueError(_malformed_hash(user, digest))
             if user in users:

@@ -70,11 +70,12 @@ def _context(request: Request, conn: Connection, filters: dict[str, Any]) -> dic
             # the requested page is shown empty with links to the first
             # page and to the last page known to exist (the one holding
             # event AUDIT_COUNT_CAP + 1), never a page presented as the
-            # last one.
+            # last one.  That page holds rows, the requested one (empty) is
+            # past it: no need to bound last_known_page by page - 1.
             if not result.rows and page > 1:
                 if result.capped:
                     past_end = True
-                    last_known_page = min(_page_count(db.AUDIT_COUNT_CAP + 1, page_size), page - 1)
+                    last_known_page = _page_count(db.AUDIT_COUNT_CAP + 1, page_size)
                 else:
                     page = min(page, _page_count(result.total, page_size))
                     if result.total:

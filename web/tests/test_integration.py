@@ -1280,3 +1280,47 @@ def test_audit_since_is_checked_before_the_query(client):
         assert message in response.text, since
     response = client.get("/audit/table", params={"since": "7 days"})
     assert "Invalid filter" not in response.text
+
+
+def test_list_audit_prepared_with_since_and_offset(client, test_url):
+    """db.list_audit() reuses named parameters (the filters in two places,
+    offset in OFFSET and in the CASE): with since (a timestamptz, then an
+    interval string) and offset > 0, as a server-side prepared statement
+    (prepare_threshold 0: prepared at the first execution), the server
+    accepts the single type of each $n and the results match the unprepared
+    ones."""
+    from datetime import UTC, datetime
+
+    from psycopg.rows import dict_row
+
+    token = csrf_token(client, "/roles")
+    for _ in range(3):
+        client.post("/roles/web_t_alpha/rotate", headers={"X-CSRF-Token": token})
+    sinces = [datetime(2000, 1, 1, tzinfo=UTC), "1 hour"]
+    with (
+        psycopg.connect(test_url, row_factory=dict_row) as plain,
+        psycopg.connect(test_url, row_factory=dict_row, prepare_threshold=0) as prepared,
+    ):
+        total = plain.execute(
+            "SELECT count(*) AS n FROM pass_policy.audit_log"
+            " WHERE role_name = 'web_t_alpha' AND event_time >= now() - '1 hour'::interval"
+        ).fetchone()["n"]
+        assert total >= 3
+        for since in sinces:
+            for offset in (1, 2, total + 5):
+                kw = {"role": "web_t_alpha", "since": since, "limit": 1, "offset": offset}
+                expected = db.list_audit(plain, **kw)
+                # twice: the second run uses the statement prepared by the first
+                assert db.list_audit(prepared, **kw) == expected
+                assert db.list_audit(prepared, **kw) == expected
+                assert expected.total >= total
+                if offset > total:
+                    assert expected.rows == [] and not expected.has_next
+                else:
+                    assert len(expected.rows) == 1
+        statements = prepared.execute(
+            "SELECT count(*) AS n FROM pg_prepared_statements"
+            " WHERE statement LIKE '%%pass_policy.audit_log%%'"
+        ).fetchone()["n"]
+        # one per since type (timestamptz, interval string), at least
+        assert statements >= 2
