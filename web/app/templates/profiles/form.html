@@ -1,7 +1,0 @@
-{% extends "base.html" %}
-{% block title %}{{ profile.name if profile else 'New profile' }}{% endblock %}
-{% block content %}
-<h1>{% if profile %}Profile {{ profile.name }}{% else %}New profile{% endif %}</h1>
-<p><a href="{{ path_for('profiles') }}">← Profiles</a></p>
-{% include "profiles/_form.html" %}
-{% endblock %}

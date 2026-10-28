@@ -8,6 +8,10 @@ Trois niveaux de tests :
 | shell | `test/shell/*.sh` | vraies connexions TCP/SCRAM : verrouillage, expiration, NOTIFY, worker |
 | matrice Docker | `docker/` | les deux niveaux précédents sur PostgreSQL 14, 15, 16, 17 et 18 |
 
+Les tests de la CLI et du back-office web sont décrits dans leurs dépôts :
+[`pg_pass_policy-cli`](https://github.com/gliatti/pg_pass_policy-cli#tests) et
+[`pg_pass_policy-web`](https://github.com/gliatti/pg_pass_policy-web#tests).
+
 ## 1. pg_regress
 
 ### Pourquoi pas `make check` ni `make installcheck` « nu »
@@ -189,5 +193,5 @@ docker/run-all.sh 16 18           # sous-ensemble
 ```
 
 Journaux par version dans `docker/logs/pgNN.log` ; code retour non nul si une
-version échoue. `docker/Dockerfile.dockerignore` exclut les objets compilés,
-les résultats de test et les répertoires `cli/target`, `web/.venv`.
+version échoue. `docker/Dockerfile.dockerignore` exclut les objets compilés
+et les résultats de test.

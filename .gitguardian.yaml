@@ -4,6 +4,3 @@ version: 2
 secret:
   ignored_paths:
     - "test/**"
-    - "cli/tests/**"
-    - "web/tests/**"
-    - "web/scripts/test-instance.sh"

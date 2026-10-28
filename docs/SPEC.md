@@ -4,6 +4,14 @@ Ce document est le contrat partagé par tous les développeurs/agents. Toute
 modification d'une interface listée ici (table, fonction SQL, GUC, prototype C,
 structure partagée) doit être reportée ici **avant** d'être codée.
 
+Le projet est réparti en trois dépôts : l'extension (ce dépôt,
+[`pg_pass_policy`](https://github.com/gliatti/pg_pass_policy)), la CLI
+[`pg_pass_policy-cli`](https://github.com/gliatti/pg_pass_policy-cli)
+et le back-office web
+[`pg_pass_policy-web`](https://github.com/gliatti/pg_pass_policy-web).
+Ce document reste leur spécification commune : les §9 et §10 décrivent les
+deux clients, dont le code se trouve dans leurs dépôts.
+
 ## 1. Objectif
 
 Extension PostgreSQL (C + SQL) de gestion du cycle de vie des mots de passe des
@@ -47,10 +55,12 @@ src/worker.c                  background worker (maintenance périodique)
 test/sql/*.sql test/expected/*.out   pg_regress
 test/shell/*.sh               tests nécessitant de vraies connexions (verrouillage, expiration)
 docker/                       matrice 14→18 (docker compose)
-cli/                          CLI Rust (clap + sqlx)
-web/                          back-office FastAPI + HTMX
 docs/                         documentation
 ```
+
+La CLI et le web ont chacun leur dépôt
+([`pg_pass_policy-cli`](https://github.com/gliatti/pg_pass_policy-cli),
+[`pg_pass_policy-web`](https://github.com/gliatti/pg_pass_policy-web)).
 
 ## 3. Modèle de données (schéma `pass_policy`)
 
@@ -782,7 +792,7 @@ Cas particuliers :
 6. `generate_password` utilise exclusivement `pg_strong_random`.
 7. `auto_explain` (`log_nested_statements`) journaliserait les paramètres des requêtes SPI du hook (`record_password_change($1, $2)`, `$2` = vérificateur SCRAM) : `auto_explain.log_min_duration` est mis à -1 (`GUC_ACTION_SAVE` / `set_config(…, true)`) pendant les requêtes SPI du hook, dans `_set_password()` et dans `run_maintenance()`, jusqu'à la sortie de la fonction. `check_password(role, password)` reçoit le mot de passe en argument : ses ERROR (extension absente ou non fiable, profil introuvable…) sont relancées avec `STATEMENT`/`CONTEXT` masqués et ses messages émis sous la même garde GUC que le hook ; en revanche la journalisation de la requête englobante (`log_statement`, `log_min_duration_statement` avec `log_parameter_max_length = -1` par défaut depuis PG 13, même pour un paramètre lié) n'est pas sous le contrôle de l'extension (README).
 
-## 9. CLI (`cli/`, Rust, clap + sqlx + tokio, nom du binaire `pgpp`)
+## 9. CLI ([`pg_pass_policy-cli`](https://github.com/gliatti/pg_pass_policy-cli), Rust, clap + sqlx + tokio, nom du binaire `pgpp`)
 
 Commandes : `status [--role] [--format table|json]`, `expiring [--within 14d]`,
 `locked`, `rotate <role> [--length N] [--exec CMD] [--vault-kv PATH]`,
@@ -798,7 +808,7 @@ avec le code de sortie 2 **avant** toute connexion : une rotation dont le
 résultat ne serait remis nulle part serait perdue. Codes de sortie : 0 succès,
 1 erreur, 2 usage, 3 mot de passe refusé par `check`.
 
-## 10. Web (`web/`, FastAPI + HTMX + Jinja2, psycopg 3, venv)
+## 10. Web ([`pg_pass_policy-web`](https://github.com/gliatti/pg_pass_policy-web), FastAPI + HTMX + Jinja2, psycopg 3, venv)
 
 Pages : tableau de bord (compteurs ok/warning/grace/expired/locked), rôles
 (table filtrable, actions lock/unlock/expire/rotate avec affichage unique),
@@ -942,6 +952,13 @@ basic ou en-tête reverse-proxy (`REMOTE_USER`), rôle PG dédié membre de
 - (vérification 10) Revue de `1303edd..9420658` (`src/`, `sql/`, `test/`), dix constats. (1) `ppp_entry_may_become_ghost()` refusait toute entrée verrouillée : le verrou permanent (`DT_NOEND`) d'un rôle supprimé gardait son entrée en `PPP_CLASS_KEEP` et son emplacement pour toujours (ou jusqu'à ce que la maintenance purge `role_state` et que le rechargement lève le verrou, s'il est recopié dans `role_state`). Un verrou actif n'empêche plus la transition s'il est entièrement audité et acquitté (ni `lock_pending_audit`, `audit_acked_seq = audit_lock_seq`, ni `lock_inflight`, ni `pending_failures`) ; il s'applique toujours au nom tant que l'entrée est là. Test : `hashfull.sh` (verrou permanent automatique audité et persisté, hash plein de compteurs vivants, `DROP ROLE`, l'échec d'un autre rôle évince l'entrée et est compté ; les deux assertions échouent sans la correction). En écrivant ce test, un défaut du parcours borné du mode COUNT (revue finale 4, H3) est apparu : quand `limit = nentries` (hash de moins de `PPP_EVICT_SCAN_LIMIT` entrées) et que le bucket de départ suit des buckets vides, le parcours s'arrête après la dernière entrée avant eux (`next_bucket < evict_fruitless_from`), le suivant repart de là et s'arrête au même endroit : la série infructueuse ne se terminait jamais, ni LOG « cannot track », ni pause d'une seconde (le test « LOG cannot track » de `hashfull.sh` échouait selon la position de départ laissée par les tests précédents). Un parcours qui a examiné toutes les entrées compte désormais comme un tour complet (`examined >= nentries`, `lockout.c`). (2-3) Le HINT du `57P03` informait un client non authentifié de la voie de secours, contre la règle écrite au-dessus (« rien n'est dit au client »). HINT client retiré, refus générique ; l'information complète (`exempt_roles`, `rescue_roles` en `peer`, superutilisateurs une fois le worker absent `PPP_WORKER_MISSING_GRACE_SECS` après l'initialisation) est dans le HINT du LOG serveur « refusing connections … ». README (encadré CAUTION, « Verrouillage et déverrouillage »), §6.3, §12 mis à jour. Test : `lockout.sh` (aucun HINT pour un rôle ordinaire ni pour un superutilisateur ; la sortie client ne cite ni worker, ni `exempt_roles`, ni `rescue_roles`, ni `peer` ; le HINT du LOG serveur cite les trois voies). (4) Le LOG de secours n'était pas borné : limitation par rôle, tableau fixe `ppp_shared->rescue_log` de `PPP_RESCUE_LOG_SLOTS` (16) cases sous le verrou du hook, une ligne par rôle et par `PPP_RESCUE_LOG_SECS` (60 s), la suivante donne le nombre d'admissions non journalisées du rôle ; tableau plein, journalisation sans limite. Test : `lockout.sh` (trois admissions d'un rôle, un LOG ; un second rôle a le sien dans la même minute ; une minute plus tard, nouveau LOG avec « 2 earlier admissions of this role were not logged » ; échoue sans la correction). (5) Course entre la recherche syscache de `ppp_sync_cleanup()` hors verrou et l'écriture : un rôle créé et authentifié entre-temps était marqué fantôme (le hook laisse le drapeau à faux, la génération ne change pas). Compteur par entrée `update_seq`, incrémenté par le hook à chaque mise à jour (succès comme échec compté) et partout où le drapeau est remis à faux (`ppp_apply_lock_ops()`, rechargement), copié par le worker et exigé égal à l'écriture. Course non reproductible de façon déterministe dans les tests shell (aucun point d'injection entre la copie et l'écriture) : pas de test dédié. (6) La transition vrai → faux supprimée par le worker est voulue : entrée en §12. (7) `check_password()` appelée par un superutilisateur ignore `min_age` alors que le rôle cible, changeant lui-même son mot de passe, sera refusé : accepté, la fonction répond pour l'appelant (parité avec le hook, vérification 9) ; README (paragraphe `check_password`) et §12. (8) `ppp_sync_cleanup()` allouait une ligne par entrée du hash : les candidates sont d'abord comptées sous verrou partagé, puis copiées dans autant de lignes (plus `PPP_HASH_COPY_MARGIN`) ; la seconde compaction est remplacée par une marque `gone` par ligne. (9) `95_parity` laissait ses lignes `par1` à `par4` dans `ppp_test.secrets` : vérifiées par `ppp_test.leaks()` puis supprimées à la fin du test. (10) `hashfull.sh` : le `sleep 1` après le tour du worker est remplacé par une attente bornée par sondage (`wait_until`, ajouté à `common.sh` : relance une commande jusqu'à ce qu'elle réussisse, au plus N secondes).
 
 ## 12. Constats de revue acceptés
+
+Depuis la séparation en trois dépôts, les constats acceptés de la CLI et du web
+sont aussi consignés dans la rubrique « Limites connues » de leurs README
+([CLI](https://github.com/gliatti/pg_pass_policy-cli#limites-connues),
+[web](https://github.com/gliatti/pg_pass_policy-web#limites-connues)).
+Les entrées ci-dessous, y compris les chemins `cli/…` et `web/…` qu'elles
+citent, sont conservées telles qu'elles ont été écrites.
 
 Points relevés en revue et volontairement non corrigés :
 

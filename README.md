@@ -11,9 +11,10 @@
 >   `sslmode=verify-full` côté client.
 > - **Client** : le résultat peut être conservé par l'outil qui l'affiche
 >   (défilement du terminal, grilles de résultats de pgAdmin ou DBeaver, logs
->   applicatifs qui écrivent les lignes renvoyées). Préférez
->   `pgpp rotate --vault-kv` ou `--exec`, qui ne passent ni par l'écran ni par une
->   variable d'environnement.
+>   applicatifs qui écrivent les lignes renvoyées). Préférez une remise qui ne
+>   passe ni par l'écran ni par une variable d'environnement, comme les
+>   options `--vault-kv` et `--exec` de la
+>   [CLI `pgpp`](https://github.com/gliatti/pg_pass_policy-cli).
 > - **Rôle `pass_policy_admin`** : un membre peut obtenir le mot de passe de tout
 >   rôle non privilégié. Accordez-le avec parcimonie.
 > - **Superutilisateur** : ajoutez `pg_pass_policy.exempt_roles = 'postgres'`
@@ -520,8 +521,10 @@ compte comme « spécial ».
 - **`check_password` et le log** : le mot de passe candidat est un argument de
   requête, l'extension ne peut pas empêcher le serveur de journaliser cette
   requête. Un paramètre lié (`$1`, `PREPARE`, API cliente, c'est ce que fait
-  `pgpp check`) évite le littéral dans `pg_stat_activity.query` et l'historique
-  de psql, mais **pas** dans le log serveur : depuis PG 13,
+  la commande `check` de la
+  [CLI `pgpp`](https://github.com/gliatti/pg_pass_policy-cli)) évite le
+  littéral dans `pg_stat_activity.query` et l'historique de psql, mais
+  **pas** dans le log serveur : depuis PG 13,
   `log_parameter_max_length` vaut -1 par défaut et `log_statement = all` comme
   `log_min_duration_statement` écrivent `DETAIL: parameters: $1 = '…'`. Pour
   les rôles qui appellent `check_password` (la fonction n'est pas accordée à
@@ -529,7 +532,7 @@ compte comme « spécial ».
   log_parameter_max_length = 0`, `SET log_statement = 'none'` et `SET
   log_min_duration_statement = -1` (ces trois GUC ne sont pas modifiables par
   une session ordinaire ; à partir de PG 15, `GRANT SET ON PARAMETER
-  log_parameter_max_length TO <appelant>` permet à `pgpp check` de poser
+  log_parameter_max_length TO <appelant>` permet à `pgpp check` (CLI) de poser
   lui-même `SET LOCAL log_parameter_max_length = 0` ; `log_parameter_max_length_on_error` reste à 0, sa
   valeur par défaut, pour ne rien journaliser non plus en cas d'erreur ;
   penser aussi à `auto_explain.log_parameter_max_length` si auto_explain est
@@ -582,6 +585,17 @@ compte comme « spécial ».
   (matière à attaque hors ligne) ; la colonne n'est lisible que par le
   propriétaire de l'extension, pas par `pass_policy_viewer`.
 
+## Clients
+
+Les clients de l'extension sont développés dans des dépôts séparés :
+
+- [`pg_pass_policy-cli`](https://github.com/gliatti/pg_pass_policy-cli) :
+  `pgpp`, client en ligne de commande (Rust) qui couvre l'API SQL et remet
+  les mots de passe générés à un coffre HashiCorp Vault ou à une commande.
+- [`pg_pass_policy-web`](https://github.com/gliatti/pg_pass_policy-web) :
+  `pgpp-web`, back-office web (FastAPI + HTMX) pour consulter l'état des
+  rôles, les profils et l'audit, et lancer les actions d'administration.
+
 ## Tests
 
 ```sh
@@ -612,7 +626,6 @@ test/sql, test/expected       pg_regress
 test/shell                    tests avec vraies connexions
 docker/                       matrice 14 → 18
 docs/                         SPEC.md (contrat), TESTING.md
-cli/, web/                    CLI et back-office prévus (répertoires vides pour l'instant)
 ```
 
 ## Licence
