@@ -39,6 +39,15 @@ kick() {
 	wait_for 30 "SELECT coalesce(max(last_reload) > '$t0'::timestamptz AND max(last_run) > '$t0'::timestamptz, false) FROM pass_policy.worker_status()"
 }
 n_log() { grep -c -- "$1" "$PPP_TMP/server.log" || true; }
+# compteur d'échecs d'un rôle dans failed_attempts() (0 sans entrée)
+n_failed() {
+	psql_admin "SELECT coalesce(max(failed_count), 0) FROM pass_policy.failed_attempts() WHERE role_name = '$1'"
+}
+# un échec de mauvais mot de passe pour le rôle $1, réussit s'il a été compté
+fail_counted() {
+	psql_as "$1" "$BAD" >/dev/null || true
+	[ "$(n_failed "$1")" != 0 ]
+}
 
 psql_admin "CREATE ROLE victime LOGIN PASSWORD '$GOOD'"
 psql_admin "CREATE ROLE regress_bf LOGIN PASSWORD '$GOOD'"
@@ -177,13 +186,50 @@ check_eq "compteurs vivants non évincables : l'échec de regress_gx n'est pas c
 kick || fail "pas de tour du worker avant la suppression des rôles"
 for i in $(seq 1 "$MAX"); do psql_admin "DROP ROLE IF EXISTS regress_gone$i"; done
 kick || fail "pas de tour du worker après la suppression des rôles"
-sleep 1
-psql_as regress_gx "$BAD" >/dev/null || true
-check_eq "rôles supprimés devenus fantômes : l'échec de regress_gx est compté" "1" \
-	"$(psql_admin "SELECT failed_count FROM pass_policy.failed_attempts() WHERE role_name = 'regress_gx'")"
+# attente bornée (vérification 10, (10)) : le premier échec compté arrête le sondage
+wait_until 15 fail_counted regress_gx || true
+check_eq "rôles supprimés devenus fantômes : l'échec de regress_gx est compté" "1" "$(n_failed regress_gx)"
 # regress_gx supprimé à son tour : son entrée redevient évincable pour la suite
 psql_admin "DROP ROLE regress_gx"
 kick || fail "pas de tour du worker après la suppression de regress_gx"
+
+# --- verrou permanent audité d'un rôle supprimé : fantôme (vérification 10) --
+# Verrou automatique permanent (lock_duration NULL) de regress_perm, audité et
+# acquitté par le worker ; le reste du hash est rempli de compteurs vivants de
+# vrais rôles (non évincables en mode COUNT). Une fois le rôle supprimé, le
+# tour suivant du worker fait de son entrée un fantôme, évincable : l'échec
+# d'un autre rôle est compté. Avant la correction, un verrou actif empêchait
+# la transition et l'entrée gardait son emplacement.
+psql_admin "SELECT pass_policy.create_profile('p_perm',
+  '{\"max_failures\": 2, \"failure_window\": \"15 minutes\", \"lock_duration\": null, \"min_age\": \"0\"}')" >/dev/null
+psql_admin "CREATE ROLE regress_perm LOGIN PASSWORD '$GOOD'"
+psql_admin "SELECT pass_policy.assign_profile('regress_perm', 'p_perm')" >/dev/null
+kick || fail "pas de rechargement après assign_profile(regress_perm)"
+for i in 1 2; do psql_as regress_perm "$BAD" >/dev/null || true; done
+out=$(psql_as regress_perm "$GOOD") || true
+check_contains "regress_perm : verrou automatique permanent" "locked until manual unlock" "$out"
+kick || fail "pas de tour du worker après le verrou de regress_perm"
+check_eq "regress_perm : verrou audité (role_locked) et persisté (role_state)" "1|infinity" \
+	"$(psql_admin "SELECT (SELECT count(*) FROM pass_policy.audit_log WHERE role_name = 'regress_perm' AND event_type = 'role_locked'),
+	                      (SELECT locked_until FROM pass_policy.role_state WHERE role_name = 'regress_perm')")"
+for i in $(seq 1 "$MAX"); do
+	psql_admin "CREATE ROLE regress_pk$i LOGIN PASSWORD '$GOOD'"
+	psql_as "regress_pk$i" "$BAD" >/dev/null || true
+done
+psql_admin "CREATE ROLE regress_pkx LOGIN PASSWORD '$GOOD'"
+check_eq "hash plein : verrou de regress_perm et compteurs vivants de vrais rôles" "$MAX" "$(n_entries)"
+psql_as regress_pkx "$BAD" >/dev/null || true
+check_eq "hash plein non évincable : l'échec de regress_pkx n'est pas compté" "0" "$(n_failed regress_pkx)"
+psql_admin "DROP ROLE regress_perm"
+kick || fail "pas de tour du worker après la suppression de regress_perm"
+wait_until 15 fail_counted regress_pkx || true
+check_eq "verrou permanent audité d'un rôle supprimé devenu fantôme : l'échec de regress_pkx est compté" "1" "$(n_failed regress_pkx)"
+check_eq "l'entrée de regress_perm a été évincée" "0" \
+	"$(psql_admin "SELECT count(*) FROM pass_policy.failed_attempts() WHERE role_name = 'regress_perm'")"
+for i in $(seq 1 "$MAX"); do psql_admin "DROP ROLE regress_pk$i"; done
+psql_admin "DROP ROLE regress_pkx"
+psql_admin "SELECT pass_policy.drop_profile('p_perm')" >/dev/null
+kick || fail "pas de tour du worker après la suppression des rôles regress_pk*"
 
 # --- toutes les entrées sont des verrous de vrais rôles : ERROR 53400 -------
 flood ghost6 24

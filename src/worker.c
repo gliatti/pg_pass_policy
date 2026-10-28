@@ -873,32 +873,38 @@ ppp_free_pending(void)
  */
 /*
  * Entry whose role_missing flag may go from false to true, for
- * ppp_sync_cleanup(): its name and incarnation (the old value of the flag
- * is false, only such entries are copied).
+ * ppp_sync_cleanup(): its name, incarnation and update counter when copied
+ * (the old value of the flag is false, only such entries are copied), and
+ * whether the catalog lookup found no role of that name.
  */
 typedef struct pppMissingRow
 {
 	char		rolename[NAMEDATALEN];
 	uint64		generation;		/* entry->generation when copied */
+	uint32		update_seq;		/* entry->update_seq when copied */
+	bool		gone;			/* no role of that name (lookup) */
 } pppMissingRow;
 
 /*
  * May the worker turn this entry into a ghost (role_missing = true)?  Only
  * an entry with nothing at stake: no lock audit pending or unacknowledged,
- * no failure to audit, no active or uncommitted lock.  Such pending work
- * belongs to the role that bore the name: the worker audits it itself
- * (role_gone / role_renamed rows, ppp_ack_pending), and a ghost would be
- * evictable before.  Caller holds ppp_shared->lock (shared or exclusive).
+ * no failure to audit, no uncommitted lock.  Such pending work belongs to
+ * the role that bore the name: the worker audits it itself (role_gone /
+ * role_renamed rows, ppp_ack_pending), and a ghost would be evictable
+ * before.  An active lock does not prevent it once fully audited and
+ * acknowledged (permanent lock of a dropped role, for instance): the entry
+ * would otherwise stay PPP_CLASS_KEEP and hold its slot for good.  The
+ * lock still applies to the name while the entry is there.  Caller holds
+ * ppp_shared->lock (shared or exclusive).
  */
 static bool
-ppp_entry_may_become_ghost(const pppRoleEntry *entry, TimestampTz now)
+ppp_entry_may_become_ghost(const pppRoleEntry *entry)
 {
 	return !entry->role_missing &&
 		!entry->lock_pending_audit &&
 		entry->pending_failures == 0 &&
 		entry->audit_acked_seq == entry->audit_lock_seq &&
-		entry->lock_inflight == 0 &&
-		!ppp_is_locked(entry, now);
+		entry->lock_inflight == 0;
 }
 
 static void
@@ -913,8 +919,9 @@ ppp_sync_cleanup(void)
 	int			purged_missing = 0;
 	int			ghosts = 0;
 	bool		in_recovery = RecoveryInProgress();
-	pppMissingRow *mrows;
+	pppMissingRow *mrows = NULL;
 	int			nmrows = 0;
+	int			ncandidates = 0;
 	int			nchanged = 0;
 	int			maxmrows;
 	int			i;
@@ -923,68 +930,91 @@ ppp_sync_cleanup(void)
 	 * Turn into ghosts (role_missing = true) the entries of roles dropped or
 	 * renamed since the last attempt: the authentication hook only sets the
 	 * flag at an attempt, so such an entry kept PPP_CLASS_INACTIVE /
-	 * PPP_CLASS_LIVE_COUNTER and the purge below used the purge rule of an
-	 * existing role.  Only the false -> true transition is made here, and
-	 * only for an entry with nothing pending (ppp_entry_may_become_ghost):
-	 * - an entry with an audit or a lock pending stays as it is, so that the
-	 *	 worker writes its role_gone / role_renamed rows (ppp_ack_pending,
-	 *	 which turns it into a ghost itself once audited) and it is not
-	 *	 evicted before;
+	 * PPP_CLASS_LIVE_COUNTER (or PPP_CLASS_KEEP for an active lock) and the
+	 * purge below used the purge rule of an existing role.  Only the
+	 * false -> true transition is made here, and only for an entry with
+	 * nothing pending (ppp_entry_may_become_ghost):
+	 * - an entry with an audit or an uncommitted lock pending stays as it
+	 *	 is, so that the worker writes its role_gone / role_renamed rows
+	 *	 (ppp_ack_pending, which turns it into a ghost itself once audited)
+	 *	 and it is not evicted before;
 	 * - true -> false is left to the authentication hook (a success, or a
 	 *	 failure whose catalog lookup finds the role): a ghost whose name is
-	 *	 taken by a new role must not hand its pseudo-lock over to it.
+	 *	 taken by a new role must not hand its pseudo-lock over to it.  The
+	 *	 attempts made under a name before its role was created stay ghost
+	 *	 attempts until then (SPEC 12).
 	 * Hence only the entries whose flag is false are looked up (no repeated
-	 * negative syscache lookups for the ghosts).  Names copied under a
-	 * shared lock, looked up outside it (no catalog access under an LWLock),
-	 * the flag written back below under the exclusive lock, to the same
-	 * incarnation of the entry only (generation) and only if it may still
-	 * become a ghost (its state may have changed meanwhile).
+	 * negative syscache lookups for the ghosts).  They are counted, then
+	 * copied (name, incarnation, update counter) under a shared lock, into
+	 * as many rows as counted (plus a margin; candidates beyond it wait for
+	 * the next cycle); looked up outside it (no catalog access under an
+	 * LWLock); the flag is written back below under the exclusive lock, to
+	 * the same incarnation of the entry only (generation), not updated by
+	 * the hook since the copy (update_seq: a role created and authenticated
+	 * meanwhile leaves the flag false and the generation unchanged), and
+	 * only if it may still become a ghost (its state may have changed).
 	 */
-	mrows = (pppMissingRow *) ppp_alloc_hash_copy(CurrentMemoryContext,
-												  sizeof(pppMissingRow),
-												  &maxmrows, LW_SHARED);
+	LWLockAcquire(ppp_shared->lock, LW_SHARED);
 	hash_seq_init(&seq, ppp_role_hash);
 	while ((entry = (pppRoleEntry *) hash_seq_search(&seq)) != NULL)
-	{
-		if (!ppp_entry_may_become_ghost(entry, now))
-			continue;
-		if (nmrows >= maxmrows)
-		{
-			hash_seq_term(&seq);
-			break;
-		}
-		strlcpy(mrows[nmrows].rolename, entry->key.rolename, NAMEDATALEN);
-		mrows[nmrows].generation = entry->generation;
-		nmrows++;
-	}
+		if (ppp_entry_may_become_ghost(entry))
+			ncandidates++;
 	LWLockRelease(ppp_shared->lock);
 
-	/* keep only the rows whose flag changes (role not found) */
-	for (i = 0; i < nmrows; i++)
+	if (ncandidates > 0)
 	{
-		if (SearchSysCacheExists1(AUTHNAME, CStringGetDatum(mrows[i].rolename)))
-			continue;
-		if (nchanged != i)
-			mrows[nchanged] = mrows[i];
-		nchanged++;
+		maxmrows = ncandidates + PPP_HASH_COPY_MARGIN;
+		mrows = (pppMissingRow *) palloc(sizeof(pppMissingRow) * maxmrows);
+
+		LWLockAcquire(ppp_shared->lock, LW_SHARED);
+		hash_seq_init(&seq, ppp_role_hash);
+		while ((entry = (pppRoleEntry *) hash_seq_search(&seq)) != NULL)
+		{
+			if (!ppp_entry_may_become_ghost(entry))
+				continue;
+			if (nmrows >= maxmrows)
+			{
+				hash_seq_term(&seq);
+				break;
+			}
+			strlcpy(mrows[nmrows].rolename, entry->key.rolename, NAMEDATALEN);
+			mrows[nmrows].generation = entry->generation;
+			mrows[nmrows].update_seq = entry->update_seq;
+			mrows[nmrows].gone = false;
+			nmrows++;
+		}
+		LWLockRelease(ppp_shared->lock);
+
+		/* mark the rows whose flag changes (role not found) */
+		for (i = 0; i < nmrows; i++)
+		{
+			mrows[i].gone =
+				!SearchSysCacheExists1(AUTHNAME, CStringGetDatum(mrows[i].rolename));
+			if (mrows[i].gone)
+				nchanged++;
+		}
 	}
 
 	LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
-	for (i = 0; i < nchanged; i++)
+	for (i = 0; nchanged > 0 && i < nmrows; i++)
 	{
 		pppRoleKey	key;
 
+		if (!mrows[i].gone)
+			continue;
 		ppp_make_key(&key, mrows[i].rolename);
 		entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key, HASH_FIND,
 											 NULL);
 		if (entry != NULL && entry->generation == mrows[i].generation &&
-			ppp_entry_may_become_ghost(entry, now))
+			entry->update_seq == mrows[i].update_seq &&
+			ppp_entry_may_become_ghost(entry))
 		{
 			entry->role_missing = true;
 			ghosts++;
 		}
 	}
-	pfree(mrows);
+	if (mrows != NULL)
+		pfree(mrows);
 
 	hash_seq_init(&seq, ppp_role_hash);
 	while ((entry = (pppRoleEntry *) hash_seq_search(&seq)) != NULL)
@@ -1273,7 +1303,10 @@ ppp_sync_reload(void)
 		}
 		entry->reload_lock_seen = true;
 		if (locks[i].role_exists)
+		{
 			entry->role_missing = false;
+			entry->update_seq++;
+		}
 
 		/* changed by shmem_lock_role() / shmem_unlock_role() since our snapshot */
 		if (entry->lock_inflight > 0 || entry->lock_seq > seq_snap)
@@ -1313,6 +1346,7 @@ ppp_sync_reload(void)
 		entry->from_profile = true;
 		entry->reload_profile_seen = true;
 		entry->role_missing = false;
+		entry->update_seq++;
 	}
 
 	hash_seq_init(&seq, ppp_role_hash);

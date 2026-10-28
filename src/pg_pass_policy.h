@@ -54,6 +54,18 @@ extern bool  ppp_enforce_database;
 #define PPP_WORKER_MISSING_GRACE_SECS	10
 #define PPP_WORKER_MISSING_LOG_SECS		60
 
+/*
+ * Rescue admissions (superuser of pg_pass_policy.rescue_roles authenticated
+ * by peer during the start-up window): one LOG per role and per
+ * PPP_RESCUE_LOG_SECS, the next one telling how many admissions of that
+ * role were not logged meanwhile.  The roles are tracked in a fixed table
+ * of PPP_RESCUE_LOG_SLOTS slots; when it is full, the admissions of the
+ * roles it does not hold are logged without any limit (a role is never
+ * hidden).
+ */
+#define PPP_RESCUE_LOG_SECS		60
+#define PPP_RESCUE_LOG_SLOTS	16
+
 /* ---- Mémoire partagée (remplie par le worker, lue par le hook auth) ------- */
 typedef struct pppRoleKey
 {
@@ -149,6 +161,18 @@ typedef struct pppRoleEntry
 	/* set by the authentication hook: user name not found in pg_authid */
 	bool		role_missing;
 
+	/*
+	 * Incremented at every update of the entry by the authentication hook
+	 * (success or counted failure, whatever the new value of role_missing),
+	 * and wherever role_missing is cleared (lock_role(), reload).  The
+	 * worker copies it with the name before its catalog lookup, made
+	 * outside the LWLock, and turns the entry into a ghost only if it has
+	 * not changed when it writes the flag back (ppp_sync_cleanup): a role
+	 * created and authenticated in between leaves the flag false and the
+	 * generation unchanged, this counter tells it.
+	 */
+	uint32		update_seq;
+
 	/* scratch marks of ppp_sync_reload() */
 	bool		reload_profile_seen;
 	bool		reload_lock_seen;
@@ -222,6 +246,14 @@ typedef struct pppEviction
 										 * an aborted lock can put it back */
 } pppEviction;
 
+/* one role of ppp_shared->rescue_log (see PPP_RESCUE_LOG_SLOTS) */
+typedef struct pppRescueLogSlot
+{
+	char		rolename[NAMEDATALEN];	/* empty: free slot */
+	TimestampTz logged_at;			/* last LOG of that role */
+	int32		suppressed;			/* admissions not logged since */
+} pppRescueLogSlot;
+
 typedef struct pppSharedState
 {
 	LWLock	   *lock;
@@ -259,12 +291,14 @@ typedef struct pppSharedState
 	 * was never started (max_worker_processes exhausted) or cannot connect
 	 * (pg_pass_policy.database does not exist).  A rescue admission
 	 * (superuser of pg_pass_policy.rescue_roles authenticated by peer during
-	 * the window) is logged every time, without such a limit.
+	 * the window) is logged once per role and per PPP_RESCUE_LOG_SECS
+	 * (rescue_log, see PPP_RESCUE_LOG_SLOTS).
 	 */
 	bool		locks_loaded;
 	TimestampTz not_loaded_logged_at;
 	TimestampTz shmem_init_at;
 	TimestampTz worker_missing_logged_at;
+	pppRescueLogSlot rescue_log[PPP_RESCUE_LOG_SLOTS];
 
 	/*
 	 * Last time an eviction scan in PPP_ENTER_COUNT mode found nothing to

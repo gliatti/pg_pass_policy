@@ -60,3 +60,8 @@ DROP FUNCTION ppp_test.parity(text, text);
 SELECT pass_policy.unassign_profile('regress_parity');
 SELECT pass_policy.drop_profile('p_parity');
 DROP ROLE regress_parity;
+
+-- Secrets de ce test vérifiés puis retirés (vérification 10) : les tests
+-- suivants ne dépendent pas des lignes par1..par4
+SELECT ppp_test.leaks();
+DELETE FROM ppp_test.secrets WHERE label IN ('par1', 'par2', 'par3', 'par4');

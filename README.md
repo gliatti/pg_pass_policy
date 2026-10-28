@@ -26,9 +26,12 @@
 >   est verrouillé dans `role_state`** : ce verrou n'est pas encore connu) ;
 >   n'y listez qu'un compte d'administration lié à un compte système, avec
 >   une ligne `local … peer` dans `pg_hba.conf`. `trust` n'y donne pas accès
->   et la liste est vide par défaut : le refus `57P03` porte un HINT qui
->   rappelle cette voie (« … through peer authentication as a superuser
->   listed in pg_pass_policy.rescue_roles », même texte pour tout client).
+>   et la liste est vide par défaut. Le refus `57P03` reste générique, sans
+>   HINT (le client n'est pas authentifié) : les voies d'accès pendant la
+>   fenêtre (`exempt_roles`, `rescue_roles` en `peer`, tout superutilisateur
+>   si aucun worker n'a démarré 10 s après le démarrage) sont rappelées dans
+>   le log du serveur (HINT du LOG « refusing connections until the
+>   background worker has loaded the lock state »).
 >   Un rôle exempté ne peut être ni expiré ni verrouillé par l'extension.
 
 Extension PostgreSQL (C + SQL) de gestion du cycle de vie des mots de passe des
@@ -166,7 +169,10 @@ refuserait avec ce code) : même évaluation que le hook, `min_age` compris
 aussitôt, contrôlé pour les autres, vérificateur pré-haché compris). Seule
 exception : elle ignore `superuser_bypass` (un superutilisateur qui vérifie
 un mot de passe pour autrui ne doit pas le croire conforme ; son propre
-`ALTER ROLE` passerait). Hors de la base `pg_pass_policy.database`,
+`ALTER ROLE` passerait). Elle répond donc pour l'appelant : un
+superutilisateur qui prépare un mot de passe que le rôle posera lui-même
+doit tenir compte de `min_age`, qu'elle ne contrôle pas pour lui
+(`PPP-030` au changement par le rôle s'il est trop proche du précédent). Hors de la base `pg_pass_policy.database`,
 où la politique ne s'applique pas, `check_password` lève `PPP-003` et
 `generate_password` aussi avec `enforce_database = on` (sinon `WARNING`,
 mot de passe produit).
@@ -280,11 +286,12 @@ log l'indique (au plus une ligne par seconde, plus le message `worker_pid =
 `pass_policy` n'appartient plus à un superutilisateur) ; le worker réessaie
 toutes les 5 secondes, y compris sur un standby, et
 `pass_policy.worker_status()` montre `locks_loaded` à faux. Le client, lui,
-ne reçoit que le `57P03`, sans détail sur l'état interne, avec un HINT
-identique pour tous (« If the condition persists, an administrator can
-connect through peer authentication as a superuser listed in
-pg_pass_policy.rescue_roles. ») : il ne dit rien du rôle ni du contenu de
-la liste. Les rôles de
+ne reçoit que le `57P03`, sans détail sur l'état interne et sans HINT : la
+confidentialité vis-à-vis d'un client non authentifié l'emporte sur
+l'indication. Le log du serveur, lui, donne l'information complète (HINT du
+LOG « refusing connections … » : `exempt_roles`, superutilisateurs de
+`rescue_roles` en `peer`, tout superutilisateur une fois le worker absent
+10 s après l'initialisation de la mémoire partagée). Les rôles de
 `pg_pass_policy.exempt_roles` passent toujours : c'est le filet de sécurité
 de l'administrateur. Un **superutilisateur** listé dans
 `pg_pass_policy.rescue_roles` (vide par défaut : pas d'accès de secours) et
@@ -295,8 +302,12 @@ voie d'administration hors `exempt_roles`. Il est refusé « locked » si un
 verrou est déjà en mémoire partagée ; un verrou de `role_state` pas encore
 chargé, lui, n'est pas connu du hook et ne l'arrête pas : d'où la liste
 explicite et la seule méthode `peer`, qui lie le rôle à un compte système.
-Le log garde la trace de chaque admission (LOG « superuser "…" admitted by
-peer authentication … », une ligne par connexion, avec le nom du rôle). Un superutilisateur non
+Le log garde la trace des admissions (LOG « superuser "…" admitted by
+peer authentication … », avec le nom du rôle) : une ligne par rôle et par
+minute, la suivante donnant le nombre d'admissions de ce rôle non
+journalisées entre-temps (« N earlier admissions of this role were not
+logged ») ; au-delà de 16 rôles suivis à la fois, chaque admission est
+journalisée, sans limite. Un superutilisateur non
 listé, en `trust` (même sur socket Unix) ou dont le contrôle `peer` échoue,
 un rôle ordinaire (même listé) reçoivent le `57P03`. Une connexion de
 réplication d'un rôle non exempté est concernée de la même façon.

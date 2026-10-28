@@ -113,3 +113,12 @@ SELECT pass_policy.drop_profile('p_parity');
 (1 row)
 
 DROP ROLE regress_parity;
+-- Secrets de ce test vérifiés puis retirés (vérification 10) : les tests
+-- suivants ne dépendent pas des lignes par1..par4
+SELECT ppp_test.leaks();
+ leaks 
+-------
+     0
+(1 row)
+
+DELETE FROM ppp_test.secrets WHERE label IN ('par1', 'par2', 'par3', 'par4');

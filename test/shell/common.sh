@@ -10,6 +10,8 @@
 #   psql_as ROLE PWD SQL       connexion réelle en SCRAM avec PGPASSWORD=PWD ;
 #                              stdout+stderr sur la sortie, code retour de psql
 #   wait_for SECS SQL          attend que SQL renvoie 't' (sondage toutes les 0,5 s)
+#   wait_until SECS CMD …      relance la commande CMD jusqu'à ce qu'elle réussisse
+#                              (sondage toutes les 0,2 s), au plus SECS secondes
 #   ok / fail / check_eq / check_contains / check_not_contains / ppp_finish
 #
 # Variables : PG_CONFIG (défaut pg_config), PPP_KEEP_TMP=1 pour conserver le
@@ -199,6 +201,21 @@ wait_for() {
 			return 0
 		fi
 		sleep 0.5
+	done
+	return 1
+}
+
+# wait_until TIMEOUT_SECONDES COMMANDE [ARG …] : relance COMMANDE (fonction
+# ou programme) jusqu'à ce qu'elle réussisse ; code 1 au-delà du délai
+wait_until() {
+	local timeout=$1 deadline
+	shift
+	deadline=$((SECONDS + timeout))
+	while [ "$SECONDS" -lt "$deadline" ]; do
+		if "$@"; then
+			return 0
+		fi
+		sleep 0.2
 	done
 	return 1
 }

@@ -107,6 +107,7 @@ ppp_init_entry(pppRoleEntry *entry)
 	entry->lock_seq = 0;
 	entry->generation = ++ppp_shared->entry_generation;
 	entry->role_missing = false;
+	entry->update_seq = 0;
 	entry->reload_profile_seen = false;
 	entry->reload_lock_seen = false;
 }
@@ -409,8 +410,17 @@ ppp_enter_role(const char *rolename, pppEnterMode mode, TimestampTz now,
 				else if (examined_at_end >= 0)
 					ppp_shared->evict_fruitless_wrapped = true;
 
-				/* !scanning: this scan alone went round the whole hash */
-				toured = !scanning ||
+				/*
+				 * !scanning, or every entry examined (limit = nentries,
+				 * stopped by the limit just before its start bucket): this
+				 * scan alone went round the whole hash.  Without the second
+				 * test, a scan whose start bucket follows empty buckets
+				 * stops after the last entry before them (next_bucket <
+				 * evict_fruitless_from), the next one starts there and stops
+				 * at the same place: the series never completed, the LOG
+				 * and the one-second pause never came.
+				 */
+				toured = !scanning || examined >= nentries ||
 					(ppp_shared->evict_fruitless_wrapped &&
 					 next_bucket >= ppp_shared->evict_fruitless_from);
 				if (toured)
@@ -661,6 +671,61 @@ ppp_auth_is_peer(const Port *port)
 }
 
 /*
+ * Rescue admission of a role (see PPP_RESCUE_LOG_SLOTS): true when it must
+ * be logged, *suppressed then receiving the number of admissions of that
+ * role not logged since its previous LOG.  A role gets a slot at its first
+ * admission: a free one, or the slot of another role whose period has
+ * elapsed with nothing left to report.  When none is left, the admission is
+ * logged anyway (no slot, no limit): a role is never hidden.  Caller holds
+ * ppp_shared->lock exclusively.
+ */
+static bool
+ppp_rescue_log_due(const char *rolename, TimestampTz now, int32 *suppressed)
+{
+	int			i;
+	int			free_slot = -1;
+	pppRescueLogSlot *slot;
+
+	*suppressed = 0;
+	for (i = 0; i < PPP_RESCUE_LOG_SLOTS; i++)
+	{
+		slot = &ppp_shared->rescue_log[i];
+		if (slot->rolename[0] == '\0')
+		{
+			if (free_slot < 0)
+				free_slot = i;
+			continue;
+		}
+		if (strncmp(slot->rolename, rolename, NAMEDATALEN) == 0)
+		{
+			if (!TimestampDifferenceExceeds(slot->logged_at, now,
+											PPP_RESCUE_LOG_SECS * 1000))
+			{
+				if (slot->suppressed < PG_INT32_MAX)
+					slot->suppressed++;
+				return false;
+			}
+			*suppressed = slot->suppressed;
+			slot->suppressed = 0;
+			slot->logged_at = now;
+			return true;
+		}
+		if (free_slot < 0 && slot->suppressed == 0 &&
+			TimestampDifferenceExceeds(slot->logged_at, now,
+									   PPP_RESCUE_LOG_SECS * 1000))
+			free_slot = i;
+	}
+	if (free_slot >= 0)
+	{
+		slot = &ppp_shared->rescue_log[free_slot];
+		strlcpy(slot->rolename, rolename, NAMEDATALEN);
+		slot->logged_at = now;
+		slot->suppressed = 0;
+	}
+	return true;
+}
+
+/*
  * ClientAuthentication_hook: see SPEC 6.3.
  *
  * - a locked role is refused with FATAL whatever the authentication result
@@ -707,6 +772,7 @@ ppp_client_auth_hook(Port *port, int status)
 	bool		log_not_loaded = false;
 	bool		log_worker_missing = false;
 	bool		log_rescue = false;
+	int32		rescue_suppressed = 0;
 	bool		check_window;
 	bool		worker_missing = false;
 	bool		local_admin = false;
@@ -864,6 +930,9 @@ ppp_client_auth_hook(Port *port, int status)
 			entry->role_missing = role_missing;
 		else if (status == STATUS_OK)
 			entry->role_missing = false;
+		/* tells ppp_sync_cleanup() that its catalog lookup may be stale */
+		if (count_failure || status == STATUS_OK)
+			entry->update_seq++;
 
 		if (!refuse)
 		{
@@ -927,12 +996,14 @@ ppp_client_auth_hook(Port *port, int status)
 	else if (local_admin && !refuse)
 	{
 		/*
-		 * Every rescue admission is logged, with the role name: the path is
-		 * open to the superusers of rescue_roles authenticated by peer
-		 * only, so the messages cannot be flooded by an outsider, and a
-		 * limit would hide admissions from the audit of the server log.
+		 * Rescue admissions are logged with the role name, once per role and
+		 * per PPP_RESCUE_LOG_SECS: the next LOG of that role tells how many
+		 * were not logged meanwhile, so that a script connecting in a loop
+		 * does not flood the server log while no role is ever hidden (a
+		 * limit for the whole instance would hide the other roles; when the
+		 * table of roles is full, the admission is logged anyway).
 		 */
-		log_rescue = true;
+		log_rescue = ppp_rescue_log_due(key.rolename, now, &rescue_suppressed);
 	}
 
 	LWLockRelease(ppp_shared->lock);
@@ -951,11 +1022,17 @@ ppp_client_auth_hook(Port *port, int status)
 				 errdetail("No pg_pass_policy background worker is running %d seconds after the shared memory initialisation; roles not listed in pg_pass_policy.exempt_roles are refused meanwhile, whatever the authentication method (at most one message per minute).",
 						   PPP_WORKER_MISSING_GRACE_SECS),
 				 errhint("Check max_worker_processes and pg_pass_policy.database; superusers and roles listed in pg_pass_policy.exempt_roles can still connect.")));
-	if (log_rescue)
+	if (log_rescue && rescue_suppressed > 0)
 		ereport(LOG,
 				(errmsg(PPP_LOG_PREFIX "superuser \"%s\" admitted by peer authentication before the lock state is loaded",
 						rolename),
-				 errdetail("The role is listed in pg_pass_policy.rescue_roles; a lock it may hold in role_state is not known yet.")));
+				 errdetail("The role is listed in pg_pass_policy.rescue_roles; a lock it may hold in role_state is not known yet. %d earlier admissions of this role were not logged (at most one message per role per minute).",
+						   (int) rescue_suppressed)));
+	else if (log_rescue)
+		ereport(LOG,
+				(errmsg(PPP_LOG_PREFIX "superuser \"%s\" admitted by peer authentication before the lock state is loaded",
+						rolename),
+				 errdetail("The role is listed in pg_pass_policy.rescue_roles; a lock it may hold in role_state is not known yet (at most one message per role per minute).")));
 	if (hash_full)
 		ereport(LOG,
 				(errmsg(PPP_LOG_PREFIX "cannot track authentication failures of role \"%s\": too many tracked roles",
@@ -998,21 +1075,19 @@ ppp_client_auth_hook(Port *port, int status)
 			ereport(LOG,
 					(errmsg(PPP_LOG_PREFIX "refusing connections until the background worker has loaded the lock state"),
 					 errdetail("Roles not listed in pg_pass_policy.exempt_roles are refused, whatever the authentication method, until the persisted locks are re-injected from role_state (at most one message per second)."),
-					 errhint("Check that the pg_pass_policy background worker is running (pass_policy.worker_status()); roles listed in pg_pass_policy.exempt_roles can still connect, superusers listed in pg_pass_policy.rescue_roles through peer, and any superuser once no worker has started for %d seconds.",
+					 errhint("Check that the pg_pass_policy background worker is running (pass_policy.worker_status()). Meanwhile, roles listed in pg_pass_policy.exempt_roles can connect, superusers listed in pg_pass_policy.rescue_roles through peer authentication only, and any superuser once no worker has published its PID %d seconds after the shared memory initialisation.",
 							 PPP_WORKER_MISSING_GRACE_SECS)));
 		/*
-		 * The hint is the same for every client, whatever the role, its
-		 * attributes and the contents of rescue_roles: it names the
-		 * documented emergency path and tells nothing about the role or
-		 * the configuration (trust is not accepted and rescue_roles is
-		 * empty by default, so an administrator locked out needs to know
-		 * where to look).
+		 * Generic refusal, without any hint: the client is not authenticated
+		 * and must not learn anything about the configuration, the
+		 * emergency paths included (rescue_roles, exempt_roles, superusers
+		 * when the worker is missing).  The administrator finds them in the
+		 * hint of the LOG above and in the documentation (SPEC 12).
 		 */
 		ereport(FATAL,
 				(errcode(ERRCODE_CANNOT_CONNECT_NOW),
 				 errmsg(PPP_LOG_PREFIX "lock state not loaded yet, retry"),
-				 errdetail("The server has just started; retry in a few seconds."),
-				 errhint("If the condition persists, an administrator can connect through peer authentication as a superuser listed in pg_pass_policy.rescue_roles.")));
+				 errdetail("The server has just started; retry in a few seconds.")));
 	}
 }
 
@@ -1225,6 +1300,7 @@ ppp_apply_lock_ops(void)
 		entry->lock_from_state = !in_recovery;
 		entry->lock_inflight++;
 		entry->role_missing = false;
+		entry->update_seq++;
 		op->applied = true;
 	}
 
