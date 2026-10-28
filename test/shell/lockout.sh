@@ -621,6 +621,47 @@ out=$(psql_as regress_ren2 "$GOOD" "SELECT current_user") || true
 check_eq "renommage : le nouveau nom repart de zéro (connexion acceptée)" "regress_ren2" "$out"
 psql_admin "DROP ROLE regress_ren2" >/dev/null
 
+# --- (vérification 3) verrou automatique, DROP ROLE puis CREATE ROLE sous le
+# même nom avant le passage du worker (SPEC §12) : le hook mémorise l'OID du
+# rôle verrouillé, le worker ne recopie pas le verrou dans role_state pour le
+# nouveau rôle (autre OID) ; l'audit dit role_missing et role_recreated, et
+# l'entrée devient fantôme (verrou en mémoire jusqu'à son expiration, 5 s).
+# DROP et CREATE dans une seule transaction : le worker ne peut pas passer
+# entre les deux (il verrait seulement un rôle supprimé, cas déjà couvert).
+psql_admin "CREATE ROLE regress_rec LOGIN PASSWORD '$GOOD'" >/dev/null
+psql_admin "SELECT pass_policy.assign_profile('regress_rec', 'p_lock')" >/dev/null
+reload_sync || true
+for i in 1 2 3 4 5; do psql_as regress_rec "$BAD" >/dev/null || true; done
+out=$(psql_as regress_rec "$GOOD") || true
+check_contains "regress_rec verrouillé automatiquement (5 échecs)" "is locked by pg_pass_policy" "$out"
+out=$(psql_admin "SELECT count(*) FROM pass_policy.audit_log WHERE event_type = 'role_locked' AND role_name = 'regress_rec'")
+check_eq "rôle recréé : verrou automatique pas encore audité" "0" "$out"
+# autre mot de passe : la ligne d'historique sans OID du CREATE ROLE de
+# l'ancien rôle, pas encore rattachée (pas de run_maintenance()), vaut pour
+# le nom (SPEC §11, C3)
+GOOD_REC='Lockout-Recreated#2024'
+psql_admin "DROP ROLE regress_rec; CREATE ROLE regress_rec LOGIN PASSWORD '$GOOD_REC'" >/dev/null
+reload_sync || fail "pas de tour du worker après DROP ROLE / CREATE ROLE"
+out=$(psql_admin "SELECT details->>'role_missing', details->>'role_recreated', coalesce(details->>'renamed_to', 'null')
+                    FROM pass_policy.audit_log WHERE event_type = 'role_locked' AND role_name = 'regress_rec'")
+check_eq "rôle recréé : role_locked audité avec role_missing et role_recreated" "true|true|null" "$out"
+out=$(psql_admin "SELECT count(*) FROM pass_policy.role_state s JOIN pg_roles r ON r.oid = s.role_oid
+                   WHERE r.rolname = 'regress_rec' AND s.locked_until IS NOT NULL")
+check_eq "rôle recréé : le verrou de l'ancien rôle n'est pas recopié dans role_state" "0" "$out"
+reload_sync || true
+out=$(psql_admin "SELECT count(*) FROM pass_policy.audit_log WHERE event_type = 'role_locked' AND role_name = 'regress_rec'")
+check_eq "rôle recréé : acquitté, audité une seule fois" "1" "$out"
+sleep 6
+reload_sync || true
+out=$(psql_admin "SELECT count(*) FROM pass_policy.failed_attempts() WHERE role_name = 'regress_rec' AND locked_until IS NOT NULL")
+check_eq "rôle recréé : plus de verrou en mémoire partagée après expiration" "0" "$out"
+out=$(psql_admin "SELECT count(*) FROM pass_policy.role_state s JOIN pg_roles r ON r.oid = s.role_oid
+                   WHERE r.rolname = 'regress_rec' AND s.locked_until IS NOT NULL")
+check_eq "rôle recréé : toujours aucun verrou dans role_state" "0" "$out"
+out=$(psql_as regress_rec "$GOOD_REC" "SELECT current_user") || true
+check_eq "rôle recréé : le nouveau rôle se connecte" "regress_rec" "$out"
+psql_admin "DROP ROLE regress_rec" >/dev/null
+
 # Fenêtre tenue ouverte de façon déterministe : role_state renommée, le
 # rechargement du worker échoue (WARNING) et la fenêtre reste fermée.
 # worker_interval reste à 0 : le rechargement doit être retenté sans SIGHUP

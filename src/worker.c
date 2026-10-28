@@ -57,6 +57,7 @@
 
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "catalog/pg_authid.h"
 #include "catalog/pg_type.h"
 #include "commands/extension.h"
 #include "executor/spi.h"
@@ -122,10 +123,17 @@ typedef struct pppPendingRow
 	uint64		lock_seq;		/* entry->lock_seq when copied */
 	bool		state_written;	/* role_state upserted with locked_until */
 	bool		role_missing;	/* non-existent user name (authentication hook) */
-	bool		role_gone;		/* existing name when locked, no longer in
-								 * pg_roles (renamed or dropped since) */
-	bool		gone_confirmed; /* role_gone, and still no such role after
-								 * the commit (ppp_recheck_gone_roles) */
+	Oid			role_oid;		/* OID of the role when it was locked
+								 * (entry->audit_role_oid, InvalidOid =
+								 * unknown: the name alone is compared) */
+	bool		role_gone;		/* that role no longer bears the name
+								 * (renamed or dropped since, the name
+								 * possibly taken by another role) */
+	bool		role_recreated; /* role_gone, and the name now belongs to
+								 * another role */
+	bool		gone_confirmed; /* role_gone, and the name still does not
+								 * lead to that role after the commit
+								 * (ppp_recheck_gone_roles) */
 } pppPendingRow;
 
 /* lockout parameters of an existing role, read from the profiles */
@@ -186,6 +194,9 @@ static TimestampTz ppp_full_cycle_at = 0;
 static pppPendingRow *ppp_pending_rows = NULL;
 static int	ppp_pending_nrows = 0;
 
+/* some row of ppp_pending_rows has role_gone (set by ppp_sync_pending) */
+static bool ppp_pending_any_gone = false;
+
 
 /*
  * Register the worker.  Called from _PG_init (only when loaded through
@@ -229,9 +240,15 @@ ppp_worker_on_exit(int code, Datum arg)
 /*
  * Run a cycle step inside its own transaction; errors are turned into a
  * WARNING.  Returns true on success.
+ *
+ * pure: the step is a mere check (ppp_recheck_gone_roles) that must not
+ * change the state of the cycle: when the extension is not installed, the
+ * reload request, the "synchronise first" step and the start-up window are
+ * left as they are (only a real cycle step may conclude that there is
+ * nothing to reload).
  */
 static bool
-ppp_run_in_xact(const char *what, void (*step) (void))
+ppp_run_in_xact(const char *what, void (*step) (void), bool pure)
 {
 	MemoryContext oldcxt = CurrentMemoryContext;
 	volatile bool ok = true;
@@ -268,7 +285,7 @@ ppp_run_in_xact(const char *what, void (*step) (void))
 						 errdetail_internal("%s", ppp_untrusted_detail(nspowner)),
 						 errhint("A superuser must own schema \"" PPP_SCHEMA "\" (ALTER SCHEMA " PPP_SCHEMA " OWNER TO a superuser).  Until the lock state is loaded, roles authenticating with a password or a secret are refused (at most one message per minute).")));
 		}
-		else
+		else if (!pure)
 		{
 			elog(DEBUG1, PPP_LOG_PREFIX "extension not installed in database \"%s\", nothing to do",
 				 ppp_database);
@@ -364,6 +381,7 @@ ppp_sync_pending(void)
 	TimestampTz ghost_last = 0;
 
 	Assert(ppp_pending_rows == NULL);
+	ppp_pending_any_gone = false;
 	/* read only: a shared lock is enough (the acknowledgement is separate) */
 	rows = (pppPendingRow *) ppp_alloc_hash_copy(ppp_worker_cxt,
 												 sizeof(pppPendingRow),
@@ -404,7 +422,9 @@ ppp_sync_pending(void)
 		rows[nrows].lock_seq = entry->lock_seq;
 		rows[nrows].state_written = false;
 		rows[nrows].role_missing = entry->role_missing;
+		rows[nrows].role_oid = entry->audit_role_oid;
 		rows[nrows].role_gone = false;
+		rows[nrows].role_recreated = false;
 		rows[nrows].gone_confirmed = false;
 		nrows++;
 	}
@@ -456,12 +476,12 @@ ppp_sync_pending(void)
 
 		if (r->lock_pending_audit && r->audit_locked_until != 0)
 		{
-			Oid			argtypes[8] = {TEXTOID, TIMESTAMPTZOID, INT4OID, BOOLOID,
-				INT8OID, BOOLOID, TEXTOID, BOOLOID};
-			Datum		values[8];
-			char		nulls[8] = {' ', ' ', ' ', ' ', ' ', ' ', 'n', ' '};
-			Oid			lookup_type[1] = {TEXTOID};
-			Datum		lookup_value[1];
+			Oid			argtypes[9] = {TEXTOID, TIMESTAMPTZOID, INT4OID, BOOLOID,
+				INT8OID, BOOLOID, TEXTOID, BOOLOID, BOOLOID};
+			Datum		values[9];
+			char		nulls[9] = {' ', ' ', ' ', ' ', ' ', ' ', 'n', ' ', ' '};
+			Oid			lookup_types[2] = {TEXTOID, OIDOID};
+			Datum		lookup_values[2];
 			bool		isnull;
 
 			/*
@@ -482,31 +502,44 @@ ppp_sync_pending(void)
 
 			/*
 			 * The entry is keyed by the user name, role_state by the OID.
-			 * The role may have been renamed (ALTER ROLE ... RENAME) or
-			 * dropped since the lock: its role_state row cannot be written
-			 * then, and the lock stays with the old name, which no longer
-			 * logs in (SPEC 12: the new name starts afresh).  The audit
-			 * row says so (role_missing, and role_renamed / renamed_to when
-			 * role_state or role_profile still carry the old name of an
-			 * existing OID) instead of being acknowledged as if the lock had
-			 * been persisted; the entry becomes a ghost at the
+			 * The role locked (r->role_oid, recorded by the authentication
+			 * hook) may have been renamed (ALTER ROLE ... RENAME) or dropped
+			 * since, and another role may bear the name now (DROP ROLE then
+			 * CREATE ROLE): its role_state row cannot be written then, and
+			 * the lock stays with the old name (SPEC 12: neither the new
+			 * name of the role nor a new role under the old name inherits
+			 * it).  The audit row says so (role_missing; role_renamed /
+			 * renamed_to when the new name of the role is known: by its OID,
+			 * or, OID unknown, when role_state or role_profile still carry
+			 * the old name of an existing OID; role_recreated when another
+			 * role has the name) instead of being acknowledged as if the
+			 * lock had been persisted; the entry becomes a ghost at the
 			 * acknowledgement (ppp_ack_pending).
 			 */
 			values[6] = (Datum) 0;
-			lookup_value[0] = CStringGetTextDatum(r->rolename);
+			lookup_values[0] = CStringGetTextDatum(r->rolename);
+			lookup_values[1] = ObjectIdGetDatum(r->role_oid);
 			ret = SPI_execute_with_args(
-										"SELECT g.found, CASE WHEN NOT g.found THEN "
-										"(SELECT r.rolname::pg_catalog.text FROM ("
+										"SELECT g.found, CASE WHEN g.found THEN NULL "
+										"WHEN $2 OPERATOR(pg_catalog.<>) 0::pg_catalog.oid THEN "
+										"(SELECT r.rolname::pg_catalog.text FROM pg_catalog.pg_roles r "
+										"WHERE r.oid OPERATOR(pg_catalog.=) $2) "
+										"ELSE (SELECT r.rolname::pg_catalog.text FROM ("
 										"SELECT s.role_oid FROM pass_policy.role_state s "
 										"WHERE s.role_name OPERATOR(pg_catalog.=) $1 "
 										"UNION SELECT rp.role_oid FROM pass_policy.role_profile rp "
 										"WHERE rp.role_name OPERATOR(pg_catalog.=) $1) o "
 										"JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) o.role_oid "
-										"ORDER BY 1 LIMIT 1) END "
-										"FROM (SELECT EXISTS (SELECT FROM pg_catalog.pg_roles r "
-										"WHERE r.rolname OPERATOR(pg_catalog.=) $1) AS found "
+										"ORDER BY 1 LIMIT 1) END, "
+										"g.taken AND NOT g.found "
+										"FROM (SELECT n.oid IS NOT NULL AND "
+										"($2 OPERATOR(pg_catalog.=) 0::pg_catalog.oid "
+										"OR n.oid OPERATOR(pg_catalog.=) $2) AS found, "
+										"n.oid IS NOT NULL AS taken "
+										"FROM (SELECT (SELECT r.oid FROM pg_catalog.pg_roles r "
+										"WHERE r.rolname OPERATOR(pg_catalog.=) $1) AS oid) n "
 										"OFFSET 0) g",
-										1, lookup_type, lookup_value, NULL, false, 1);
+										2, lookup_types, lookup_values, NULL, false, 1);
 			if (ret != SPI_OK_SELECT || SPI_processed != 1)
 				elog(ERROR, "role lookup of \"%s\" returned SPI code %d", r->rolename, ret);
 			r->role_gone = !DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
@@ -522,6 +555,10 @@ ppp_sync_pending(void)
 					values[6] = CStringGetTextDatum(new_name);
 					nulls[6] = ' ';
 				}
+				r->role_recreated = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+															   SPI_tuptable->tupdesc,
+															   3, &isnull));
+				ppp_pending_any_gone = true;
 			}
 
 			values[0] = CStringGetTextDatum(r->rolename);
@@ -531,6 +568,7 @@ ppp_sync_pending(void)
 			values[4] = Int64GetDatum((int64) r->lost_episodes);
 			values[5] = BoolGetDatum(replaced);
 			values[7] = BoolGetDatum(r->role_gone);
+			values[8] = BoolGetDatum(r->role_recreated);
 
 			/*
 			 * lost_episodes: earlier automatic locks of the role whose own
@@ -551,13 +589,16 @@ ppp_sync_pending(void)
 										"OPERATOR(pg_catalog.||) CASE WHEN $5 OPERATOR(pg_catalog.>) 0 THEN "
 										"pg_catalog.jsonb_build_object('lost_episodes', $5) "
 										"ELSE '{}'::pg_catalog.jsonb END "
-										"OPERATOR(pg_catalog.||) CASE WHEN $7 IS NOT NULL THEN "
-										"pg_catalog.jsonb_build_object('role_missing', true, "
-										"'role_renamed', true, 'renamed_to', $7) "
-										"WHEN $8 THEN "
+										"OPERATOR(pg_catalog.||) CASE WHEN $8 THEN "
 										"pg_catalog.jsonb_build_object('role_missing', true) "
+										"ELSE '{}'::pg_catalog.jsonb END "
+										"OPERATOR(pg_catalog.||) CASE WHEN $7 IS NOT NULL THEN "
+										"pg_catalog.jsonb_build_object('role_renamed', true, 'renamed_to', $7) "
+										"ELSE '{}'::pg_catalog.jsonb END "
+										"OPERATOR(pg_catalog.||) CASE WHEN $9 THEN "
+										"pg_catalog.jsonb_build_object('role_recreated', true) "
 										"ELSE '{}'::pg_catalog.jsonb END)",
-										8, argtypes, values, nulls, false, 0);
+										9, argtypes, values, nulls, false, 0);
 			if (ret != SPI_OK_SELECT)
 				elog(ERROR, "audit('role_locked') returned SPI code %d", ret);
 		}
@@ -565,33 +606,36 @@ ppp_sync_pending(void)
 		if (r->lock_pending_audit && r->audit_locked_until != 0 &&
 			r->locked_until == r->audit_locked_until && !r->role_gone)
 		{
-			Oid			argtypes[2] = {TEXTOID, TIMESTAMPTZOID};
-			Datum		values[2];
-			char		nulls[2] = {' ', ' '};
+			Oid			argtypes[3] = {TEXTOID, TIMESTAMPTZOID, OIDOID};
+			Datum		values[3];
+			char		nulls[3] = {' ', ' ', ' '};
 
 			values[0] = CStringGetTextDatum(r->rolename);
 			values[1] = TimestampTzGetDatum(r->audit_locked_until); /* DT_NOEND = infinity */
+			values[2] = ObjectIdGetDatum(r->role_oid);
 
-			/* only existing roles get a role_state row */
+			/* only the role locked gets a role_state row, if it still exists */
 			ret = SPI_execute_with_args(
 										"INSERT INTO pass_policy.role_state "
 										"(role_oid, role_name, locked_until, locked_by, lock_reason) "
 										"SELECT r.oid, r.rolname, $2, 'auto', "
 										"'too many failed authentication attempts' "
 										"FROM pg_catalog.pg_roles r WHERE r.rolname = $1 "
+										"AND ($3 = 0::pg_catalog.oid OR r.oid = $3) "
 										"ON CONFLICT (role_oid) DO UPDATE SET "
 										"role_name = EXCLUDED.role_name, "
 										"locked_until = EXCLUDED.locked_until, "
 										"locked_by = EXCLUDED.locked_by, "
 										"lock_reason = EXCLUDED.lock_reason",
-										2, argtypes, values, nulls, false, 0);
+										3, argtypes, values, nulls, false, 0);
 			if (ret != SPI_OK_INSERT)
 				elog(ERROR, "role_state upsert returned SPI code %d", ret);
 
 			/*
-			 * Renamed or dropped after the lookup above: the role_locked row
-			 * written above would claim a persisted lock.  Roll back and
-			 * start again at the next cycle, which sees the role gone.
+			 * Renamed or dropped (and possibly created again) after the
+			 * lookup above: the role_locked row written above would claim a
+			 * persisted lock.  Roll back and start again at the next cycle,
+			 * which sees the role gone.
 			 */
 			if (SPI_processed != 1)
 				ereport(ERROR,
@@ -671,10 +715,13 @@ ppp_sync_pending(void)
 
 /*
  * Run in its own transaction by ppp_ack_pending(), after the commit of
- * ppp_sync_pending(): is a role found gone by that step still unknown?  The
- * syscache is read in a fresh transaction (invalidations accepted at its
- * start), outside ppp_shared->lock.  A role renamed away and back since the
- * lookup is alive again: its entry must not be turned into a ghost.
+ * ppp_sync_pending(): does the name of a role found gone by that step still
+ * not lead to that role?  The syscache is read in a fresh transaction
+ * (invalidations accepted at its start), outside ppp_shared->lock.  A role
+ * renamed away and back since the lookup is alive again (same OID): its
+ * entry must not be turned into a ghost.  Another role created since under
+ * the name (another OID) is not the role locked: the name is confirmed gone
+ * for it.  OID unknown (r->role_oid invalid): the name alone is compared.
  */
 static void
 ppp_recheck_gone_roles(void)
@@ -684,10 +731,19 @@ ppp_recheck_gone_roles(void)
 	for (i = 0; i < ppp_pending_nrows; i++)
 	{
 		pppPendingRow *r = &ppp_pending_rows[i];
+		HeapTuple	tup;
+		bool		back = false;
 
-		if (r->role_gone)
-			r->gone_confirmed = !SearchSysCacheExists1(AUTHNAME,
-													   CStringGetDatum(r->rolename));
+		if (!r->role_gone)
+			continue;
+		tup = SearchSysCache1(AUTHNAME, CStringGetDatum(r->rolename));
+		if (HeapTupleIsValid(tup))
+		{
+			back = (!OidIsValid(r->role_oid) ||
+					((Form_pg_authid) GETSTRUCT(tup))->oid == r->role_oid);
+			ReleaseSysCache(tup);
+		}
+		r->gone_confirmed = !back;
 	}
 }
 
@@ -709,17 +765,13 @@ ppp_ack_pending(void)
 	 * Rows of roles found gone: check again, after the commit, that they
 	 * still are.  If that check fails (error turned into a WARNING,
 	 * extension no longer trusted), gone_confirmed stays false: the entry
-	 * is acknowledged but not turned into a ghost, the conservative choice
-	 * (a ghost can be evicted, a real lock must not).
+	 * is not turned into a ghost, the conservative choice (a ghost can be
+	 * evicted, a real lock must not), and its lock stays pending (below).
+	 * pure: this check must not touch the reload state of the cycle.
 	 */
-	for (i = 0; i < ppp_pending_nrows; i++)
-	{
-		if (ppp_pending_rows[i].role_gone)
-		{
-			(void) ppp_run_in_xact("role existence check", ppp_recheck_gone_roles);
-			break;
-		}
-	}
+	if (ppp_pending_any_gone)
+		(void) ppp_run_in_xact("role existence check", ppp_recheck_gone_roles,
+							   true);
 
 	LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
 	for (i = 0; i < ppp_pending_nrows; i++)
@@ -764,19 +816,30 @@ ppp_ack_pending(void)
 		{
 			bool		same_lock = (entry->audit_lock_seq == r->audit_lock_seq);
 
+			/*
+			 * Role found gone, but back under its name after the commit
+			 * (renamed a -> b and back b -> a in the meantime, same OID), or
+			 * not checked again (the check failed): the role_locked row
+			 * says role_missing and role_state was not written, yet the lock
+			 * may be real.  It stays pending: the next cycle writes a normal
+			 * role_locked row, which completes the first one, and persists
+			 * the lock in role_state (or, the role really gone, audits it
+			 * again with role_missing and turns the entry into a ghost).
+			 */
+			if (r->role_gone && !r->gone_confirmed)
+				continue;
+
 			if (same_lock)
 				entry->lock_pending_audit = false;
 			if ((int32) (r->audit_lock_seq - entry->audit_acked_seq) > 0)
 				entry->audit_acked_seq = r->audit_lock_seq;
 
 			/*
-			 * Renamed or dropped role: its lock was audited with
-			 * role_missing and not persisted; the name no longer logs in,
-			 * the entry becomes a ghost (evictable, purged once inactive).
-			 * Only if the name is still unknown after the commit
-			 * (gone_confirmed): renamed a -> b and back b -> a in the
-			 * meantime, the role is alive and its lock is real, it must
-			 * not become evictable.
+			 * Renamed or dropped role (gone_confirmed: the name still does
+			 * not lead to it after the commit, possibly taken by another
+			 * role since): its lock was audited with role_missing and not
+			 * persisted; the name no longer logs in for that role, the
+			 * entry becomes a ghost (evictable, purged once inactive).
 			 */
 			if (r->gone_confirmed && same_lock)
 				entry->role_missing = true;
@@ -796,6 +859,7 @@ ppp_free_pending(void)
 		pfree(ppp_pending_rows);
 	ppp_pending_rows = NULL;
 	ppp_pending_nrows = 0;
+	ppp_pending_any_gone = false;
 }
 
 /* ------------------------------------------------------------------------
@@ -874,10 +938,14 @@ ppp_sync_cleanup(void)
 
 	/*
 	 * Entries purged: room is free again, a series of fruitless eviction
-	 * scans of the authentication hook (ppp_enter_role) is over.
+	 * scans of the authentication hook (ppp_enter_role) is over, and so is
+	 * the one-second pause that followed a complete fruitless tour.
 	 */
 	if (purged > 0 || purged_missing > 0)
+	{
 		ppp_shared->evict_fruitless_active = false;
+		ppp_shared->evict_failed_at = 0;
+	}
 	LWLockRelease(ppp_shared->lock);
 
 	if (purged > 0 || purged_missing > 0)
@@ -1253,7 +1321,7 @@ ppp_worker_cycle(bool run_full, bool retry_only)
 	{
 		(void) pg_atomic_exchange_u32(&ppp_shared->reload_requested, 0);
 		ppp_reload_pending = true;
-		(void) ppp_run_in_xact("shared memory synchronisation", ppp_step_sync);
+		(void) ppp_run_in_xact("shared memory synchronisation", ppp_step_sync, false);
 		if (!ppp_reload_pending)
 			ppp_sync_first = false;
 		else if (retry_only)
@@ -1266,7 +1334,7 @@ ppp_worker_cycle(bool run_full, bool retry_only)
 	}
 
 	if (run_full)
-		(void) ppp_run_in_xact("maintenance", ppp_step_maintenance);
+		(void) ppp_run_in_xact("maintenance", ppp_step_maintenance, false);
 
 	CHECK_FOR_INTERRUPTS();
 
@@ -1284,13 +1352,13 @@ ppp_worker_cycle(bool run_full, bool retry_only)
 	 * memory is acknowledged only once they are committed, and an error in
 	 * the synchronisation step below cannot roll them back.
 	 */
-	if (ppp_run_in_xact("pending audit", ppp_sync_pending))
+	if (ppp_run_in_xact("pending audit", ppp_sync_pending, false))
 		ppp_ack_pending();
 	ppp_free_pending();
 
 	CHECK_FOR_INTERRUPTS();
 
-	(void) ppp_run_in_xact("shared memory synchronisation", ppp_step_sync);
+	(void) ppp_run_in_xact("shared memory synchronisation", ppp_step_sync, false);
 
 	LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
 	ppp_shared->worker_last_run = GetCurrentTimestamp();
@@ -1325,7 +1393,7 @@ ppp_worker_cycle_standby(void)
 	(void) pg_atomic_exchange_u32(&ppp_shared->reload_requested, 0);
 	ppp_reload_pending = true;
 
-	(void) ppp_run_in_xact("standby synchronisation", ppp_step_sync);
+	(void) ppp_run_in_xact("standby synchronisation", ppp_step_sync, false);
 
 	LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
 	ppp_shared->worker_last_run = GetCurrentTimestamp();

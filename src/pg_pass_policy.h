@@ -109,6 +109,15 @@ typedef struct pppRoleEntry
 	TimestampTz audit_lock_set_at;
 
 	/*
+	 * OID of the role that bore this name when the automatic lock
+	 * audit_locked_until was set (authentication hook, InvalidOid if the
+	 * catalog lookup was skipped).  The entry is keyed by the name: the
+	 * worker only persists the lock, or keeps it alive, for that very role,
+	 * not for another role created since under the same name (SPEC 12).
+	 */
+	Oid			audit_role_oid;
+
+	/*
 	 * When locked_until was last set to a new lock (authentication hook,
 	 * PRE_COMMIT of shmem_lock_role(), re-injection by the worker).  An
 	 * unlock committed afterwards only lifts a lock set before it was

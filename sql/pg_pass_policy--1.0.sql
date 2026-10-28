@@ -52,11 +52,23 @@ $roles$;
  * _rotate_role().  Both are SQL-standard bodies (parsed once, at CREATE
  * EXTENSION: the caller's search_path plays no part) and IMMUTABLE.
  *
- * _max_generated_length(): PPP_GEN_MAX_LENGTH (policy.c), the longest
- * password that generate_password() produces; the only copy of the value
- * on the SQL side (a profile whose bounds exceed it could never be
- * rotated).  Keep both values in step.
+ * _min_generated_length() / _max_generated_length(): PPP_GEN_MIN_LENGTH and
+ * PPP_GEN_MAX_LENGTH (policy.c), the shortest and longest passwords that
+ * generate_password() produces; the only copies of the values on the SQL
+ * side (a profile whose bounds exceed them could never be rotated).  Keep
+ * the values in step.
+ *
+ * These three functions are pure and are granted to PUBLIC (end of
+ * script): the CHECK constraints of profile run with the privileges of the
+ * user who writes the row (direct INSERT/UPDATE, pg_restore), who must not
+ * get a 42501 instead of the 23514 of the constraint.
  */
+CREATE FUNCTION _min_generated_length()
+RETURNS int
+LANGUAGE sql IMMUTABLE PARALLEL SAFE
+RETURN 8;
+COMMENT ON FUNCTION _min_generated_length() IS 'Internal: shortest password generate_password() produces (PPP_GEN_MIN_LENGTH)';
+
 CREATE FUNCTION _max_generated_length()
 RETURNS int
 LANGUAGE sql IMMUTABLE PARALLEL SAFE
@@ -91,7 +103,7 @@ CREATE TABLE profile (
                       CHECK (name ~ '^[A-Za-z0-9_.-]{1,63}$'),
     -- upper bound: max_length <= _max_generated_length() and
     -- profile_length_range (min_length <= max_length)
-    min_length        int NOT NULL DEFAULT 12  CHECK (min_length >= 8),
+    min_length        int NOT NULL DEFAULT 12  CHECK (min_length >= pass_policy._min_generated_length()),
     max_length        int NOT NULL DEFAULT 128 CHECK (max_length <= pass_policy._max_generated_length()),
     min_lower         int NOT NULL DEFAULT 1   CHECK (min_lower   >= 0),
     min_upper         int NOT NULL DEFAULT 1   CHECK (min_upper   >= 0),
@@ -2096,7 +2108,8 @@ COMMENT ON VIEW v_recent_audit IS 'Last 1000 audit events';
  *   (column grant: the hashes are offline-cracking material) ;
  * - admin: member of viewer + EXECUTE on the administration API ;
  * - shmem_* and internal _* functions: no grant (called by SECURITY DEFINER
- *   code only).
+ *   code only), except the three pure generator bounds used by the CHECK
+ *   constraints of profile (granted to PUBLIC below).
  */
 REVOKE ALL ON SCHEMA pass_policy FROM PUBLIC;
 GRANT USAGE ON SCHEMA pass_policy TO pass_policy_viewer, pass_policy_admin;
@@ -2104,6 +2117,12 @@ GRANT USAGE ON SCHEMA pass_policy TO pass_policy_viewer, pass_policy_admin;
 REVOKE ALL ON ALL TABLES IN SCHEMA pass_policy FROM PUBLIC;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA pass_policy FROM PUBLIC;
 REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA pass_policy FROM PUBLIC;
+-- pure functions called by the CHECK constraints of profile: executed with
+-- the privileges of whoever writes the row (direct INSERT/UPDATE by a
+-- non-superuser, pg_restore), so they must stay callable by everyone
+GRANT EXECUTE ON FUNCTION _min_generated_length(), _max_generated_length(),
+                          _generator_minimum(int, int, int, int, int)
+   TO PUBLIC;
 
 GRANT SELECT ON profile, role_profile, role_state, dictionary, audit_log, rotation_pair,
                 v_role_status, v_expiring, v_locked, v_recent_audit

@@ -183,7 +183,10 @@ suivant, mais un verrou que le worker n'a pas encore écrit reste attaché à
 l'ancien nom ; il est audité (`role_locked`, `details.role_missing`, et
 `role_renamed` / `renamed_to` quand le nouveau nom est connu) sans être
 transféré. Pour garder un compte bloqué pendant un renommage, utiliser
-`lock_role()`.
+`lock_role()`. Un autre rôle créé ensuite sous l'ancien nom (`DROP ROLE` puis
+`CREATE ROLE`) ne reçoit pas ce verrou dans `role_state` : le hook mémorise
+l'OID du rôle verrouillé (audit `role_recreated`) ; le verrou en mémoire
+partagée tient seulement jusqu'à son expiration (`unlock_role()` le lève).
 
 Seuls les échecs des méthodes où le client présente un mot de passe ou un
 secret sont comptés : `password`, `md5`, `scram-sha-256`, `ldap`, `pam`,

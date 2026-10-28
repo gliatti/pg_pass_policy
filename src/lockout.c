@@ -99,6 +99,7 @@ ppp_init_entry(pppRoleEntry *entry)
 	entry->audit_lock_seq = 0;
 	entry->audit_acked_seq = 0;
 	entry->audit_lock_set_at = 0;
+	entry->audit_role_oid = InvalidOid;
 	entry->lock_set_at = 0;
 	entry->lock_from_state = false;
 	entry->lock_inflight = 0;
@@ -424,9 +425,11 @@ ppp_enter_role(const char *rolename, pppEnterMode mode, TimestampTz now,
 
 		/*
 		 * A victim found, by either mode: the hash has changed, the series
-		 * of fruitless scans (if any) no longer describes it.
+		 * of fruitless scans (if any) no longer describes it, nor does the
+		 * pause that followed a complete fruitless tour.
 		 */
 		ppp_shared->evict_fruitless_active = false;
+		ppp_shared->evict_failed_at = 0;
 
 		if (ev)
 		{
@@ -451,9 +454,11 @@ ppp_enter_role(const char *rolename, pppEnterMode mode, TimestampTz now,
 		 * No scan: the hash is not full.  A series of fruitless scans
 		 * started earlier is over (entries have left since); a later one
 		 * starts afresh instead of completing a tour over a hash that has
-		 * changed in between.
+		 * changed in between.  The pause that followed a complete fruitless
+		 * tour (evict_failed_at) is over too: room has been found.
 		 */
 		ppp_shared->evict_fruitless_active = false;
+		ppp_shared->evict_failed_at = 0;
 	}
 
 	entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key,
@@ -541,14 +546,14 @@ ppp_lockout_init(void)
 /*
  * Look a user name up in pg_authid: *missing when no role has that name,
  * *expired when its rolvaliduntil is in the past, *superuser when it has
- * rolsuper.  The hook runs inside the transaction started by InitPostgres()
+ * rolsuper, *roleid its OID (InvalidOid when missing or not looked up).  The hook runs inside the transaction started by InitPostgres()
  * for authentication, with catalog caches available (see the file header);
  * the lookup is skipped (role assumed to exist, valid and not superuser, the
  * conservative answer) if that ever stops being true.
  */
 static void
 ppp_role_lookup(const char *rolename, TimestampTz now,
-				bool *missing, bool *expired, bool *superuser)
+				bool *missing, bool *expired, bool *superuser, Oid *roleid)
 {
 	HeapTuple	tup;
 	Datum		datum;
@@ -557,6 +562,7 @@ ppp_role_lookup(const char *rolename, TimestampTz now,
 	*missing = false;
 	*expired = false;
 	*superuser = false;
+	*roleid = InvalidOid;
 	if (!IsTransactionState())
 		return;
 
@@ -571,6 +577,7 @@ ppp_role_lookup(const char *rolename, TimestampTz now,
 	if (!isnull && DatumGetTimestampTz(datum) < now)
 		*expired = true;
 	*superuser = ((Form_pg_authid) GETSTRUCT(tup))->rolsuper;
+	*roleid = ((Form_pg_authid) GETSTRUCT(tup))->oid;
 	ReleaseSysCache(tup);
 }
 
@@ -685,6 +692,7 @@ ppp_client_auth_hook(Port *port, int status)
 	bool		just_locked = false;
 	bool		hash_full = false;
 	bool		role_missing = false;
+	Oid			role_oid = InvalidOid;
 	bool		count_failure;
 	bool		in_recovery;
 	int			failed_count = 0;
@@ -724,7 +732,7 @@ ppp_client_auth_hook(Port *port, int status)
 		bool		expired;
 
 		ppp_role_lookup(key.rolename, now, &role_missing, &expired,
-						&is_superuser);
+						&is_superuser, &role_oid);
 		if (count_failure && expired &&
 			ppp_auth_method_checks_valid_until(port))
 			count_failure = false;
@@ -859,6 +867,7 @@ ppp_client_auth_hook(Port *port, int status)
 					entry->lock_pending_audit = true;
 					entry->audit_locked_until = entry->locked_until;
 					entry->audit_lock_set_at = now;
+					entry->audit_role_oid = role_oid;
 					entry->lock_set_at = now;
 					entry->lock_from_state = false;
 					just_locked = true;

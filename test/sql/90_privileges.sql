@@ -117,6 +117,32 @@ SELECT ppp_test.try($$SELECT pass_policy.lock_role('regress_target')$$) AS lock;
 SELECT ppp_test.try($$UPDATE pass_policy.profile SET min_length = 1$$) AS upd_profile;
 RESET SESSION AUTHORIZATION;
 
+-- Bornes du générateur appelées par les CHECK de profile : fonctions pures
+-- accordées à PUBLIC (un CHECK s'exécute avec les droits de celui qui écrit
+-- la ligne : INSERT/UPDATE direct, pg_restore par un non-superutilisateur)
+SELECT has_function_privilege('regress_user', 'pass_policy._min_generated_length()', 'EXECUTE') AS user_min_len,
+       has_function_privilege('regress_user', 'pass_policy._max_generated_length()', 'EXECUTE') AS user_max_len,
+       has_function_privilege('regress_user', 'pass_policy._generator_minimum(int, int, int, int, int)', 'EXECUTE') AS user_gen_min;
+SET SESSION AUTHORIZATION regress_viewer;
+SELECT pass_policy._min_generated_length() AS min_len,
+       pass_policy._max_generated_length() AS max_len,
+       pass_policy._generator_minimum(1, 1, 1, 1, 3) AS gen_min;
+RESET SESSION AUTHORIZATION;
+-- INSERT/UPDATE direct par un admin non superutilisateur (droit d'écriture
+-- accordé dans une transaction annulée, profile_id explicite comme un COPY de
+-- pg_restore) : la contrainte répond 23514, pas 42501
+BEGIN;
+GRANT INSERT, UPDATE ON pass_policy.profile TO regress_admin;
+SET SESSION AUTHORIZATION regress_admin;
+SELECT ppp_test.try($$INSERT INTO pass_policy.profile (profile_id, name, min_length) VALUES (9001, 'p_direct', 7)$$) AS direct_min_length;
+SELECT ppp_test.try($$INSERT INTO pass_policy.profile (profile_id, name, max_length) VALUES (9001, 'p_direct', 513)$$) AS direct_max_length;
+SELECT ppp_test.try($$INSERT INTO pass_policy.profile (profile_id, name, min_length, max_length, min_lower)
+                      VALUES (9001, 'p_direct', 12, 12, 11)$$) AS direct_classes_fit;
+SELECT ppp_test.try($$INSERT INTO pass_policy.profile (profile_id, name) VALUES (9001, 'p_direct')$$) AS direct_valid;
+SELECT ppp_test.try($$UPDATE pass_policy.profile SET max_length = 513 WHERE name = 'p_direct'$$) AS direct_update;
+RESET SESSION AUTHORIZATION;
+ROLLBACK;
+
 -- Admin (membre de pass_policy_admin, non superutilisateur) ---------------
 SET SESSION AUTHORIZATION regress_admin;
 SELECT rolsuper FROM pg_roles WHERE rolname = session_user;
