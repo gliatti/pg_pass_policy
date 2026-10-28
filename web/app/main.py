@@ -85,13 +85,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         headers = exc.headers
         detail = str(exc.detail)
         if isinstance(exc, InvalidCsrfToken):
-            if session_cookie_name(settings) not in request.cookies:
-                # the browser never sent the session cookie back (Secure
-                # cookie over plain HTTP, cookies blocked): a reload would
-                # fail the same way, in a loop
+            has_cookie = session_cookie_name(settings) in request.cookies
+            if not exc.supplied:
+                # no token: a client that never fetched a page; without the
+                # session cookie either, say that it must be kept as well
+                if not has_cookie:
+                    detail = f"{detail}. {SESSION_NOT_STORED}"
+            elif secure_cookie_over_http(request, settings):
+                # a Secure cookie the browser drops (page served over plain
+                # HTTP): a reload would fail the same way on every action
                 detail = SESSION_NOT_STORED
             elif is_hx(request):
-                # a stale token (lost session): reload the page for a fresh one
+                # a stale token (session expired or lost while the page
+                # stayed open): reload the page for a fresh one
                 headers = {**(headers or {}), "HX-Refresh": "true"}
         return _error_response(request, exc.status_code, detail, headers)
 
@@ -142,14 +148,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     return app
 
 
-# no automatic reload then: a cookie the browser does not keep would make
-# HX-Refresh loop.  The request alone cannot tell a cookie never stored from
-# one expired (max_age) while the page stayed open: the message covers both.
+# shown without automatic reload: a cookie the browser does not keep would
+# make HX-Refresh fail again on every action
 SESSION_NOT_STORED = (
     "Session cookie not stored (or expired): reload the page; if this persists,"
     " check PGPP_WEB_SESSION_HTTPS_ONLY / cookies (a Secure cookie is not kept"
     " over plain HTTP, the browser may block cookies)"
 )
+
+
+def secure_cookie_over_http(request: Request, settings: Settings) -> bool:
+    """A Secure session cookie (PGPP_WEB_SESSION_HTTPS_ONLY) and a page the
+    browser loaded over plain HTTP (Origin, else Referer, as the browser
+    sees it, whatever the proxy in between): the cookie is never stored."""
+    if not settings.session_https_only:
+        return False
+    origin = request.headers.get("origin") or request.headers.get("referer") or ""
+    return origin.lower().startswith("http://")
 
 
 def session_cookie_name(settings: Settings) -> str:

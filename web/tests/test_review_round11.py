@@ -24,13 +24,14 @@ from tests.test_review_round6 import app as app  # noqa: F401 (fixture)
 
 @pytest.mark.parametrize("htmx", [False, True])
 def test_a_csrf_refusal_without_session_cookie_does_not_reload(app, htmx):  # noqa: F811
-    # a client that never got (or never kept) the session cookie
+    # a client that never got the session cookie and sends no token
     client = TestClient(app, follow_redirects=False)
     client.auth = (TEST_USER, TEST_PASSWORD)
-    headers = {"X-CSRF-Token": "from-a-page", **({"HX-Request": "true"} if htmx else {})}
+    headers = {"HX-Request": "true"} if htmx else {}
     response = client.post("/roles/r1/lock", headers=headers)
     assert response.status_code == 403
     assert "HX-Refresh" not in response.headers
+    assert "CSRF token missing: fetch a page first" in response.text
     assert "Session cookie not stored" in response.text
     assert "PGPP_WEB_SESSION_HTTPS_ONLY" in response.text
     if htmx:
@@ -48,7 +49,8 @@ def test_a_secure_cookie_over_plain_http_is_reported():
     page = client.get("/maintenance")
     assert "__Host-pgpp_session" in page.headers.get("set-cookie", "")
     # kept in the jar, but never sent back over http:// (Secure)
-    response = client.post("/maintenance/run", headers={"X-CSRF-Token": "x", "HX-Request": "true"})
+    headers = {"X-CSRF-Token": "x", "HX-Request": "true", "Origin": "http://testserver"}
+    response = client.post("/maintenance/run", headers=headers)
     assert response.status_code == 403
     assert "HX-Refresh" not in response.headers
     assert "Session cookie not stored" in response.text
@@ -73,7 +75,7 @@ def test_a_stale_token_with_a_session_cookie_still_reloads(app):  # noqa: F811
     [
         (120, 7, 3, [300, 100]),  # page_size 50: 3 pages
         (120, 3, 3, [100]),
-        (0, 5, 1, [200, 0]),
+        (0, 5, 1, [200]),  # nothing matches: no second query
         (0, 1, 1, [0]),
     ],
 )

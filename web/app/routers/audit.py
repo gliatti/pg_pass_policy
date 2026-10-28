@@ -29,6 +29,10 @@ def _filters(
     }
 
 
+def _page_count(total: int, page_size: int) -> int:
+    return max(1, math.ceil(total / page_size))
+
+
 def _context(request: Request, conn: Connection, filters: dict[str, Any]) -> dict[str, Any]:
     page_size = request.app.state.settings.page_size
     error = None
@@ -38,30 +42,29 @@ def _context(request: Request, conn: Connection, filters: dict[str, Any]) -> dic
     try:
         with conn.transaction():
             since = db.parse_since(filters["since"])
-            rows, total = db.list_audit(
-                conn,
-                role=filters["role"],
-                event_type=filters["type"],
-                since=since,
-                limit=page_size,
-                offset=(page - 1) * page_size,
-            )
-            last = max(1, math.ceil(total / page_size))
-            if page > last:
-                # a page past the end (stale link, hand-typed URL): the last
-                # page, not an empty table with a "page 7 / 2" footer
-                page = last
-                rows, total = db.list_audit(
+
+            def fetch(number: int) -> tuple[list[dict[str, Any]], int]:
+                return db.list_audit(
                     conn,
                     role=filters["role"],
                     event_type=filters["type"],
                     since=since,
                     limit=page_size,
-                    offset=(page - 1) * page_size,
+                    offset=(number - 1) * page_size,
                 )
+
+            rows, total = fetch(page)
+            # a page past the end (stale link, hand-typed URL): the last
+            # page, not an empty table with a "page 7 / 2" footer; no second
+            # query when nothing matches (the last page is empty as well)
+            clamped = min(page, _page_count(total, page_size))
+            if clamped != page:
+                page = clamped
+                if total:
+                    rows, total = fetch(page)
     except psycopg.DataError as exc:
         error = f"Invalid filter: {db.error_message(exc)}"
-    pages = max(1, math.ceil(total / page_size))
+    pages = _page_count(total, page_size)
     page = min(page, pages)
     return {
         "events": rows,

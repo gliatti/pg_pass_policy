@@ -203,15 +203,18 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
   n'est émis sur les pages 401/403 affichées avant l'authentification. Une
   requête marquée `Sec-Fetch-Site: cross-site` ou `same-site` est refusée : le
   back-office n'a pas d'appelant légitime sur un autre sous-domaine ou port.
-  Un jeton absent ou périmé (session perdue : cookie expiré ou effacé,
-  `PGPP_WEB_SECRET` changé) donne un 403 « reload the page » ; pour une
-  requête htmx, la réponse porte `HX-Refresh: true` et la page est rechargée
-  avec un jeton neuf. Si la requête ne porte aucun cookie de session (cookie
-  `Secure` de `PGPP_WEB_SESSION_HTTPS_ONLY=true` servi en HTTP clair, cookies
-  bloqués par le navigateur, ou cookie expiré), il n'y a pas de rechargement
-  automatique, qui tournerait en boucle : une alerte « Session cookie not
-  stored (or expired) » invite à recharger la page puis, si l'erreur persiste,
-  à vérifier `PGPP_WEB_SESSION_HTTPS_ONLY` et les cookies. Le jeton n'est publié que dans `hx-headers` (pas de
+  Un jeton périmé (session perdue pendant que la page restait ouverte : cookie
+  expiré ou effacé, `PGPP_WEB_SECRET` changé) donne un 403 « CSRF token
+  invalid: reload the page » ; pour une requête htmx, la réponse porte
+  `HX-Refresh: true` et la page est rechargée avec un jeton neuf. Exception :
+  avec `PGPP_WEB_SESSION_HTTPS_ONLY=true` et une page chargée en HTTP clair
+  (en-tête `Origin` ou `Referer` en `http://`), le navigateur ne garde jamais
+  le cookie `Secure` ; au lieu d'un rechargement qui échouerait à chaque
+  action, une alerte « Session cookie not stored (or expired) » invite à
+  vérifier `PGPP_WEB_SESSION_HTTPS_ONLY` et les cookies. Une requête sans
+  aucun jeton (client qui n'a chargé aucune page) reçoit « CSRF token
+  missing: fetch a page first », complété par la même alerte si elle ne porte
+  pas non plus de cookie de session. Le jeton n'est publié que dans `hx-headers` (pas de
   balise `<meta>`).
 - **En-têtes** : `Content-Security-Policy` sans script inline (nonce par
   requête, `script-src 'self'`, `frame-ancestors 'none'`, `form-action 'self'`),
@@ -324,9 +327,10 @@ par utilisateur serait un déni de service trivial sur l'unique compte admin.
   '^[A-Za-z0-9_.-]{1,63}$')` de `pass_policy.profile` interdit `/` (un profil
   `x/delete` ne peut pas exister, ce que vérifie un test d'intégration). Seuls
   `.` et `..` (segments supprimés de l'URL par le navigateur), acceptés par
-  l'extension, restent injoignables : l'interface refuse de créer ou de
-  modifier un profil portant l'un d'eux (422, message explicite) et n'en
-  affiche pas le formulaire d'édition (404) ; un tel profil se gère en SQL.
+  l'extension, restent injoignables : l'interface refuse de créer un profil
+  portant l'un d'eux (422, message explicite) ; son formulaire d'édition et sa
+  modification répondent 404 (même garde, avant toute requête) ; un tel profil
+  se gère en SQL.
 - **Droits** : le rôle de service est seulement membre de `pass_policy_admin` ;
   les fonctions `SECURITY DEFINER` qui visent un rôle (rotation, expiration,
   verrouillage, paires, `assign_profile()` et `unassign_profile()`) refusent

@@ -305,7 +305,8 @@ def test_reserved_name_refused_on_update(form_app):
     headers = {"X-CSRF-Token": token, "HX-Request": "true"}
     # "." only arrives encoded (a client removes the plain dot segment)
     response = client.post("/profiles/p/%2E", data={}, headers=headers)
-    assert response.status_code == 422
+    # the same guard and status as the edit page (404)
+    assert response.status_code == 404
     assert "is reserved by the web interface" in response.text
     assert "alter" not in events
     # "new" is an ordinary name under /profiles/p/: no collision with the

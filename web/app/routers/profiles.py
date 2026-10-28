@@ -129,6 +129,14 @@ def _form_response(
     return render(request, template, context, status_code=422 if error else 200)
 
 
+def _reserved_or_404(name: str) -> None:
+    """404 for "." and "..": only reachable with an encoded dot segment, the
+    form would post to a URL that the browser rewrites.  Checked before any
+    query, by both the edit page and the update."""
+    if name in RESERVED_NAMES:
+        raise HTTPException(status_code=404, detail=RESERVED_MESSAGE.format(name))
+
+
 def _profile_or_404(conn: Connection, name: str) -> dict[str, Any]:
     """The profile, or the generic 404 response: a page, or for htmx an
     alert retargeted to #alerts (the form stays in place)."""
@@ -205,23 +213,19 @@ def profile_unassign(
 # that such a name is refused)
 @router.get("/p/{name}", name="profile_edit")
 def profile_edit(request: Request, name: str, conn: Connection = db.CONN):
-    if name in RESERVED_NAMES:
-        # only reachable with an encoded dot segment: the form would post to
-        # a URL that the browser rewrites
-        raise HTTPException(status_code=404, detail=RESERVED_MESSAGE.format(name))
+    _reserved_or_404(name)
     profile = _profile_or_404(conn, name)
     return _form_response(request, profile, profile)
 
 
 @router.post("/p/{name}", name="profile_update")
 def profile_update(request: Request, name: str, form: FormData = FORM, conn: Connection = db.CONN):
+    _reserved_or_404(name)
     profile = _profile_or_404(conn, name)
     values = {k: form.get(k) for k, _ in db.PROFILE_FIELDS}
     values["name"] = name
     notice = None
     try:
-        if name in RESERVED_NAMES:
-            raise ValueError(RESERVED_MESSAGE.format(name))
         settings = settings_from_form(form)
     except ValueError as exc:
         return _form_response(request, profile, values, error=str(exc))
