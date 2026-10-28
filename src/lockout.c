@@ -101,6 +101,7 @@ ppp_init_entry(pppRoleEntry *entry)
 	entry->audit_acked_seq = 0;
 	entry->audit_lock_set_at = 0;
 	entry->audit_role_oid = InvalidOid;
+	entry->lock_role_oid = InvalidOid;
 	entry->lock_set_at = 0;
 	entry->lock_from_state = false;
 	entry->lock_inflight = 0;
@@ -671,6 +672,18 @@ ppp_auth_is_peer(const Port *port)
 }
 
 /*
+ * Has the PPP_RESCUE_LOG_SECS period since logged_at elapsed?  A clock set
+ * back (now before logged_at) counts as elapsed: the role would otherwise
+ * stay silent until the clock caught up.
+ */
+static bool
+ppp_rescue_period_elapsed(TimestampTz logged_at, TimestampTz now)
+{
+	return now < logged_at ||
+		TimestampDifferenceExceeds(logged_at, now, PPP_RESCUE_LOG_SECS * 1000);
+}
+
+/*
  * Rescue admission of a role (see PPP_RESCUE_LOG_SLOTS): true when it must
  * be logged, *suppressed then receiving the number of admissions of that
  * role not logged since its previous LOG.  A role gets a slot at its first
@@ -698,8 +711,7 @@ ppp_rescue_log_due(const char *rolename, TimestampTz now, int32 *suppressed)
 		}
 		if (strncmp(slot->rolename, rolename, NAMEDATALEN) == 0)
 		{
-			if (!TimestampDifferenceExceeds(slot->logged_at, now,
-											PPP_RESCUE_LOG_SECS * 1000))
+			if (!ppp_rescue_period_elapsed(slot->logged_at, now))
 			{
 				if (slot->suppressed < PG_INT32_MAX)
 					slot->suppressed++;
@@ -711,8 +723,7 @@ ppp_rescue_log_due(const char *rolename, TimestampTz now, int32 *suppressed)
 			return true;
 		}
 		if (free_slot < 0 && slot->suppressed == 0 &&
-			TimestampDifferenceExceeds(slot->logged_at, now,
-									   PPP_RESCUE_LOG_SECS * 1000))
+			ppp_rescue_period_elapsed(slot->logged_at, now))
 			free_slot = i;
 	}
 	if (free_slot >= 0)
@@ -723,6 +734,46 @@ ppp_rescue_log_due(const char *rolename, TimestampTz now, int32 *suppressed)
 		slot->suppressed = 0;
 	}
 	return true;
+}
+
+/*
+ * Worker, at every synchronisation: LOG the rescue admissions that were not
+ * logged (suppressed) once the period of their role has elapsed, and all of
+ * them once the start-up window is closed (no admission is left unlogged
+ * then: none can be added).  logged_at is kept, so that the next admission
+ * of the role is logged as usual once its period has elapsed.
+ */
+void
+ppp_flush_rescue_log(void)
+{
+	pppRescueLogSlot due[PPP_RESCUE_LOG_SLOTS];
+	TimestampTz now = GetCurrentTimestamp();
+	int			ndue = 0;
+	int			i;
+
+	LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
+	for (i = 0; i < PPP_RESCUE_LOG_SLOTS; i++)
+	{
+		pppRescueLogSlot *slot = &ppp_shared->rescue_log[i];
+
+		if (slot->suppressed > 0 &&
+			(ppp_shared->locks_loaded ||
+			 ppp_rescue_period_elapsed(slot->logged_at, now)))
+		{
+			due[ndue++] = *slot;
+			slot->suppressed = 0;
+		}
+	}
+	LWLockRelease(ppp_shared->lock);
+
+	for (i = 0; i < ndue; i++)
+		ereport(LOG,
+				(errmsg_plural(PPP_LOG_PREFIX "%d admission of superuser \"%s\" by peer authentication before the lock state was loaded was not logged",
+							   PPP_LOG_PREFIX "%d admissions of superuser \"%s\" by peer authentication before the lock state was loaded were not logged",
+							   due[i].suppressed, (int) due[i].suppressed,
+							   due[i].rolename),
+				 errdetail("The role is listed in pg_pass_policy.rescue_roles; its admissions are logged at most once every %d seconds.",
+						   PPP_RESCUE_LOG_SECS)));
 }
 
 /*
@@ -924,9 +975,11 @@ ppp_client_auth_hook(Port *port, int status)
 		/*
 		 * Refreshed at every failure: a role created after its name was
 		 * first tried loses the flag.  A successful authentication proves
-		 * that the role exists.
+		 * that the role exists.  Not while the entry is locked: a locked
+		 * entry never becomes a ghost (evictable), the worker removes the
+		 * lock of a dropped role itself (ppp_sync_cleanup).
 		 */
-		if (count_failure)
+		if (count_failure && !refuse)
 			entry->role_missing = role_missing;
 		else if (status == STATUS_OK)
 			entry->role_missing = false;
@@ -980,6 +1033,7 @@ ppp_client_auth_hook(Port *port, int status)
 					entry->audit_locked_until = entry->locked_until;
 					entry->audit_lock_set_at = now;
 					entry->audit_role_oid = role_oid;
+					entry->lock_role_oid = role_oid;
 					entry->lock_set_at = now;
 					entry->lock_from_state = false;
 					just_locked = true;
@@ -997,11 +1051,12 @@ ppp_client_auth_hook(Port *port, int status)
 	{
 		/*
 		 * Rescue admissions are logged with the role name, once per role and
-		 * per PPP_RESCUE_LOG_SECS: the next LOG of that role tells how many
-		 * were not logged meanwhile, so that a script connecting in a loop
-		 * does not flood the server log while no role is ever hidden (a
-		 * limit for the whole instance would hide the other roles; when the
-		 * table of roles is full, the admission is logged anyway).
+		 * per PPP_RESCUE_LOG_SECS: the next LOG of that role (or the worker,
+		 * ppp_flush_rescue_log) tells how many were not logged meanwhile, so
+		 * that a script connecting in a loop does not flood the server log
+		 * while no role is ever hidden (a limit for the whole instance would
+		 * hide the other roles; when the table of roles is full, the
+		 * admission is logged anyway).
 		 */
 		log_rescue = ppp_rescue_log_due(key.rolename, now, &rescue_suppressed);
 	}
@@ -1022,17 +1077,17 @@ ppp_client_auth_hook(Port *port, int status)
 				 errdetail("No pg_pass_policy background worker is running %d seconds after the shared memory initialisation; roles not listed in pg_pass_policy.exempt_roles are refused meanwhile, whatever the authentication method (at most one message per minute).",
 						   PPP_WORKER_MISSING_GRACE_SECS),
 				 errhint("Check max_worker_processes and pg_pass_policy.database; superusers and roles listed in pg_pass_policy.exempt_roles can still connect.")));
-	if (log_rescue && rescue_suppressed > 0)
+	if (log_rescue)
 		ereport(LOG,
 				(errmsg(PPP_LOG_PREFIX "superuser \"%s\" admitted by peer authentication before the lock state is loaded",
 						rolename),
-				 errdetail("The role is listed in pg_pass_policy.rescue_roles; a lock it may hold in role_state is not known yet. %d earlier admissions of this role were not logged (at most one message per role per minute).",
-						   (int) rescue_suppressed)));
-	else if (log_rescue)
-		ereport(LOG,
-				(errmsg(PPP_LOG_PREFIX "superuser \"%s\" admitted by peer authentication before the lock state is loaded",
-						rolename),
-				 errdetail("The role is listed in pg_pass_policy.rescue_roles; a lock it may hold in role_state is not known yet (at most one message per role per minute).")));
+				 rescue_suppressed > 0 ?
+				 errdetail_plural("The role is listed in pg_pass_policy.rescue_roles; a lock it may hold in role_state is not known yet. %d earlier admission of this role was not logged (at most one message per role every %d seconds).",
+								  "The role is listed in pg_pass_policy.rescue_roles; a lock it may hold in role_state is not known yet. %d earlier admissions of this role were not logged (at most one message per role every %d seconds).",
+								  rescue_suppressed, (int) rescue_suppressed,
+								  PPP_RESCUE_LOG_SECS) :
+				 errdetail("The role is listed in pg_pass_policy.rescue_roles; a lock it may hold in role_state is not known yet (at most one message per role every %d seconds).",
+						   PPP_RESCUE_LOG_SECS)));
 	if (hash_full)
 		ereport(LOG,
 				(errmsg(PPP_LOG_PREFIX "cannot track authentication failures of role \"%s\": too many tracked roles",
@@ -1112,6 +1167,7 @@ typedef struct pppPendingOp
 	pppShmemOp	op;
 	char		rolename[NAMEDATALEN];
 	TimestampTz until;			/* PPP_OP_LOCK only */
+	Oid			roleid;			/* PPP_OP_LOCK: its role (PRE_COMMIT lookup) */
 	TimestampTz queued_at;		/* when it was requested */
 	bool		expired_only;	/* PPP_OP_UNLOCK: lift an expired lock only */
 	bool		kept_newer;		/* PPP_OP_UNLOCK: a newer lock was kept */
@@ -1256,7 +1312,11 @@ ppp_apply_lock_ops(void)
 	nops = 0;
 	for (op = ppp_pending_ops; op != NULL; op = op->next)
 		if (op->op == PPP_OP_LOCK && !ppp_op_overridden(op))
+		{
+			/* catalog lookup before taking the LWLock */
+			op->roleid = get_role_oid(op->rolename, true);
 			ops[nops++] = op;
+		}
 
 	now = GetCurrentTimestamp();
 	in_recovery = RecoveryInProgress();
@@ -1289,6 +1349,7 @@ ppp_apply_lock_ops(void)
 		 * without copying it to role_state (locked_until differs now).
 		 */
 		entry->locked_until = op->until;
+		entry->lock_role_oid = op->roleid;
 		entry->lock_set_at = now;
 
 		/*

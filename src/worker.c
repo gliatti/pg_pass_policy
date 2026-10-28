@@ -150,7 +150,7 @@ typedef struct pppProfileRow
 typedef struct pppLockRow
 {
 	char		rolename[NAMEDATALEN];
-	bool		role_exists;
+	Oid			role_oid;
 	TimestampTz locked_until;
 } pppLockRow;
 
@@ -515,8 +515,8 @@ ppp_sync_pending(void)
 			 * or, OID unknown, when role_state or role_profile still carry
 			 * the old name of an existing OID; role_recreated when another
 			 * role has the name) instead of being acknowledged as if the
-			 * lock had been persisted; the entry becomes a ghost at the
-			 * acknowledgement (ppp_ack_pending).
+			 * lock had been persisted; once it is acknowledged
+			 * (ppp_ack_pending), ppp_sync_cleanup removes the entry.
 			 */
 			values[6] = (Datum) 0;
 			lookup_values[0] = CStringGetTextDatum(r->rolename);
@@ -829,7 +829,8 @@ ppp_ack_pending(void)
 			 * may be real.  It stays pending: the next cycle writes a normal
 			 * role_locked row, which completes the first one, and persists
 			 * the lock in role_state (or, the role really gone, audits it
-			 * again with role_missing and turns the entry into a ghost).
+			 * again with role_missing, and ppp_sync_cleanup removes the
+			 * entry).
 			 */
 			if (r->role_gone && !r->gone_confirmed)
 				continue;
@@ -838,16 +839,6 @@ ppp_ack_pending(void)
 				entry->lock_pending_audit = false;
 			if ((int32) (r->audit_lock_seq - entry->audit_acked_seq) > 0)
 				entry->audit_acked_seq = r->audit_lock_seq;
-
-			/*
-			 * Renamed or dropped role (gone_confirmed: the name still does
-			 * not lead to it after the commit, possibly taken by another
-			 * role since): its lock was audited with role_missing and not
-			 * persisted; the name no longer logs in for that role, the
-			 * entry becomes a ghost (evictable, purged once inactive).
-			 */
-			if (r->gone_confirmed && same_lock)
-				entry->role_missing = true;
 		}
 	}
 	LWLockRelease(ppp_shared->lock);
@@ -872,39 +863,74 @@ ppp_free_pending(void)
  * ------------------------------------------------------------------------
  */
 /*
- * Entry whose role_missing flag may go from false to true, for
- * ppp_sync_cleanup(): its name, incarnation and update counter when copied
- * (the old value of the flag is false, only such entries are copied), and
- * whether the catalog lookup found no role of that name.
+ * Entry of ppp_sync_cleanup() whose role may be gone: its name, incarnation
+ * and update counter when copied, and lock_role_oid for a locked entry
+ * (InvalidOid for an entry that may become a ghost).
  */
 typedef struct pppMissingRow
 {
 	char		rolename[NAMEDATALEN];
 	uint64		generation;		/* entry->generation when copied */
 	uint32		update_seq;		/* entry->update_seq when copied */
-	bool		gone;			/* no role of that name (lookup) */
+	Oid			lock_role_oid;	/* locked entry: OID of the lock's role */
 } pppMissingRow;
 
 /*
- * May the worker turn this entry into a ghost (role_missing = true)?  Only
- * an entry with nothing at stake: no lock audit pending or unacknowledged,
+ * Nothing at stake in the entry: no lock audit pending or unacknowledged,
  * no failure to audit, no uncommitted lock.  Such pending work belongs to
  * the role that bore the name: the worker audits it itself (role_gone /
- * role_renamed rows, ppp_ack_pending), and a ghost would be evictable
- * before.  An active lock does not prevent it once fully audited and
- * acknowledged (permanent lock of a dropped role, for instance): the entry
- * would otherwise stay PPP_CLASS_KEEP and hold its slot for good.  The
- * lock still applies to the name while the entry is there.  Caller holds
- * ppp_shared->lock (shared or exclusive).
+ * role_renamed rows, ppp_ack_pending) before the entry may go.
  */
 static bool
-ppp_entry_may_become_ghost(const pppRoleEntry *entry)
+ppp_entry_settled(const pppRoleEntry *entry)
 {
-	return !entry->role_missing &&
-		!entry->lock_pending_audit &&
+	return !entry->lock_pending_audit &&
 		entry->pending_failures == 0 &&
 		entry->audit_acked_seq == entry->audit_lock_seq &&
 		entry->lock_inflight == 0;
+}
+
+/*
+ * May the worker turn this entry into a ghost (role_missing = true)?  Only
+ * a settled entry without an active lock: a locked entry never becomes a
+ * ghost, which invented names could evict; the lock of a dropped role is
+ * released by removing its entry instead (ppp_lock_may_be_released).
+ * Caller holds ppp_shared->lock (shared or exclusive).
+ */
+static bool
+ppp_entry_may_become_ghost(const pppRoleEntry *entry, TimestampTz now)
+{
+	return !entry->role_missing && ppp_entry_settled(entry) &&
+		!ppp_is_locked(entry, now);
+}
+
+/* settled locked entry whose role is known (lock_role_oid) */
+static bool
+ppp_lock_may_be_released(const pppRoleEntry *entry, TimestampTz now)
+{
+	return ppp_entry_settled(entry) && ppp_is_locked(entry, now) &&
+		OidIsValid(entry->lock_role_oid);
+}
+
+/*
+ * Does no role of that OID bear that name any more (dropped, or renamed)?
+ * OID unknown: does no role bear the name?
+ */
+static bool
+ppp_role_gone(const char *rolename, Oid roleid)
+{
+	HeapTuple	tup;
+	bool		gone;
+
+	if (!OidIsValid(roleid))
+		return !SearchSysCacheExists1(AUTHNAME, CStringGetDatum(rolename));
+	tup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(roleid));
+	if (!HeapTupleIsValid(tup))
+		return true;
+	gone = strcmp(NameStr(((Form_pg_authid) GETSTRUCT(tup))->rolname),
+				  rolename) != 0;
+	ReleaseSysCache(tup);
+	return gone;
 }
 
 static void
@@ -918,103 +944,98 @@ ppp_sync_cleanup(void)
 	int			purged = 0;
 	int			purged_missing = 0;
 	int			ghosts = 0;
+	int			released = 0;
 	bool		in_recovery = RecoveryInProgress();
-	pppMissingRow *mrows = NULL;
+	pppMissingRow *mrows;
 	int			nmrows = 0;
-	int			ncandidates = 0;
 	int			nchanged = 0;
 	int			maxmrows;
 	int			i;
 
 	/*
-	 * Turn into ghosts (role_missing = true) the entries of roles dropped or
-	 * renamed since the last attempt: the authentication hook only sets the
-	 * flag at an attempt, so such an entry kept PPP_CLASS_INACTIVE /
-	 * PPP_CLASS_LIVE_COUNTER (or PPP_CLASS_KEEP for an active lock) and the
-	 * purge below used the purge rule of an existing role.  Only the
-	 * false -> true transition is made here, and only for an entry with
-	 * nothing pending (ppp_entry_may_become_ghost):
-	 * - an entry with an audit or an uncommitted lock pending stays as it
-	 *	 is, so that the worker writes its role_gone / role_renamed rows
-	 *	 (ppp_ack_pending, which turns it into a ghost itself once audited)
-	 *	 and it is not evicted before;
-	 * - true -> false is left to the authentication hook (a success, or a
-	 *	 failure whose catalog lookup finds the role): a ghost whose name is
-	 *	 taken by a new role must not hand its pseudo-lock over to it.  The
-	 *	 attempts made under a name before its role was created stay ghost
-	 *	 attempts until then (SPEC 12).
-	 * Hence only the entries whose flag is false are looked up (no repeated
-	 * negative syscache lookups for the ghosts).  They are counted, then
-	 * copied (name, incarnation, update counter) under a shared lock, into
-	 * as many rows as counted (plus a margin; candidates beyond it wait for
-	 * the next cycle); looked up outside it (no catalog access under an
-	 * LWLock); the flag is written back below under the exclusive lock, to
+	 * Entries of roles dropped or renamed since the last attempt: the
+	 * authentication hook only sets role_missing at an attempt, so such an
+	 * entry kept PPP_CLASS_INACTIVE / PPP_CLASS_LIVE_COUNTER (the purge
+	 * below used the purge rule of an existing role), or PPP_CLASS_KEEP for
+	 * a lock.  Only settled entries are concerned (ppp_entry_settled):
+	 * - an entry without an active lock becomes a ghost (false -> true
+	 *	 only; true -> false is left to the authentication hook, a success
+	 *	 or a failure whose catalog lookup finds the role: a ghost whose name
+	 *	 is taken by a new role must not hand its pseudo-lock over to it,
+	 *	 and the attempts made under a name before its role was created stay
+	 *	 ghost attempts until then, SPEC 12);
+	 * - a locked entry never becomes a ghost (invented names could evict
+	 *	 it): once its lock is audited, the entry is removed when no role of
+	 *	 lock_role_oid bears the name any more, so that a role created since
+	 *	 under the name starts from a clean entry (SPEC 12).
+	 * Hence only the entries whose flag is false, or locked, are looked up
+	 * (no repeated negative syscache lookups for the ghosts).  Copied under
+	 * a shared lock (name, incarnation, update counter, OID of the lock),
+	 * looked up outside it (no catalog access under an LWLock), the rows
+	 * that change are kept and applied below under the exclusive lock, to
 	 * the same incarnation of the entry only (generation), not updated by
-	 * the hook since the copy (update_seq: a role created and authenticated
-	 * meanwhile leaves the flag false and the generation unchanged), and
-	 * only if it may still become a ghost (its state may have changed).
+	 * the hook or a lock since the copy (update_seq: a role created and
+	 * authenticated meanwhile leaves the flag false and the generation
+	 * unchanged), and only if it is still a candidate of the same kind.
 	 */
-	LWLockAcquire(ppp_shared->lock, LW_SHARED);
+	mrows = (pppMissingRow *) ppp_alloc_hash_copy(CurrentMemoryContext,
+												  sizeof(pppMissingRow),
+												  &maxmrows, LW_SHARED);
 	hash_seq_init(&seq, ppp_role_hash);
 	while ((entry = (pppRoleEntry *) hash_seq_search(&seq)) != NULL)
-		if (ppp_entry_may_become_ghost(entry))
-			ncandidates++;
+	{
+		bool		locked = ppp_lock_may_be_released(entry, now);
+
+		if (!locked && !ppp_entry_may_become_ghost(entry, now))
+			continue;
+		if (nmrows >= maxmrows)
+		{
+			hash_seq_term(&seq);
+			break;
+		}
+		strlcpy(mrows[nmrows].rolename, entry->key.rolename, NAMEDATALEN);
+		mrows[nmrows].generation = entry->generation;
+		mrows[nmrows].update_seq = entry->update_seq;
+		mrows[nmrows].lock_role_oid = locked ? entry->lock_role_oid : InvalidOid;
+		nmrows++;
+	}
 	LWLockRelease(ppp_shared->lock);
 
-	if (ncandidates > 0)
+	/* keep only the rows whose role is gone */
+	for (i = 0; i < nmrows; i++)
 	{
-		maxmrows = ncandidates + PPP_HASH_COPY_MARGIN;
-		mrows = (pppMissingRow *) palloc(sizeof(pppMissingRow) * maxmrows);
-
-		LWLockAcquire(ppp_shared->lock, LW_SHARED);
-		hash_seq_init(&seq, ppp_role_hash);
-		while ((entry = (pppRoleEntry *) hash_seq_search(&seq)) != NULL)
-		{
-			if (!ppp_entry_may_become_ghost(entry))
-				continue;
-			if (nmrows >= maxmrows)
-			{
-				hash_seq_term(&seq);
-				break;
-			}
-			strlcpy(mrows[nmrows].rolename, entry->key.rolename, NAMEDATALEN);
-			mrows[nmrows].generation = entry->generation;
-			mrows[nmrows].update_seq = entry->update_seq;
-			mrows[nmrows].gone = false;
-			nmrows++;
-		}
-		LWLockRelease(ppp_shared->lock);
-
-		/* mark the rows whose flag changes (role not found) */
-		for (i = 0; i < nmrows; i++)
-		{
-			mrows[i].gone =
-				!SearchSysCacheExists1(AUTHNAME, CStringGetDatum(mrows[i].rolename));
-			if (mrows[i].gone)
-				nchanged++;
-		}
+		if (!ppp_role_gone(mrows[i].rolename, mrows[i].lock_role_oid))
+			continue;
+		if (nchanged != i)
+			mrows[nchanged] = mrows[i];
+		nchanged++;
 	}
 
 	LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
-	for (i = 0; nchanged > 0 && i < nmrows; i++)
+	for (i = 0; i < nchanged; i++)
 	{
 		pppRoleKey	key;
+		bool		locked = OidIsValid(mrows[i].lock_role_oid);
 
-		if (!mrows[i].gone)
-			continue;
 		ppp_make_key(&key, mrows[i].rolename);
 		entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key, HASH_FIND,
 											 NULL);
-		if (entry != NULL && entry->generation == mrows[i].generation &&
-			entry->update_seq == mrows[i].update_seq &&
-			ppp_entry_may_become_ghost(entry))
+		if (entry == NULL || entry->generation != mrows[i].generation ||
+			entry->update_seq != mrows[i].update_seq)
+			continue;
+		if (!locked && ppp_entry_may_become_ghost(entry, now))
 		{
 			entry->role_missing = true;
 			ghosts++;
 		}
+		else if (locked && ppp_lock_may_be_released(entry, now) &&
+				 entry->lock_role_oid == mrows[i].lock_role_oid)
+		{
+			hash_search(ppp_role_hash, &key, HASH_REMOVE, NULL);
+			/* the released rows are logged below */
+			mrows[released++] = mrows[i];
+		}
 	}
-	if (mrows != NULL)
-		pfree(mrows);
 
 	hash_seq_init(&seq, ppp_role_hash);
 	while ((entry = (pppRoleEntry *) hash_seq_search(&seq)) != NULL)
@@ -1074,17 +1095,25 @@ ppp_sync_cleanup(void)
 	}
 
 	/*
-	 * Entries purged, or turned into ghosts (always evictable): room is
-	 * free again, a series of fruitless eviction scans of the
+	 * Entries purged or released, or turned into ghosts (always evictable):
+	 * room is free again, a series of fruitless eviction scans of the
 	 * authentication hook (ppp_enter_role) is over, and so is the
 	 * one-second pause that followed a complete fruitless tour.
 	 */
-	if (purged > 0 || purged_missing > 0 || ghosts > 0)
+	if (purged > 0 || purged_missing > 0 || ghosts > 0 || released > 0)
 	{
 		ppp_shared->evict_fruitless_active = false;
 		ppp_shared->evict_failed_at = 0;
 	}
 	LWLockRelease(ppp_shared->lock);
+
+	for (i = 0; i < released; i++)
+		ereport(LOG,
+				(errmsg(PPP_LOG_PREFIX "lock of dropped role \"%s\" released",
+						mrows[i].rolename),
+				 errdetail("No role of OID %u bears this name any more (dropped or renamed); the lock is audited and a role created under this name starts from a clean entry.",
+						   mrows[i].lock_role_oid)));
+	pfree(mrows);
 
 	if (ghosts > 0)
 		elog(DEBUG1, PPP_LOG_PREFIX "%d shared memory entries of dropped or renamed roles marked role_missing",
@@ -1222,11 +1251,15 @@ ppp_sync_reload(void)
 		}
 	}
 
-	/* persisted active locks ('infinity' comes back as DT_NOEND) */
-	ret = SPI_execute("SELECT COALESCE(r.rolname::text, s.role_name), s.locked_until, "
-					  "r.oid IS NOT NULL "
+	/*
+	 * persisted active locks ('infinity' comes back as DT_NOEND), of
+	 * existing roles only: the row of a dropped role (purged by
+	 * run_maintenance()) would otherwise put its lock back under its old
+	 * name at every reload
+	 */
+	ret = SPI_execute("SELECT r.rolname::text, s.locked_until, r.oid "
 					  "FROM pass_policy.role_state s "
-					  "LEFT JOIN pg_catalog.pg_roles r ON r.oid = s.role_oid "
+					  "JOIN pg_catalog.pg_roles r ON r.oid = s.role_oid "
 					  "WHERE s.locked_until IS NOT NULL AND s.locked_until > now()",
 					  true, 0);
 	if (ret != SPI_OK_SELECT)
@@ -1247,7 +1280,7 @@ ppp_sync_reload(void)
 			if (name)
 				strlcpy(locks[i].rolename, name, NAMEDATALEN);
 			locks[i].locked_until = isnull ? 0 : DatumGetTimestampTz(d);
-			locks[i].role_exists = DatumGetBool(SPI_getbinval(tup, desc, 3, &isnull));
+			locks[i].role_oid = DatumGetObjectId(SPI_getbinval(tup, desc, 3, &isnull));
 		}
 	}
 
@@ -1302,11 +1335,8 @@ ppp_sync_reload(void)
 			continue;
 		}
 		entry->reload_lock_seen = true;
-		if (locks[i].role_exists)
-		{
-			entry->role_missing = false;
-			entry->update_seq++;
-		}
+		entry->role_missing = false;
+		entry->update_seq++;
 
 		/* changed by shmem_lock_role() / shmem_unlock_role() since our snapshot */
 		if (entry->lock_inflight > 0 || entry->lock_seq > seq_snap)
@@ -1320,6 +1350,7 @@ ppp_sync_reload(void)
 		if (entry->locked_until != locks[i].locked_until)
 			entry->lock_set_at = now;
 		entry->locked_until = locks[i].locked_until;
+		entry->lock_role_oid = locks[i].role_oid;
 		entry->lock_from_state = true;
 	}
 
@@ -1433,6 +1464,7 @@ ppp_sync_reload(void)
 static void
 ppp_step_sync(void)
 {
+	ppp_flush_rescue_log();
 	ppp_sync_cleanup();
 	/* kept pending when some persisted locks could not be loaded */
 	if (ppp_reload_pending && ppp_sync_reload())

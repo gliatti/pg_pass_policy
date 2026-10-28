@@ -256,8 +256,14 @@ l'ancien nom ; il est audité (`role_locked`, `details.role_missing`, et
 transféré. Pour garder un compte bloqué pendant un renommage, utiliser
 `lock_role()`. Un autre rôle créé ensuite sous l'ancien nom (`DROP ROLE` puis
 `CREATE ROLE`) ne reçoit pas ce verrou dans `role_state` : le hook mémorise
-l'OID du rôle verrouillé (audit `role_recreated`) ; le verrou en mémoire
-partagée tient seulement jusqu'à son expiration (`unlock_role()` le lève).
+l'OID du rôle verrouillé (audit `role_recreated`). Une fois le verrou
+audité, le tour suivant du worker retire de la mémoire partagée le verrou
+d'un rôle supprimé ou renommé (LOG « lock of dropped role "…" released ») :
+un rôle recréé sous le même nom part d'une entrée propre. Exception : un
+`DROP ROLE` suivi d'un `CREATE ROLE` du même nom avant le passage de
+`run_maintenance()`, que celle-ci prend pour une restauration (lignes de
+`role_state` rattachées au nouvel OID par le nom) : le nouveau rôle hérite
+alors d'un verrou déjà persisté.
 
 Seuls les échecs des méthodes où le client présente un mot de passe ou un
 secret sont comptés : `password`, `md5`, `scram-sha-256`, `ldap`, `pam`,
@@ -307,7 +313,9 @@ Le log garde la trace des admissions (LOG « superuser "…" admitted by
 peer authentication … », avec le nom du rôle) : une ligne par rôle et par
 minute, la suivante donnant le nombre d'admissions de ce rôle non
 journalisées entre-temps (« N earlier admissions of this role were not
-logged ») ; au-delà de 16 rôles suivis à la fois, chaque admission est
+logged ») ; à défaut d'admission suivante, le worker écrit lui-même ce
+nombre une fois la minute écoulée, et tous les nombres en attente dès que
+l'état est chargé ; au-delà de 16 rôles suivis à la fois, chaque admission est
 journalisée, sans limite. Un superutilisateur non
 listé, en `trust` (même sur socket Unix) ou dont le contrôle `peer` échoue,
 un rôle ordinaire (même listé) reçoivent le `57P03`. Une connexion de

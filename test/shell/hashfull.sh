@@ -193,13 +193,15 @@ check_eq "rôles supprimés devenus fantômes : l'échec de regress_gx est compt
 psql_admin "DROP ROLE regress_gx"
 kick || fail "pas de tour du worker après la suppression de regress_gx"
 
-# --- verrou permanent audité d'un rôle supprimé : fantôme (vérification 10) --
+# --- verrou permanent audité d'un rôle supprimé : entrée retirée (vérification 11)
 # Verrou automatique permanent (lock_duration NULL) de regress_perm, audité et
 # acquitté par le worker ; le reste du hash est rempli de compteurs vivants de
 # vrais rôles (non évincables en mode COUNT). Une fois le rôle supprimé, le
-# tour suivant du worker fait de son entrée un fantôme, évincable : l'échec
-# d'un autre rôle est compté. Avant la correction, un verrou actif empêchait
-# la transition et l'entrée gardait son emplacement.
+# tour suivant du worker retire l'entrée du hash (l'OID du verrou n'existe
+# plus), avec un LOG : la place libérée compte l'échec d'un autre rôle. Un
+# rôle recréé sous le même nom part d'une entrée propre, y compris après un
+# rechargement (vérification 10 : l'entrée devenait un fantôme verrouillé,
+# évincable par des noms inventés, hérité ou non selon la pression sur le hash).
 psql_admin "SELECT pass_policy.create_profile('p_perm',
   '{\"max_failures\": 2, \"failure_window\": \"15 minutes\", \"lock_duration\": null, \"min_age\": \"0\"}')" >/dev/null
 psql_admin "CREATE ROLE regress_perm LOGIN PASSWORD '$GOOD'"
@@ -220,14 +222,26 @@ psql_admin "CREATE ROLE regress_pkx LOGIN PASSWORD '$GOOD'"
 check_eq "hash plein : verrou de regress_perm et compteurs vivants de vrais rôles" "$MAX" "$(n_entries)"
 psql_as regress_pkx "$BAD" >/dev/null || true
 check_eq "hash plein non évincable : l'échec de regress_pkx n'est pas compté" "0" "$(n_failed regress_pkx)"
+released='lock of dropped role "regress_perm" released'
+check_eq "aucun LOG de libération avant DROP ROLE" "0" "$(n_log "$released")"
 psql_admin "DROP ROLE regress_perm"
 kick || fail "pas de tour du worker après la suppression de regress_perm"
-wait_until 15 fail_counted regress_pkx || true
-check_eq "verrou permanent audité d'un rôle supprimé devenu fantôme : l'échec de regress_pkx est compté" "1" "$(n_failed regress_pkx)"
-check_eq "l'entrée de regress_perm a été évincée" "0" \
+check_eq "verrou d'un rôle supprimé : l'entrée a disparu du hash au tour suivant du worker" "0" \
 	"$(psql_admin "SELECT count(*) FROM pass_policy.failed_attempts() WHERE role_name = 'regress_perm'")"
-for i in $(seq 1 "$MAX"); do psql_admin "DROP ROLE regress_pk$i"; done
+check_eq "verrou d'un rôle supprimé : LOG de libération" "1" "$(n_log "$released")"
+psql_as regress_pkx "$BAD" >/dev/null || true
+check_eq "place libérée : l'échec de regress_pkx est compté" "1" "$(n_failed regress_pkx)"
 psql_admin "DROP ROLE regress_pkx"
+psql_admin "CREATE ROLE regress_perm LOGIN PASSWORD '$GOOD'"
+out=$(psql_as regress_perm "$GOOD" "SELECT current_user") || true
+check_eq "rôle recréé sous le même nom : connexion réussie" "regress_perm" "$out"
+kick || fail "pas de rechargement après la recréation de regress_perm"
+out=$(psql_as regress_perm "$GOOD" "SELECT current_user") || true
+check_eq "rôle recréé : le rechargement ne réinjecte pas le verrou orphelin" "regress_perm" "$out"
+check_eq "rôle recréé : aucun verrou hérité en mémoire partagée" "0" \
+	"$(psql_admin "SELECT count(*) FROM pass_policy.failed_attempts() WHERE role_name = 'regress_perm' AND locked_until IS NOT NULL")"
+psql_admin "DROP ROLE regress_perm"
+for i in $(seq 1 "$MAX"); do psql_admin "DROP ROLE regress_pk$i"; done
 psql_admin "SELECT pass_policy.drop_profile('p_perm')" >/dev/null
 kick || fail "pas de tour du worker après la suppression des rôles regress_pk*"
 

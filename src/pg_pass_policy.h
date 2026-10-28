@@ -58,7 +58,9 @@ extern bool  ppp_enforce_database;
  * Rescue admissions (superuser of pg_pass_policy.rescue_roles authenticated
  * by peer during the start-up window): one LOG per role and per
  * PPP_RESCUE_LOG_SECS, the next one telling how many admissions of that
- * role were not logged meanwhile.  The roles are tracked in a fixed table
+ * role were not logged meanwhile; the worker logs that number itself once
+ * the period has elapsed, and at once when the window closes
+ * (ppp_flush_rescue_log).  The roles are tracked in a fixed table
  * of PPP_RESCUE_LOG_SLOTS slots; when it is full, the admissions of the
  * roles it does not hold are logged without any limit (a role is never
  * hidden).
@@ -131,6 +133,16 @@ typedef struct pppRoleEntry
 	Oid			audit_role_oid;
 
 	/*
+	 * OID of the role that bore this name when locked_until was last set
+	 * (authentication hook, PRE_COMMIT of shmem_lock_role(), re-injection
+	 * from role_state; InvalidOid if unknown).  Once the lock is fully
+	 * audited, the worker removes the entry when no role of that OID bears
+	 * the name any more (ppp_sync_cleanup): a locked entry never becomes a
+	 * ghost, and a role created since under the name starts afresh.
+	 */
+	Oid			lock_role_oid;
+
+	/*
 	 * When locked_until was last set to a new lock (authentication hook,
 	 * PRE_COMMIT of shmem_lock_role(), re-injection by the worker).  An
 	 * unlock committed afterwards only lifts a lock set before it was
@@ -166,10 +178,11 @@ typedef struct pppRoleEntry
 	 * (success or counted failure, whatever the new value of role_missing),
 	 * and wherever role_missing is cleared (lock_role(), reload).  The
 	 * worker copies it with the name before its catalog lookup, made
-	 * outside the LWLock, and turns the entry into a ghost only if it has
-	 * not changed when it writes the flag back (ppp_sync_cleanup): a role
-	 * created and authenticated in between leaves the flag false and the
-	 * generation unchanged, this counter tells it.
+	 * outside the LWLock, and turns the entry into a ghost, or removes a
+	 * lock of a dropped role, only if it has not changed when it comes back
+	 * under the exclusive lock (ppp_sync_cleanup): a role created and
+	 * authenticated in between leaves the flag false and the generation
+	 * unchanged, this counter tells it.
 	 */
 	uint32		update_seq;
 
@@ -423,6 +436,8 @@ extern pppRoleEntry *ppp_enter_role(const char *rolename, pppEnterMode mode,
 									TimestampTz now, bool in_recovery,
 									pppEviction *ev);
 extern void ppp_log_eviction(const pppEviction *ev);
+/* worker: LOG the rescue admissions not logged yet (see PPP_RESCUE_LOG_SLOTS) */
+extern void ppp_flush_rescue_log(void);
 /*
  * Allocate in cxt one row of rowsize bytes per hash entry (plus
  * PPP_HASH_COPY_MARGIN), then return with ppp_shared->lock held in mode;

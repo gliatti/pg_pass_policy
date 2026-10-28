@@ -846,19 +846,43 @@ if [ "$n" -ge 1 ] && [ "$n" -lt 9 ]; then
 else
 	fail "fenêtre : LOG attendu entre 1 et 8 fois, obtenu $n"
 fi
-# (vérification 10, (4)) une minute après le premier LOG de regress_su_peer, la
-# ligne suivante donne le nombre d'admissions non journalisées (2)
+# (vérification 10, (4) ; vérification 11, (4) et (9)) une minute après le
+# premier LOG de regress_su_peer, le worker journalise lui-même les deux
+# admissions non journalisées, sans attendre une admission suivante. Attente
+# réelle de 61 s (pas de GUC de test, docs/TESTING.md) : la fenêtre doit rester
+# ouverte (locks_loaded = false) tout du long, vérifié avant et après, pour
+# qu'un échec soit explicite plutôt qu'intermittent.
+check_eq "fenêtre : toujours ouverte avant l'attente d'une minute (locks_loaded = false)" "f" \
+	"$(psql_admin "SELECT locks_loaded FROM pass_policy.worker_status()")"
 while [ $((SECONDS - rescue_t0)) -le 61 ]; do sleep 1; done
+check_eq "fenêtre : toujours ouverte après l'attente d'une minute (locks_loaded = false)" "f" \
+	"$(psql_admin "SELECT locks_loaded FROM pass_policy.worker_status()")"
+rescue_flush() { tail -n "+$((log0 + 1))" "$PPP_TMP/server.log" | grep -c "$1 of superuser \"regress_su_peer\" by peer authentication before the lock state was loaded $2 not logged" || true; }
+flush_seen() { [ "$(rescue_flush "$@")" = 1 ]; }
+if wait_until 15 flush_seen "2 admissions" were; then
+	ok "fenêtre : le worker journalise les 2 admissions non journalisées une fois la période écoulée"
+else
+	fail "fenêtre : pas de LOG du worker pour les 2 admissions non journalisées"
+fi
 out=$(psql_local regress_su_peer) || true
 check_eq "fenêtre : admission de secours une minute plus tard" "regress_su_peer" "$out"
 check_eq "fenêtre : nouveau LOG de secours après une minute" "2" "$(n_rescue regress_su_peer)"
 out=$(tail -n "+$((log0 + 1))" "$PPP_TMP/server.log" | grep -A1 "superuser \"regress_su_peer\" $rescue_log" | tail -1)
-check_contains "fenêtre : le LOG donne les admissions non journalisées du rôle" "2 earlier admissions of this role were not logged" "$out"
+check_not_contains "fenêtre : ce LOG ne recompte pas les admissions déjà journalisées par le worker" "earlier admission" "$out"
+# une admission de plus dans la période : journalisée par le worker à la
+# fermeture de la fenêtre (aucune admission ne reste non journalisée)
+out=$(psql_local regress_su_peer) || true
+check_eq "fenêtre : admission de secours dans la période, pas de nouveau LOG" "regress_su_peer|2" "$out|$(n_rescue regress_su_peer)"
 psql_admin "ALTER TABLE pass_policy.role_state_hidden RENAME TO role_state" >/dev/null
 if wait_for 30 "SELECT last_reload IS NOT NULL FROM pass_policy.worker_status()"; then
 	ok "fenêtre, worker_interval = 0 : le rechargement est retenté sans SIGHUP"
 else
 	fail "fenêtre, worker_interval = 0 : pas de rechargement après le retour de role_state"
+fi
+if wait_until 15 flush_seen "1 admission" was; then
+	ok "fenêtre fermée : le worker journalise l'admission restée non journalisée"
+else
+	fail "fenêtre fermée : admission de secours restée non journalisée"
 fi
 out=$(psql_as regress_lock "$GOOD" "SELECT current_user") || true
 check_contains "fenêtre fermée : refus « locked »" "is locked by pg_pass_policy" "$out"
