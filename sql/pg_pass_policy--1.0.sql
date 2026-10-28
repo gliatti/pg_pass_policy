@@ -51,8 +51,11 @@ CREATE TABLE profile (
     profile_id        serial PRIMARY KEY,
     name              text NOT NULL UNIQUE
                       CHECK (name ~ '^[A-Za-z0-9_.-]{1,63}$'),
-    min_length        int NOT NULL DEFAULT 12  CHECK (min_length >= 8),
-    max_length        int NOT NULL DEFAULT 128 CHECK (max_length <= 1024),
+    -- 512 = PPP_GEN_MAX_LENGTH (policy.c), the longest password that
+    -- generate_password() produces: a profile whose bounds exceed it could
+    -- never be rotated.  Keep both values in step.
+    min_length        int NOT NULL DEFAULT 12  CHECK (min_length BETWEEN 8 AND 512),
+    max_length        int NOT NULL DEFAULT 128 CHECK (max_length <= 512),
     min_lower         int NOT NULL DEFAULT 1   CHECK (min_lower   >= 0),
     min_upper         int NOT NULL DEFAULT 1   CHECK (min_upper   >= 0),
     min_digit         int NOT NULL DEFAULT 1   CHECK (min_digit   >= 0),
@@ -78,7 +81,8 @@ CREATE TABLE profile (
     created_at        timestamptz NOT NULL DEFAULT now(),
     updated_at        timestamptz NOT NULL DEFAULT now(),
     CONSTRAINT profile_length_range CHECK (max_length >= min_length),
-    CONSTRAINT profile_classes_fit  CHECK (min_lower + min_upper + min_digit + min_special <= max_length)
+    -- bigint: the sum of four large minima must not overflow int4
+    CONSTRAINT profile_classes_fit  CHECK (min_lower::bigint + min_upper + min_digit + min_special <= max_length)
 );
 COMMENT ON TABLE profile IS 'Password policy profiles; "default" applies to every role without an assignment';
 
@@ -423,7 +427,12 @@ LANGUAGE sql STABLE
 SET search_path = pg_catalog, pg_temp
 AS $$
     SELECT coalesce((SELECT r.rolsuper FROM pg_catalog.pg_roles r WHERE r.rolname = session_user), false)
-        OR pg_catalog.pg_has_role(session_user, 'pass_policy_admin', 'MEMBER')
+        -- pg_has_role() by name raises "role does not exist" once
+        -- pass_policy_admin has been dropped: look the role up first and
+        -- pass its OID (a superuser keeps access through rolsuper)
+        OR EXISTS (SELECT FROM pg_catalog.pg_roles g
+                    WHERE g.rolname = 'pass_policy_admin'
+                      AND pg_catalog.pg_has_role(session_user, g.oid, 'MEMBER'))
 $$;
 COMMENT ON FUNCTION _is_admin() IS 'Internal: true if session_user is a superuser or a member of pass_policy_admin';
 
@@ -1177,7 +1186,9 @@ COMMENT ON FUNCTION unassign_profile(name) IS 'Removes the profile assignment of
  * hook did not run.
  *
  * Length: p_length NULL (default of the callers) = 24 characters, raised
- * to the min_length of the profile and capped by its max_length; an
+ * to the min_length of the profile and to the sum of its class minima
+ * (min_lower + min_upper + min_digit + min_special), capped by its
+ * max_length (profile_classes_fit keeps the sum within it); an
  * explicit p_length outside [min_length, max_length] is refused (22023).
  */
 CREATE FUNCTION _rotate_role(p_role name, p_oid oid, p_length int,
@@ -1188,18 +1199,21 @@ AS $$
 DECLARE
     v_min int;
     v_max int;
+    v_cls int;
     v_len int;
 BEGIN
     -- read once: the caller's audit row names the profile actually used
-    SELECT p.name, p.min_length, p.max_length INTO profile, v_min, v_max
+    SELECT p.name, p.min_length, p.max_length,
+           p.min_lower + p.min_upper + p.min_digit + p.min_special
+      INTO profile, v_min, v_max, v_cls
       FROM pass_policy.effective_profile(p_role) p;
     IF p_length IS NULL THEN
-        v_len := least(greatest(24, v_min), v_max);
+        v_len := least(greatest(24, v_min, v_cls), v_max);
     ELSIF p_length < v_min OR p_length > v_max THEN
         RAISE EXCEPTION 'pg_pass_policy: password length % is outside the bounds of profile "%"', p_length, profile
               USING ERRCODE = 'invalid_parameter_value',
                     DETAIL = format('Profile "%s" requires %s to %s characters.', profile, v_min, v_max),
-                    HINT = 'Omit the length to use the default (24 characters, raised to min_length).';
+                    HINT = 'Omit the length to use the default (24 characters, raised to min_length and to the sum of the class minima).';
     ELSE
         v_len := p_length;
     END IF;

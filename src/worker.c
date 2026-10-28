@@ -120,13 +120,14 @@ typedef struct pppPendingRow
 	uint64		lock_seq;		/* entry->lock_seq when copied */
 	bool		state_written;	/* role_state upserted with locked_until */
 	bool		role_missing;	/* non-existent user name (authentication hook) */
+	bool		role_gone;		/* existing name when locked, no longer in
+								 * pg_roles (renamed or dropped since) */
 } pppPendingRow;
 
-/* lockout parameters of a role, read from the profiles */
+/* lockout parameters of an existing role, read from the profiles */
 typedef struct pppProfileRow
 {
 	char		rolename[NAMEDATALEN];
-	bool		role_exists;
 	int32		max_failures;
 	int32		failure_window_secs;
 	int32		lock_duration_secs;
@@ -384,13 +385,21 @@ ppp_sync_pending(void)
 		rows[nrows].audit_locked_until = entry->audit_locked_until;
 		rows[nrows].audit_lock_seq = entry->audit_lock_seq;
 		rows[nrows].lost_episodes = 0;
+
+		/*
+		 * Signed difference, bounded at 0: audit_acked_seq is never ahead
+		 * of audit_lock_seq (ppp_ack_pending), but an unsigned difference
+		 * would turn any inconsistency into some four billion lost
+		 * episodes.
+		 */
 		if (entry->lock_pending_audit &&
-			entry->audit_lock_seq - entry->audit_acked_seq > 1)
+			(int32) (entry->audit_lock_seq - entry->audit_acked_seq) > 1)
 			rows[nrows].lost_episodes = entry->audit_lock_seq -
 				entry->audit_acked_seq - 1;
 		rows[nrows].lock_seq = entry->lock_seq;
 		rows[nrows].state_written = false;
 		rows[nrows].role_missing = entry->role_missing;
+		rows[nrows].role_gone = false;
 		nrows++;
 	}
 	LWLockRelease(ppp_shared->lock);
@@ -441,9 +450,13 @@ ppp_sync_pending(void)
 
 		if (r->lock_pending_audit && r->audit_locked_until != 0)
 		{
-			Oid			argtypes[6] = {TEXTOID, TIMESTAMPTZOID, INT4OID, BOOLOID, INT8OID, BOOLOID};
-			Datum		values[6];
-			char		nulls[6] = {' ', ' ', ' ', ' ', ' ', ' '};
+			Oid			argtypes[8] = {TEXTOID, TIMESTAMPTZOID, INT4OID, BOOLOID,
+				INT8OID, BOOLOID, TEXTOID, BOOLOID};
+			Datum		values[8];
+			char		nulls[8] = {' ', ' ', ' ', ' ', ' ', ' ', 'n', ' '};
+			Oid			lookup_type[1] = {TEXTOID};
+			Datum		lookup_value[1];
+			bool		isnull;
 
 			/*
 			 * The lock was lifted (unlock_role(): locked_until cleared,
@@ -461,12 +474,55 @@ ppp_sync_pending(void)
 			bool		still_locked = (r->locked_until == r->audit_locked_until);
 			bool		replaced = !still_locked && r->locked_until != 0;
 
+			/*
+			 * The entry is keyed by the user name, role_state by the OID.
+			 * The role may have been renamed (ALTER ROLE ... RENAME) or
+			 * dropped since the lock: its role_state row cannot be written
+			 * then, and the lock stays with the old name, which no longer
+			 * logs in (SPEC 12: the new name starts afresh).  The audit
+			 * row says so (role_missing, and role_renamed / renamed_to when
+			 * role_state or role_profile still carry the old name of an
+			 * existing OID) instead of being acknowledged as if the lock had
+			 * been persisted; the entry becomes a ghost at the
+			 * acknowledgement (ppp_ack_pending).
+			 */
+			values[6] = (Datum) 0;
+			lookup_value[0] = CStringGetTextDatum(r->rolename);
+			ret = SPI_execute_with_args(
+										"SELECT EXISTS (SELECT FROM pg_catalog.pg_roles r "
+										"WHERE r.rolname OPERATOR(pg_catalog.=) $1), "
+										"(SELECT r.rolname::pg_catalog.text FROM ("
+										"SELECT s.role_oid FROM pass_policy.role_state s "
+										"WHERE s.role_name OPERATOR(pg_catalog.=) $1 "
+										"UNION SELECT rp.role_oid FROM pass_policy.role_profile rp "
+										"WHERE rp.role_name OPERATOR(pg_catalog.=) $1) o "
+										"JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) o.role_oid "
+										"ORDER BY 1 LIMIT 1)",
+										1, lookup_type, lookup_value, NULL, false, 1);
+			if (ret != SPI_OK_SELECT || SPI_processed != 1)
+				elog(ERROR, "role lookup of \"%s\" returned SPI code %d", r->rolename, ret);
+			r->role_gone = !DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+														SPI_tuptable->tupdesc,
+														1, &isnull));
+			if (r->role_gone)
+			{
+				char	   *new_name = SPI_getvalue(SPI_tuptable->vals[0],
+													SPI_tuptable->tupdesc, 2);
+
+				if (new_name != NULL)
+				{
+					values[6] = CStringGetTextDatum(new_name);
+					nulls[6] = ' ';
+				}
+			}
+
 			values[0] = CStringGetTextDatum(r->rolename);
 			values[1] = TimestampTzGetDatum(r->audit_locked_until); /* DT_NOEND = infinity */
 			values[2] = Int32GetDatum(r->failed_count);
 			values[3] = BoolGetDatum(!still_locked && !replaced);
 			values[4] = Int64GetDatum((int64) r->lost_episodes);
 			values[5] = BoolGetDatum(replaced);
+			values[7] = BoolGetDatum(r->role_gone);
 
 			/*
 			 * lost_episodes: earlier automatic locks of the role whose own
@@ -486,14 +542,20 @@ ppp_sync_pending(void)
 										"ELSE '{}'::pg_catalog.jsonb END "
 										"OPERATOR(pg_catalog.||) CASE WHEN $5 OPERATOR(pg_catalog.>) 0 THEN "
 										"pg_catalog.jsonb_build_object('lost_episodes', $5) "
+										"ELSE '{}'::pg_catalog.jsonb END "
+										"OPERATOR(pg_catalog.||) CASE WHEN $7 IS NOT NULL THEN "
+										"pg_catalog.jsonb_build_object('role_missing', true, "
+										"'role_renamed', true, 'renamed_to', $7) "
+										"WHEN $8 THEN "
+										"pg_catalog.jsonb_build_object('role_missing', true) "
 										"ELSE '{}'::pg_catalog.jsonb END)",
-										6, argtypes, values, nulls, false, 0);
+										8, argtypes, values, nulls, false, 0);
 			if (ret != SPI_OK_SELECT)
 				elog(ERROR, "audit('role_locked') returned SPI code %d", ret);
 		}
 
 		if (r->lock_pending_audit && r->audit_locked_until != 0 &&
-			r->locked_until == r->audit_locked_until)
+			r->locked_until == r->audit_locked_until && !r->role_gone)
 		{
 			Oid			argtypes[2] = {TEXTOID, TIMESTAMPTZOID};
 			Datum		values[2];
@@ -517,6 +579,17 @@ ppp_sync_pending(void)
 										2, argtypes, values, nulls, false, 0);
 			if (ret != SPI_OK_INSERT)
 				elog(ERROR, "role_state upsert returned SPI code %d", ret);
+
+			/*
+			 * Renamed or dropped after the lookup above: the role_locked row
+			 * written above would claim a persisted lock.  Roll back and
+			 * start again at the next cycle, which sees the role gone.
+			 */
+			if (SPI_processed != 1)
+				ereport(ERROR,
+						(errmsg(PPP_LOG_PREFIX "role \"%s\" disappeared while its automatic lock was being written",
+								r->rolename),
+						 errdetail("The pending audit rows are written again at the next cycle.")));
 			r->state_written = true;
 		}
 	}
@@ -613,19 +686,47 @@ ppp_ack_pending(void)
 		entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key, HASH_FIND, NULL);
 		if (entry == NULL)
 			continue;
+
+		/*
+		 * The entry found under this name may not be the one copied: it
+		 * may have been evicted and entered again in between, its episode
+		 * numbers starting again from 0.  Such an entry (episode number
+		 * behind the copied one, or the same number for another lock) is
+		 * left as it is: what it holds was not written, and it is written
+		 * at the next cycle.  audit_acked_seq thus never gets ahead of
+		 * audit_lock_seq, and lost_episodes stays meaningful.
+		 */
+		if ((int32) (entry->audit_lock_seq - r->audit_lock_seq) < 0 ||
+			(r->lock_pending_audit &&
+			 entry->audit_lock_seq == r->audit_lock_seq &&
+			 entry->audit_locked_until != r->audit_locked_until))
+			continue;
+
 		entry->pending_failures -= r->pending_failures;
 		if (entry->pending_failures < 0)
 			entry->pending_failures = 0;
+
 		/*
 		 * A lock set again since (later episode) stays pending; the
-		 * episodes up to the one written are acknowledged.
+		 * episodes up to the one written are acknowledged, the pending flag
+		 * is only cleared for the very lock written.
 		 */
 		if (r->lock_pending_audit)
 		{
-			if (entry->audit_lock_seq == r->audit_lock_seq)
+			bool		same_lock = (entry->audit_lock_seq == r->audit_lock_seq);
+
+			if (same_lock)
 				entry->lock_pending_audit = false;
 			if ((int32) (r->audit_lock_seq - entry->audit_acked_seq) > 0)
 				entry->audit_acked_seq = r->audit_lock_seq;
+
+			/*
+			 * Renamed or dropped role: its lock was audited with
+			 * role_missing and not persisted; the name no longer logs in,
+			 * the entry becomes a ghost (evictable, purged once inactive).
+			 */
+			if (r->role_gone && same_lock)
+				entry->role_missing = true;
 		}
 	}
 	LWLockRelease(ppp_shared->lock);
@@ -818,14 +919,18 @@ ppp_sync_reload(void)
 		def_lock = ppp_spi_get_int32(tup, desc, 3, -1);
 	}
 
-	/* roles with an assigned profile; current name taken from pg_roles */
-	ret = SPI_execute("SELECT COALESCE(r.rolname::text, rp.role_name), p.max_failures, "
+	/*
+	 * Roles with an assigned profile, current name taken from pg_roles.
+	 * Only existing roles: the row of a dropped role (purged by
+	 * run_maintenance()) would otherwise give its old name a from_profile
+	 * entry (PPP_CLASS_KEEP, never evicted) for nothing.
+	 */
+	ret = SPI_execute("SELECT r.rolname::text, p.max_failures, "
 					  PPP_SQL_WINDOW_SECS ", "
-					  PPP_SQL_LOCK_SECS ", "
-					  "r.oid IS NOT NULL "
+					  PPP_SQL_LOCK_SECS " "
 					  "FROM pass_policy.role_profile rp "
 					  "JOIN pass_policy.profile p USING (profile_id) "
-					  "LEFT JOIN pg_catalog.pg_roles r ON r.oid = rp.role_oid",
+					  "JOIN pg_catalog.pg_roles r ON r.oid = rp.role_oid",
 					  true, 0);
 	if (ret != SPI_OK_SELECT)
 		elog(ERROR, "reading role profiles returned SPI code %d", ret);
@@ -838,7 +943,6 @@ ppp_sync_reload(void)
 			HeapTuple	tup = SPI_tuptable->vals[i];
 			TupleDesc	desc = SPI_tuptable->tupdesc;
 			char	   *name = SPI_getvalue(tup, desc, 1);
-			bool		isnull;
 
 			memset(profiles[i].rolename, 0, NAMEDATALEN);
 			if (name)
@@ -846,7 +950,6 @@ ppp_sync_reload(void)
 			profiles[i].max_failures = ppp_spi_get_int32(tup, desc, 2, 0);
 			profiles[i].failure_window_secs = ppp_spi_get_int32(tup, desc, 3, 0);
 			profiles[i].lock_duration_secs = ppp_spi_get_int32(tup, desc, 4, -1);
-			profiles[i].role_exists = DatumGetBool(SPI_getbinval(tup, desc, 5, &isnull));
 		}
 	}
 
@@ -970,8 +1073,7 @@ ppp_sync_reload(void)
 		entry->lock_duration_secs = profiles[i].lock_duration_secs;
 		entry->from_profile = true;
 		entry->reload_profile_seen = true;
-		if (profiles[i].role_exists)
-			entry->role_missing = false;
+		entry->role_missing = false;
 	}
 
 	hash_seq_init(&seq, ppp_role_hash);

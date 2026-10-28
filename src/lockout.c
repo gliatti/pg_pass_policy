@@ -252,7 +252,9 @@ ppp_expire_lock(pppRoleEntry *entry, TimestampTz now, bool check_inflight)
  * previous scan stopped (ppp_shared->evict_scan_bucket), and the victim is
  * the best one of that window.  A fruitless window is treated as "no room"
  * for this attempt (ev->scan_skipped, not logged); once fruitless windows
- * have covered every entry (ppp_shared->evict_scan_fruitless), the scan is
+ * have covered every bucket (ppp_shared->evict_fruitless_*: one real tour of
+ * the buckets, whatever the number of entries examined twice when a scan
+ * resumes in the middle of a chain), the scan is
  * not repeated for one second (ppp_shared->evict_failed_at): the hash is
  * then full of entries the hook may not evict, and a flood of failed
  * connections would otherwise keep scanning it under the exclusive lock.
@@ -294,7 +296,10 @@ ppp_enter_role(const char *rolename, pppEnterMode mode, TimestampTz now,
 		long		nentries = hash_get_num_entries(ppp_role_hash);
 		long		limit = nentries;
 		long		examined = 0;
+		long		examined_at_end = -1;	/* examined when the end was first
+											 * reached, -1 = not reached */
 		uint32		start_bucket = 0;
+		uint32		next_bucket = 0;
 		bool		wrapped;
 		bool		scanning;
 
@@ -326,6 +331,8 @@ ppp_enter_role(const char *rolename, pppEnterMode mode, TimestampTz now,
 			if (e == NULL)
 			{
 				/* hash_seq_search() has terminated the scan */
+				if (examined_at_end < 0)
+					examined_at_end = examined;
 				if (wrapped)
 				{
 					scanning = false;
@@ -350,8 +357,6 @@ ppp_enter_role(const char *rolename, pppEnterMode mode, TimestampTz now,
 
 		if (mode == PPP_ENTER_COUNT)
 		{
-			uint32		next_bucket = 0;
-
 			if (scanning)
 			{
 				/*
@@ -373,12 +378,42 @@ ppp_enter_role(const char *rolename, pppEnterMode mode, TimestampTz now,
 		{
 			if (mode == PPP_ENTER_COUNT)
 			{
-				ppp_shared->evict_scan_fruitless += examined;
-				if (ppp_shared->evict_scan_fruitless >= nentries)
+				bool		toured;
+
+				/*
+				 * Follow the series of fruitless scans by bucket positions:
+				 * the buckets examined so far are those from
+				 * evict_fruitless_from to next_bucket, past the last bucket
+				 * once evict_fruitless_wrapped is set.  A scan that reached
+				 * the end before examining any entry (resumed beyond the
+				 * last non-empty bucket) starts its series at bucket 0.
+				 */
+				if (!ppp_shared->evict_fruitless_active)
 				{
-					/* every entry examined in vain: give up for a second */
+					ppp_shared->evict_fruitless_active = true;
+					if (examined_at_end == 0)
+					{
+						ppp_shared->evict_fruitless_from = 0;
+						ppp_shared->evict_fruitless_wrapped = false;
+					}
+					else
+					{
+						ppp_shared->evict_fruitless_from = start_bucket;
+						ppp_shared->evict_fruitless_wrapped = (examined_at_end > 0);
+					}
+				}
+				else if (examined_at_end >= 0)
+					ppp_shared->evict_fruitless_wrapped = true;
+
+				/* !scanning: this scan alone went round the whole hash */
+				toured = !scanning ||
+					(ppp_shared->evict_fruitless_wrapped &&
+					 next_bucket >= ppp_shared->evict_fruitless_from);
+				if (toured)
+				{
+					/* every bucket examined in vain: give up for a second */
 					ppp_shared->evict_failed_at = now;
-					ppp_shared->evict_scan_fruitless = 0;
+					ppp_shared->evict_fruitless_active = false;
 				}
 				else if (ev)
 					ev->scan_skipped = true;
@@ -386,7 +421,7 @@ ppp_enter_role(const char *rolename, pppEnterMode mode, TimestampTz now,
 			return NULL;
 		}
 		if (mode == PPP_ENTER_COUNT)
-			ppp_shared->evict_scan_fruitless = 0;
+			ppp_shared->evict_fruitless_active = false;
 
 		if (ev)
 		{

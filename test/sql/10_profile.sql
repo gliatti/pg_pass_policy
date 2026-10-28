@@ -30,6 +30,16 @@ SELECT ppp_test.try($$SELECT pass_policy.create_profile('p_bad', '{"profile_id":
 -- Valeur invalide (type)
 SELECT ppp_test.try($$SELECT pass_policy.create_profile('p_bad', '{"min_length": "abc"}')$$) <> 'ok' AS bad_value_refused;
 
+-- (vérification) Bornes absolues alignées sur generate_password() (8 à 512,
+-- PPP_GEN_MAX_LENGTH) et somme des minima de classes <= max_length : 23514
+SELECT ppp_test.try($$SELECT pass_policy.create_profile('p_bad', '{"min_length": 513, "max_length": 512}')$$) AS min_length_over_512;
+SELECT ppp_test.try($$SELECT pass_policy.create_profile('p_bad', '{"max_length": 513}')$$) AS max_length_over_512;
+SELECT ppp_test.try($$SELECT pass_policy.create_profile('p_bad', '{"min_length": 512, "max_length": 512}')$$) AS length_512_ok;
+SELECT pass_policy.drop_profile('p_bad');
+SELECT ppp_test.try($$SELECT pass_policy.create_profile('p_bad', '{"min_digit": 128}')$$) AS classes_over_max_length;
+SELECT ppp_test.try($$SELECT pass_policy.create_profile('p_bad', '{"min_lower": 2000000000, "min_upper": 2000000000}')$$) AS classes_sum_no_overflow;
+SELECT count(*) AS p_bad_rows FROM pass_policy.profile WHERE name = 'p_bad';
+
 -- alter_profile
 SELECT pass_policy.alter_profile('p_plain', '{"min_length": 14, "max_age": null}');
 SELECT name, min_length, max_age, updated_at >= created_at AS updated

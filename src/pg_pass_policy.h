@@ -249,13 +249,19 @@ typedef struct pppSharedState
 	 * Bounded eviction scan of PPP_ENTER_COUNT mode (ppp_enter_role): the
 	 * hook examines at most PPP_EVICT_SCAN_LIMIT entries per attempt,
 	 * starting from the bucket where the previous scan stopped
-	 * (evict_scan_bucket).  evict_scan_fruitless counts the entries examined
-	 * since an evictable one was last found; once it reaches the number of
-	 * entries, the whole hash has been examined in vain and evict_failed_at
-	 * is set.
+	 * (evict_scan_bucket).  A series of fruitless scans (no evictable entry
+	 * found) is followed by bucket positions, not by entry counts: a scan
+	 * stopped in the middle of a chain resumes at the start of that bucket,
+	 * and counting the entries would count those twice.  The series starts
+	 * at bucket evict_fruitless_from; evict_fruitless_wrapped is set once
+	 * it has gone past the last bucket.  When a wrapped series reaches
+	 * evict_fruitless_from again, every bucket has been examined in vain:
+	 * evict_failed_at is set.  A victim found ends the series.
 	 */
 	uint32		evict_scan_bucket;
-	int64		evict_scan_fruitless;
+	uint32		evict_fruitless_from;
+	bool		evict_fruitless_active;
+	bool		evict_fruitless_wrapped;
 
 	/*
 	 * Incremented (under the lock) each time a lock or unlock requested

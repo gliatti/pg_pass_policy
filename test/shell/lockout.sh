@@ -563,6 +563,64 @@ check_contains "démarrage : après le premier tour, refus « locked »" "is loc
 out=$(psql_as regress_exempt "$GOOD" "SELECT current_user") || true
 check_eq "démarrage : le rôle exempté se connecte" "regress_exempt" "$out"
 
+# --- (vérification) worker_interval = 0 : rechargement sans run_maintenance() --
+# Le worker ne tourne que sur demande (shmem_reload) et ne lance jamais
+# run_maintenance() : une ligne role_profile d'un rôle supprimé n'est pas
+# purgée. Le rechargement ne doit pas en tirer une entrée « profil » (KEEP,
+# jamais évincée) pour l'ancien nom : elle redevient ordinaire, puis est purgée.
+reload_sync() {
+	local t
+	t=$(psql_admin "SELECT clock_timestamp()")
+	psql_admin "SELECT pass_policy.shmem_reload()" >/dev/null
+	wait_reload "$t"
+}
+n_tracked() { psql_admin "SELECT tracked_roles FROM pass_policy.worker_status()"; }
+reload_sync || fail "pas de rechargement (worker_interval = 0)"
+reload_sync || true
+n0=$(n_tracked)
+psql_admin "CREATE ROLE regress_orphan LOGIN" >/dev/null
+psql_admin "SELECT pass_policy.assign_profile('regress_orphan', 'p_lock')" >/dev/null
+reload_sync || fail "pas de rechargement après assign_profile(regress_orphan)"
+check_eq "profil assigné : une entrée de plus en mémoire partagée" "$((n0 + 1))" "$(n_tracked)"
+psql_admin "DROP ROLE regress_orphan" >/dev/null
+reload_sync || true
+reload_sync || true
+out=$(psql_admin "SELECT count(*) FROM pass_policy.role_profile WHERE role_name = 'regress_orphan'")
+check_eq "rôle supprimé : ligne role_profile orpheline encore présente (pas de run_maintenance)" "1" "$out"
+check_eq "rôle supprimé : plus aucune entrée profil pour lui après rechargement" "$n0" "$(n_tracked)"
+
+# --- (vérification) verrou automatique puis ALTER ROLE ... RENAME (SPEC §12) --
+# L'entrée de la mémoire partagée est indexée par le nom, role_state par l'OID.
+# Renommé avant le passage du worker (worker_interval = 0 : il ne tourne que
+# sur demande), le rôle n'a plus de ligne pg_roles sous l'ancien nom : l'audit
+# role_locked est écrit sous l'ancien nom avec role_missing / role_renamed /
+# renamed_to, une seule fois, et le verrou n'est pas transféré au nouveau nom.
+psql_admin "CREATE ROLE regress_ren LOGIN PASSWORD '$GOOD'" >/dev/null
+# profil assigné : la ligne role_profile garde l'ancien nom, ce qui permet au
+# worker de nommer le nouveau (renamed_to) ; sans elle ni ligne role_state,
+# seul role_missing est écrit
+psql_admin "SELECT pass_policy.assign_profile('regress_ren', 'p_lock')" >/dev/null
+reload_sync || true	# tour éventuellement demandé par CREATE ROLE, terminé avant les échecs
+for i in 1 2 3 4 5; do psql_as regress_ren "$BAD" >/dev/null || true; done
+out=$(psql_as regress_ren "$GOOD") || true
+check_contains "regress_ren verrouillé automatiquement (5 échecs)" "is locked by pg_pass_policy" "$out"
+out=$(psql_admin "SELECT count(*) FROM pass_policy.audit_log WHERE event_type = 'role_locked' AND role_name = 'regress_ren'")
+check_eq "verrou automatique pas encore audité (worker non réveillé)" "0" "$out"
+psql_admin "ALTER ROLE regress_ren RENAME TO regress_ren2" >/dev/null
+reload_sync || fail "pas de tour du worker après le renommage"
+out=$(psql_admin "SELECT details->>'locked_by', details->>'role_missing', details->>'role_renamed', details->>'renamed_to'
+                    FROM pass_policy.audit_log WHERE event_type = 'role_locked' AND role_name = 'regress_ren'")
+check_eq "renommage : role_locked audité sous l'ancien nom (role_renamed, renamed_to)" "auto|true|true|regress_ren2" "$out"
+out=$(psql_admin "SELECT count(*) FROM pass_policy.role_state s JOIN pg_roles r ON r.oid = s.role_oid
+                   WHERE r.rolname = 'regress_ren2' AND s.locked_until IS NOT NULL")
+check_eq "renommage : verrou non recopié dans role_state" "0" "$out"
+reload_sync || true
+out=$(psql_admin "SELECT count(*) FROM pass_policy.audit_log WHERE event_type = 'role_locked' AND role_name IN ('regress_ren', 'regress_ren2')")
+check_eq "renommage : acquitté, audité une seule fois (pas de réécriture à chaque tour)" "1" "$out"
+out=$(psql_as regress_ren2 "$GOOD" "SELECT current_user") || true
+check_eq "renommage : le nouveau nom repart de zéro (connexion acceptée)" "regress_ren2" "$out"
+psql_admin "DROP ROLE regress_ren2" >/dev/null
+
 # Fenêtre tenue ouverte de façon déterministe : role_state renommée, le
 # rechargement du worker échoue (WARNING) et la fenêtre reste fermée.
 # worker_interval reste à 0 : le rechargement doit être retenté sans SIGHUP

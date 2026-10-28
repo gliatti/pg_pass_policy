@@ -64,6 +64,50 @@ SELECT ppp_test.try($$SELECT pass_policy.create_profile('p_bad', '{"min_length":
  t
 (1 row)
 
+-- (vérification) Bornes absolues alignées sur generate_password() (8 à 512,
+-- PPP_GEN_MAX_LENGTH) et somme des minima de classes <= max_length : 23514
+SELECT ppp_test.try($$SELECT pass_policy.create_profile('p_bad', '{"min_length": 513, "max_length": 512}')$$) AS min_length_over_512;
+ min_length_over_512 
+---------------------
+ 23514
+(1 row)
+
+SELECT ppp_test.try($$SELECT pass_policy.create_profile('p_bad', '{"max_length": 513}')$$) AS max_length_over_512;
+ max_length_over_512 
+---------------------
+ 23514
+(1 row)
+
+SELECT ppp_test.try($$SELECT pass_policy.create_profile('p_bad', '{"min_length": 512, "max_length": 512}')$$) AS length_512_ok;
+ length_512_ok 
+---------------
+ ok
+(1 row)
+
+SELECT pass_policy.drop_profile('p_bad');
+ drop_profile 
+--------------
+ 
+(1 row)
+
+SELECT ppp_test.try($$SELECT pass_policy.create_profile('p_bad', '{"min_digit": 128}')$$) AS classes_over_max_length;
+ classes_over_max_length 
+-------------------------
+ 23514
+(1 row)
+
+SELECT ppp_test.try($$SELECT pass_policy.create_profile('p_bad', '{"min_lower": 2000000000, "min_upper": 2000000000}')$$) AS classes_sum_no_overflow;
+ classes_sum_no_overflow 
+-------------------------
+ 23514
+(1 row)
+
+SELECT count(*) AS p_bad_rows FROM pass_policy.profile WHERE name = 'p_bad';
+ p_bad_rows 
+------------
+          0
+(1 row)
+
 -- alter_profile
 SELECT pass_policy.alter_profile('p_plain', '{"min_length": 14, "max_age": null}');
  alter_profile 

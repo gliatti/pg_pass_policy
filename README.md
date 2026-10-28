@@ -121,15 +121,20 @@ SELECT pass_policy.generate_password(32, 'applicatif');
 ```
 
 `generate_password` respecte `min_length`/`max_length` du profil :
-`generate_password(8)` échoue avec le profil `default` (minimum 12).
+`generate_password(8)` échoue avec le profil `default` (minimum 12). Les
+bornes d'un profil ne dépassent jamais 512 caractères, la limite de
+`generate_password` (contraintes `CHECK`), et la somme des minima de classes
+(`min_lower + min_upper + min_digit + min_special`) ne dépasse pas
+`max_length`.
 
 ### Rotation
 
 ```sql
 -- Génère un mot de passe, l'applique (ALTER ROLE), pose VALID UNTIL, audite,
 -- et le RETOURNE UNE SEULE FOIS : il n'est stocké nulle part.
--- Sans longueur : 24 caractères, relevés au min_length du profil (et bornés
--- par son max_length) ; une longueur explicite hors de ces bornes est refusée.
+-- Sans longueur : 24 caractères, relevés au min_length du profil et à la somme
+-- de ses minima de classes (et bornés par son max_length) ; une longueur
+-- explicite hors de [min_length, max_length] est refusée.
 SELECT pass_policy.rotate_password('app_user');
 SELECT pass_policy.rotate_password('app_user', 32);
 -- Forcer un changement : VALID UNTIL = maintenant, statut « expired »
@@ -165,6 +170,15 @@ Après `max_failures` échecs d'authentification dans `failure_window`, le rôle
 est verrouillé pour `lock_duration` (NULL = jusqu'à déverrouillage manuel). Un
 rôle verrouillé est refusé **même avec le bon mot de passe** : le client reçoit
 `FATAL: role "x" is locked by pg_pass_policy`.
+
+Le compteur et le verrou automatique sont tenus par **nom** de rôle. Après
+`ALTER ROLE … RENAME`, le nouveau nom repart de zéro : un verrou automatique
+déjà recopié dans `role_state` (indexée par OID) suit le rôle au rechargement
+suivant, mais un verrou que le worker n'a pas encore écrit reste attaché à
+l'ancien nom ; il est audité (`role_locked`, `details.role_missing`, et
+`role_renamed` / `renamed_to` quand le nouveau nom est connu) sans être
+transféré. Pour garder un compte bloqué pendant un renommage, utiliser
+`lock_role()`.
 
 Seuls les échecs des méthodes où le client présente un mot de passe ou un
 secret sont comptés : `password`, `md5`, `scram-sha-256`, `ldap`, `pam`,

@@ -84,6 +84,23 @@ INSERT INTO ppp_test.secrets
   SELECT 'rot16', pass_policy.rotate_password('regress_rot32');
 SELECT length(pwd) AS len_capped FROM ppp_test.secrets WHERE label = 'rot16';
 
+-- (vérification) Longueur par défaut relevée à la somme des minima de classes :
+-- min_digit = 30 (somme 33 > 24) donnait 22023 avec least(greatest(24, min_length), max_length)
+CREATE ROLE regress_rotcls LOGIN;
+SELECT pass_policy.create_profile('p_rotcls', '{"min_digit": 30, "max_length": 64, "min_age": "0"}') > 0 AS created;
+SELECT pass_policy.assign_profile('regress_rotcls', 'p_rotcls');
+INSERT INTO ppp_test.secrets
+  SELECT 'rotcls', pass_policy.rotate_password('regress_rotcls');
+SELECT length(pwd) AS len_classes,
+       length(regexp_replace(pwd, '[^0-9]', '', 'g')) >= 30 AS digits_ok
+  FROM ppp_test.secrets WHERE label = 'rotcls';
+-- somme des minima bornée par max_length : 64 tient, 65 non
+SELECT ppp_test.try($$SELECT pass_policy.alter_profile('p_rotcls', '{"min_digit": 61}')$$) AS classes_fit_64;
+SELECT ppp_test.try($$SELECT pass_policy.alter_profile('p_rotcls', '{"min_digit": 62}')$$) AS classes_over_max;
+INSERT INTO ppp_test.secrets
+  SELECT 'rotcls64', pass_policy.rotate_password('regress_rotcls');
+SELECT length(pwd) AS len_classes_max FROM ppp_test.secrets WHERE label = 'rotcls64';
+
 -- (clôture) _record_done() : drapeau posé par le hook pour la transaction
 -- courante ; une seule ligne d'historique par rotation (pas de doublon par
 -- _ensure_recorded())

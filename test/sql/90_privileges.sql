@@ -303,6 +303,22 @@ SELECT 'SELECT pg_sleep(0.1) WHERE current_setting(''pg_pass_policy.exempt_roles
 \set ECHO all
 SHOW pg_pass_policy.exempt_roles;
 
+-- (vérification) _is_admin() sans le rôle pass_policy_admin : pg_has_role()
+-- par nom levait « role does not exist » (42704). Le rôle est renommé dans une
+-- transaction annulée (DROP ROLE échouerait sur ses privilèges) : le
+-- superutilisateur garde l'accès, un ancien membre est refusé en 42501.
+BEGIN;
+ALTER ROLE pass_policy_admin RENAME TO regress_ppp_admin_gone;
+SELECT pass_policy._is_admin() AS super_is_admin;
+SELECT ppp_test.try($$SELECT pass_policy.lock_role('regress_target')$$) AS super_lock_without_admin_role;
+SET SESSION AUTHORIZATION regress_admin;
+SELECT ppp_test.try($$SELECT pass_policy.lock_role('regress_target')$$) AS member_lock_without_admin_role;
+RESET SESSION AUTHORIZATION;
+ROLLBACK;
+SELECT count(*) AS admin_role_back FROM pg_roles WHERE rolname = 'pass_policy_admin';
+SELECT locked_until IS NULL AS target_not_locked
+  FROM pass_policy.role_state WHERE role_name = 'regress_target';
+
 -- ---------------------------------------------------------------------
 -- Faux schéma pass_policy dans une autre base : le hook ne doit jamais
 -- exécuter en superutilisateur les fonctions d'un schéma qui n'appartient pas
