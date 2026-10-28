@@ -381,6 +381,15 @@ AS 'MODULE_PATHNAME', 'ppp_generate_password'
 LANGUAGE C VOLATILE PARALLEL RESTRICTED;
 COMMENT ON FUNCTION generate_password(int, text) IS 'Generates a random password (pg_strong_random) compliant with a profile';
 
+-- Addition to SPEC §4: generate_password() for a known target role, whose
+-- name (and its reverse) the draws must not contain (PPP-017), so that the
+-- hook never refuses the password of _rotate_role().  Internal, no grant.
+CREATE FUNCTION _generate_password_for(role name, length int, profile text)
+RETURNS text
+AS 'MODULE_PATHNAME', 'ppp_generate_password_for'
+LANGUAGE C VOLATILE PARALLEL RESTRICTED;
+COMMENT ON FUNCTION _generate_password_for(name, int, text) IS 'Internal: generate_password() whose draws never contain the role name (PPP-017)';
+
 CREATE FUNCTION failed_attempts()
 RETURNS TABLE (role_name text, failed_count int, first_failure_at timestamptz,
                last_failure_at timestamptz, locked_until timestamptz)
@@ -415,6 +424,13 @@ RETURNS void
 AS 'MODULE_PATHNAME', 'ppp_shmem_reset_failures'
 LANGUAGE C STRICT VOLATILE;
 COMMENT ON FUNCTION shmem_reset_failures(text) IS 'Resets the shared-memory failure counter of a role';
+
+-- Addition to SPEC §4: used by unlock_role() (was the role locked in shmem?)
+CREATE FUNCTION _shmem_is_locked(role text)
+RETURNS bool
+AS 'MODULE_PATHNAME', 'ppp_shmem_is_locked'
+LANGUAGE C STRICT VOLATILE;
+COMMENT ON FUNCTION _shmem_is_locked(text) IS 'Internal: true if shared memory holds an active lock of the role (superuser)';
 
 CREATE FUNCTION worker_status()
 RETURNS TABLE (pid int, last_run timestamptz, last_reload timestamptz, tracked_roles int,
@@ -740,6 +756,14 @@ COMMENT ON FUNCTION _refresh_role_state(oid) IS 'Internal: recomputes expires_at
  *             rotation pair only): the extension does not manage the
  *             expiry, it only lifts a block it caused; a past VALID UNTIL
  *             set by hand (to disable the account) is left alone.
+ *   'release' switch_rotation_pair(), role becoming active again, when the
+ *             extension does not manage its VALID UNTIL ('unblock' mode
+ *             above): lifts the bound the pair wrote when the role became
+ *             the previous one (= valid_until_synced), even if it is still
+ *             in the future; 'unblock' only lifts a past one, and nothing
+ *             would ever lift this one: the active role would be blocked
+ *             at the end of the grace period.  A value set by hand is left
+ *             alone, as in 'unblock'.
  * Returns a jsonb description of the change, or NULL if nothing was done.
  * Step d of run_maintenance() computes the same target value for all roles
  * at once, to call this function only for those whose VALID UNTIL differs
@@ -779,6 +803,12 @@ BEGIN
         END IF;
         -- not grace_until: with manage_valid_until = off nothing would ever
         -- lift that new value once passed, and the role would end up blocked
+        v_new := coalesce(r.pair_bound, 'infinity');
+    ELSIF p_mode = 'release' THEN
+        IF r.rolvaliduntil IS NULL OR r.rolvaliduntil = 'infinity'
+           OR r.rolvaliduntil IS DISTINCT FROM r.valid_until_synced THEN
+            RETURN NULL;
+        END IF;
         v_new := coalesce(r.pair_bound, 'infinity');
     ELSE
         IF v_desired IS NULL THEN
@@ -1289,7 +1319,9 @@ BEGIN
     ELSE
         v_len := p_length;
     END IF;
-    password := pass_policy.generate_password(v_len, profile);
+    -- the draws never contain the role name: the hook cannot refuse them
+    -- with PPP-017 (short role names, reject_username)
+    password := pass_policy._generate_password_for(p_role, v_len, profile);
     IF password IS NULL THEN
         RAISE EXCEPTION 'pg_pass_policy: password generation failed';
     END IF;
@@ -1357,6 +1389,14 @@ DECLARE
 BEGIN
     PERFORM pass_policy._require_admin();
     v_oid := pass_policy._require_target_allowed(v_role);
+    -- An exempt role is never synchronised nor reported as expired
+    -- (v_role_status shows 'exempt'): a VALID UNTIL now() written here would
+    -- block the role silently, hence the refusal.
+    IF pass_policy._is_exempt(v_role) THEN
+        RAISE EXCEPTION 'pg_pass_policy: role "%" is exempt from the policy', v_role
+              USING ERRCODE = 'invalid_parameter_value',
+                    HINT = 'Remove it from pg_pass_policy.exempt_roles first.';
+    END IF;
     -- also refreshes role_state.role_name (current name, after a rename)
     PERFORM pass_policy._ensure_state(v_oid);
     UPDATE pass_policy.role_state s
@@ -1383,6 +1423,13 @@ DECLARE
 BEGIN
     PERFORM pass_policy._require_admin();
     v_oid := pass_policy._require_target_allowed(v_role);
+    -- The lockout hook ignores exempt roles: the lock would only show in
+    -- v_role_status (status 'locked') and apply unexpectedly as soon as the
+    -- role leaves exempt_roles.
+    IF pass_policy._is_exempt(v_role) THEN
+        RAISE EXCEPTION 'pg_pass_policy: role "%" is exempt from the policy: remove it from pg_pass_policy.exempt_roles first', v_role
+              USING ERRCODE = 'invalid_parameter_value';
+    END IF;
     IF $2 IS NOT NULL AND $2 <= interval '0' THEN
         RAISE EXCEPTION 'pg_pass_policy: lock duration must be positive'
               USING ERRCODE = 'invalid_parameter_value';
@@ -1427,11 +1474,10 @@ BEGIN
     -- even with an expired lock not yet cleaned by run_maintenance(), or in
     -- shared memory only (automatic lock still waiting for the worker).
     -- shmem_unlock_role() without expired_only always queues the unlock and
-    -- returns true: failed_attempts() is read instead.
+    -- returns true: _shmem_is_locked() (HASH_FIND of this role) is asked.
     v_locked := (SELECT s.locked_until IS NOT NULL FROM pass_policy.role_state s
                   WHERE s.role_oid = v_oid)
-                OR EXISTS (SELECT FROM pass_policy.failed_attempts() f
-                            WHERE f.role_name = v_role::text AND f.locked_until IS NOT NULL);
+                OR pass_policy._shmem_is_locked(v_role::text);
     UPDATE pass_policy.role_state s
        SET locked_until = NULL, locked_by = NULL, lock_reason = NULL
      WHERE s.role_oid = v_oid;
@@ -1573,6 +1619,16 @@ BEGIN
      WHERE r.pair_name = rp.pair_name;
 
     SELECT r.password INTO v_pwd FROM pass_policy._rotate_role(v_new, v_new_oid, $2) r;
+    -- When the extension does not manage VALID UNTIL (manage_valid_until =
+    -- off, or exempt role), _rotate_role() only lifts a past bound
+    -- ('unblock'): the bound written by a previous switch, still in the
+    -- future after two quick switches, would block the active role at the
+    -- end of the grace period.  'release' lifts it (bound written by the
+    -- extension only).
+    IF NOT (pass_policy._guc_on('pg_pass_policy.manage_valid_until', true)
+            AND NOT pass_policy._is_exempt(v_new)) THEN
+        PERFORM pass_policy._apply_valid_until(v_new_oid, 'release');
+    END IF;
 
     IF v_old IS NOT NULL THEN
         SELECT now() + p.grace_period INTO v_bound FROM pass_policy.effective_profile(v_old) p;
@@ -2104,46 +2160,66 @@ COMMENT ON FUNCTION rebind_restored_roles() IS 'After a restore into another clu
 -------------------------------------------------------------------------------
 -- 7. Views (SPEC §4)
 -------------------------------------------------------------------------------
+/*
+ * status: single synthetic value, by priority locked > exempt > expiry
+ * state.  The priority hides information (a locked role may also be
+ * expired; an exempt role keeps a computed expiry), hence the independent
+ * columns, added after role_oid (column order kept for existing clients):
+ *   is_exempt     role listed in pg_pass_policy.exempt_roles;
+ *   expiry_state  ok / warning / grace / expired / never_expires / unknown,
+ *                 computed regardless of the lock and of the exemption;
+ *   valid_until   pg_roles.rolvaliduntil (what the server enforces).
+ */
 CREATE VIEW v_role_status AS
 SELECT q.role_name, q.profile, q.password_changed_at, q.expires_at, q.grace_until,
        CASE WHEN q.expires_at IS NULL THEN NULL
             ELSE floor(extract(epoch FROM q.expires_at - now()) / 86400)::int END AS days_left,
        q.locked_until, q.failed_count,
        CASE
-           WHEN q.locked_until > now()                         THEN 'locked'
+           WHEN q.locked_until > now() THEN 'locked'
            -- exempt_roles: no expiry is enforced (a lock, which applies again as
            -- soon as the role leaves the list, is still shown as such)
-           WHEN q.exempt                                       THEN 'exempt'
-           WHEN q.must_change AND now() < q.grace_until        THEN 'grace'   -- previous role of a pair, still usable until its bound
-           WHEN q.must_change                                  THEN 'expired'
-           WHEN q.max_age IS NULL                              THEN 'never_expires'
-           WHEN q.password_changed_at IS NULL                  THEN 'unknown'
-           WHEN now() >= q.grace_until                         THEN 'expired'
-           WHEN now() >= q.expires_at                          THEN 'grace'
-           WHEN q.expires_at - now() < q.warn_before           THEN 'warning'
-           ELSE 'ok'
+           WHEN q.exempt               THEN 'exempt'
+           ELSE q.expiry_state
        END AS status,
-       q.role_oid
-  FROM (SELECT r.oid AS role_oid, r.rolname::text AS role_name, e.name AS profile, e.max_age, e.warn_before,
-               pass_policy._is_exempt(r.rolname) AS exempt,
-               s.password_changed_at, coalesce(s.must_change, false) AS must_change,
-               CASE WHEN s.must_change THEN s.expires_at
-                    ELSE s.password_changed_at + e.max_age END AS expires_at,
-               CASE WHEN s.must_change THEN s.grace_until
-                    ELSE s.password_changed_at + e.max_age + e.grace_period END AS grace_until,
-               greatest(s.locked_until, f.locked_until) AS locked_until,
-               coalesce(f.failed_count, 0) AS failed_count
-          FROM pg_catalog.pg_roles r
-          JOIN _role_effective_profile e ON e.role_oid = r.oid
-          LEFT JOIN role_state s ON s.role_oid = r.oid
-          LEFT JOIN failed_attempts() f ON f.role_name = r.rolname
-         WHERE r.rolcanlogin) q;
-COMMENT ON VIEW v_role_status IS 'Password and lock status of every login role (status exempt: listed in exempt_roles; role_oid: join key for role_state)';
+       q.role_oid,
+       q.exempt AS is_exempt,
+       q.expiry_state,
+       q.valid_until
+  FROM (SELECT p.*,
+               CASE
+                   WHEN p.must_change AND now() < p.grace_until THEN 'grace'   -- previous role of a pair, still usable until its bound
+                   WHEN p.must_change                           THEN 'expired'
+                   WHEN p.max_age IS NULL                       THEN 'never_expires'
+                   WHEN p.password_changed_at IS NULL           THEN 'unknown'
+                   WHEN now() >= p.grace_until                  THEN 'expired'
+                   WHEN now() >= p.expires_at                   THEN 'grace'
+                   WHEN p.expires_at - now() < p.warn_before    THEN 'warning'
+                   ELSE 'ok'
+               END AS expiry_state
+          FROM (SELECT r.oid AS role_oid, r.rolname::text AS role_name, e.name AS profile, e.max_age, e.warn_before,
+                       pass_policy._is_exempt(r.rolname) AS exempt,
+                       r.rolvaliduntil AS valid_until,
+                       s.password_changed_at, coalesce(s.must_change, false) AS must_change,
+                       CASE WHEN s.must_change THEN s.expires_at
+                            ELSE s.password_changed_at + e.max_age END AS expires_at,
+                       CASE WHEN s.must_change THEN s.grace_until
+                            ELSE s.password_changed_at + e.max_age + e.grace_period END AS grace_until,
+                       greatest(s.locked_until, f.locked_until) AS locked_until,
+                       coalesce(f.failed_count, 0) AS failed_count
+                  FROM pg_catalog.pg_roles r
+                  JOIN _role_effective_profile e ON e.role_oid = r.oid
+                  LEFT JOIN role_state s ON s.role_oid = r.oid
+                  LEFT JOIN failed_attempts() f ON f.role_name = r.rolname
+                 WHERE r.rolcanlogin) p) q;
+COMMENT ON VIEW v_role_status IS 'Password and lock status of every login role (status: locked > exempt > expiry_state; is_exempt: listed in exempt_roles; expiry_state: computed regardless of lock and exemption; valid_until: rolvaliduntil; role_oid: join key for role_state)';
 
--- exempt roles (status 'exempt') are left out: their expiry is not enforced
+-- Filtered on expiry_state, not on status: a locked role whose password is
+-- expired is listed; exempt roles are left out (their expiry is not enforced)
 CREATE VIEW v_expiring AS
-SELECT * FROM v_role_status WHERE status IN ('warning', 'grace', 'expired');
-COMMENT ON VIEW v_expiring IS 'Login roles whose password is about to expire, in grace period or expired (exempt roles excluded)';
+SELECT * FROM v_role_status
+ WHERE expiry_state IN ('warning', 'grace', 'expired') AND NOT is_exempt;
+COMMENT ON VIEW v_expiring IS 'Login roles whose password is about to expire, in grace period or expired, locked or not (exempt roles excluded)';
 
 -- Joined by OID: role_state.role_name may still hold the former name after
 -- ALTER ROLE ... RENAME (until run_maintenance() or the next lock_role()).

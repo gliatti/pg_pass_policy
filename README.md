@@ -1,5 +1,27 @@
 # pg_pass_policy
 
+> [!CAUTION]
+> **À la charge de l'exploitation.** `rotate_password()` et `switch_rotation_pair()`
+> renvoient le nouveau mot de passe en clair à l'appelant, une seule fois. Le
+> serveur ne le stocke ni ne le journalise, mais sa protection en dehors du
+> serveur dépend de votre configuration :
+>
+> - **Transport** : sans TLS, le mot de passe circule en clair sur le réseau.
+>   Imposez `hostssl` dans `pg_hba.conf` pour les comptes d'administration, et
+>   `sslmode=verify-full` côté client.
+> - **Client** : le résultat peut être conservé par l'outil qui l'affiche
+>   (défilement du terminal, grilles de résultats de pgAdmin ou DBeaver, logs
+>   applicatifs qui écrivent les lignes renvoyées). Préférez
+>   `pgpp rotate --vault-kv` ou `--exec`, qui ne passent ni par l'écran ni par une
+>   variable d'environnement.
+> - **Rôle `pass_policy_admin`** : un membre peut obtenir le mot de passe de tout
+>   rôle non privilégié. Accordez-le avec parcimonie.
+> - **Superutilisateur** : ajoutez `pg_pass_policy.exempt_roles = 'postgres'`
+>   (ou votre compte d'administration) pour ne pas vous verrouiller dehors :
+>   pendant la fenêtre de démarrage, tout rôle non exempté est refusé
+>   (`57P03`), y compris par `peer` ou `trust`. Un rôle exempté ne peut être
+>   ni expiré ni verrouillé par l'extension.
+
 Extension PostgreSQL (C + SQL) de gestion du cycle de vie des mots de passe des
 rôles, pour PostgreSQL **14 à 18** :
 
@@ -59,8 +81,9 @@ CREATE EXTENSION pg_pass_policy;
 ```
 
 Au démarrage, seuls les rôles de `exempt_roles` passent tant que le worker
-n'a pas chargé les verrous (les autres connexions par mot de passe, celles
-des superutilisateurs comprises, reçoivent `57P03`, voir « Verrouillage et
+n'a pas chargé les verrous (les autres connexions, quelle que soit la
+méthode d'authentification, `trust` et `peer` compris, et celles des
+superutilisateurs aussi, reçoivent `57P03`, voir « Verrouillage et
 déverrouillage »). Le worker occupe une place de `max_worker_processes` : si
 aucune n'est libre, ou si `pg_pass_policy.database` n'existe pas, il ne
 démarre pas ; 10 secondes après le démarrage, les superutilisateurs sont
@@ -68,7 +91,10 @@ alors acceptés et le log porte, au plus une fois par minute, le message
 `pg_pass_policy: worker has not loaded the lock state yet (worker_pid = 0)`.
 
 Recommandé : `pg_pass_policy.exempt_roles = 'postgres'` (ou votre compte
-d'administration), pour ne jamais être bloqué par un profil trop strict.
+d'administration), pour ne jamais être bloqué par un profil trop strict ni
+par la fenêtre de démarrage. Un rôle exempté ne peut être ni expiré
+(`expire_password()`) ni verrouillé (`lock_role()`) : les deux fonctions le
+refusent (`22023`), il faut d'abord le retirer de la liste.
 
 `CREATE EXTENSION` crée le schéma `pass_policy`, les tables, les fonctions, les
 vues, le profil `default`, charge le dictionnaire de mots de passe courants et
@@ -123,6 +149,13 @@ SELECT pass_policy.generate_password();                     -- 24 caractères, p
 SELECT pass_policy.generate_password(32, 'applicatif');
 ```
 
+`check_password` répond comme le ferait `ALTER ROLE … PASSWORD` du même
+appelant (même évaluation que le hook, `superuser_bypass` et `min_age` d'un
+vérificateur pré-haché compris). Hors de la base `pg_pass_policy.database`,
+où la politique ne s'applique pas, `check_password` lève `PPP-003` et
+`generate_password` aussi avec `enforce_database = on` (sinon `WARNING`,
+mot de passe produit).
+
 `generate_password` respecte `min_length`/`max_length` du profil :
 `generate_password(8)` échoue avec le profil `default` (minimum 12). Les
 bornes d'un profil ne dépassent jamais 512 caractères, la limite de
@@ -133,7 +166,9 @@ majuscule et un chiffre, `min_special` caractères spéciaux, et un spécial de
 plus si les trois autres classes n'atteignent pas `min_classes`
 (`pass_policy._generator_minimum()`). Sans longueur explicite,
 `rotate_password()` et `switch_rotation_pair()` génèrent 24 caractères,
-relevés au `min_length` du profil et à cette longueur minimale.
+relevés au `min_length` du profil et à cette longueur minimale ; leurs
+tirages ne contiennent jamais le nom du rôle ni son inverse (`PPP-017`), même
+pour un nom de trois lettres.
 
 ### Rotation
 
@@ -146,6 +181,7 @@ relevés au `min_length` du profil et à cette longueur minimale.
 SELECT pass_policy.rotate_password('app_user');
 SELECT pass_policy.rotate_password('app_user', 32);
 -- Forcer un changement : VALID UNTIL = maintenant, statut « expired »
+-- (refusé pour un rôle de exempt_roles : 22023)
 SELECT pass_policy.expire_password('app_user');
 ```
 
@@ -153,10 +189,10 @@ SELECT pass_policy.expire_password('app_user');
 
 ```sql
 SELECT * FROM pass_policy.v_role_status;   -- un rôle LOGIN par ligne
-SELECT * FROM pass_policy.v_expiring;      -- status IN (warning, grace, expired), sans les rôles exemptés
+SELECT * FROM pass_policy.v_expiring;      -- expiry_state IN (warning, grace, expired), verrouillés compris, sans les rôles exemptés
 SELECT * FROM pass_policy.v_locked;
 SELECT * FROM pass_policy.v_recent_audit;  -- 1000 derniers événements
-SELECT * FROM pass_policy.failed_attempts();  -- compteurs d'échecs en mémoire partagée
+SELECT * FROM pass_policy.failed_attempts();  -- compteurs d'échecs en mémoire partagée (noms inexistants : voir ci-dessous)
 SELECT * FROM pass_policy.worker_status();    -- pid, last_run, last_reload, tracked_roles, locks_loaded
 ```
 
@@ -169,7 +205,14 @@ NULL) ou `unknown` (aucune date de changement connue : rôle antérieur à
 l'extension, ou créé par `CREATE ROLE … PASSWORD`, tant que
 `run_maintenance()` n'a pas créé son état ; la réconciliation prend alors la
 date du jour comme date de changement).
-La dernière colonne, `role_oid`, sert à joindre `pass_policy.role_state` :
+`status` ne garde qu'une valeur, par priorité `locked` > `exempt` > état
+d'expiration : les colonnes suivantes donnent le reste. `is_exempt` (bool)
+dit si le rôle est dans `exempt_roles` ; `expiry_state` (`ok`, `warning`,
+`grace`, `expired`, `never_expires`, `unknown`) est calculé indépendamment du
+verrou et de l'exemption (un rôle verrouillé peut être `expired`, et figure
+alors dans `v_expiring`) ; `valid_until` reprend `pg_roles.rolvaliduntil`, la
+date que le serveur applique réellement.
+La colonne `role_oid` sert à joindre `pass_policy.role_state` :
 après `ALTER ROLE … RENAME`, `role_state.role_name` garde l'ancien nom
 jusqu'au passage suivant de la maintenance ou au prochain `lock_role()`,
 `unlock_role()` ou `expire_password()` sur ce rôle (`v_locked` joint déjà par
@@ -205,10 +248,11 @@ Le refus d'un rôle verrouillé, lui, s'applique quelle que soit la méthode.
 **Au démarrage du serveur**, la mémoire partagée est vide : les verrous
 enregistrés dans `role_state` (dont les verrous manuels sans fin) n'y sont
 réinjectés que par le premier tour du worker, qui commence par là. Pour
-qu'aucun rôle verrouillé ne se glisse dans cette fenêtre, les connexions par
-mot de passe ou secret (`password`, `md5`, `scram-sha-256`, `ldap`, `pam`,
-`radius`, `bsd`) des rôles non exemptés, superutilisateurs compris, sont
-refusées tant que l'état n'est pas chargé, bon ou mauvais mot de passe :
+qu'aucun rôle verrouillé ne se glisse dans cette fenêtre, les connexions des
+rôles non exemptés, superutilisateurs compris, sont refusées tant que l'état
+n'est pas chargé, quelle que soit la méthode d'authentification (`trust`,
+`peer`, `cert`, `gss`, `sspi` comprises : un rôle verrouillé passerait sinon
+par une ligne de `pg_hba.conf` sans secret), bon ou mauvais mot de passe :
 `FATAL: pg_pass_policy: lock state not loaded yet, retry` (SQLSTATE `57P03`,
 comme « the database system is starting up » : il suffit de réessayer). Ces
 tentatives ne modifient pas le compteur d'échecs : ni échec compté, ni
@@ -222,8 +266,10 @@ log l'indique (au plus une ligne par seconde, plus le message `worker_pid =
 toutes les 5 secondes, y compris sur un standby, et
 `pass_policy.worker_status()` montre `locks_loaded` à faux. Le client, lui,
 ne reçoit que le `57P03`, sans détail sur l'état interne. Les rôles de
-`pg_pass_policy.exempt_roles` et les connexions sans secret (`peer`,
-`cert`…) passent toujours : c'est le filet de sécurité de l'administrateur.
+`pg_pass_policy.exempt_roles` passent toujours : c'est le filet de sécurité
+de l'administrateur (l'accès local par `peer` ou `trust` d'un rôle non
+exempté attend lui aussi la fin de la fenêtre). Une connexion de
+réplication d'un rôle non exempté est concernée de la même façon.
 Les superutilisateurs ne passent que si le worker est absent (aucun worker
 10 secondes après le démarrage : base inexistante, `max_worker_processes`
 épuisé), pour qu'une installation dont le worker ne démarre pas reste
@@ -259,6 +305,13 @@ Clés de `details` : `role_locked` porte `locked_by` (`auto` / `manual`),
 l'expiration levée par `run_maintenance()`, `manual` pour `unlock_role()`). Les échecs sur des noms de
 rôles inexistants sont journalisés en une seule ligne `auth_failed` par tour
 du worker (`role_name` NULL, `details.unknown_roles` et `details.attempts`).
+De même, `failed_attempts()` ne nomme ces entrées que pour un
+superutilisateur : un nom saisi dans le champ utilisateur peut être un mot de
+passe. Les autres appelants (`pass_policy_viewer`, `pass_policy_admin`) en
+reçoivent une seule ligne de `role_name` NULL (compteurs additionnés).
+`lock_role()` refuse un rôle de `exempt_roles` (`22023`) : le hook ignore le
+verrou d'un rôle exempté, qui s'appliquerait par surprise à sa sortie de la
+liste.
 Si la bibliothèque a été retirée de
 `shared_preload_libraries` après l'installation, `lock_role()` et
 `unlock_role()` échouent (ERROR) au lieu de valider `role_state` sans effet sur

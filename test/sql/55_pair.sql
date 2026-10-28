@@ -123,3 +123,44 @@ SELECT ppp_test.leaks();
 SELECT ppp_test.try($$SELECT * FROM pass_policy.switch_rotation_pair('no_such_pair')$$) <> 'ok' AS unknown_pair_refused;
 
 DROP TABLE ppp_test.switches;
+
+-- (vérification 6) manage_valid_until = off : _rotate_role() ne relève
+-- qu'une borne passée (mode unblock). Après deux basculements rapides, le
+-- rôle qui redevient actif garde la borne future posée par le premier
+-- (previous_valid_until) : elle est levée (mode release), sinon le rôle actif
+-- serait bloqué à la fin de grace_period. L'ancien rôle reste borné.
+ALTER SYSTEM SET pg_pass_policy.manage_valid_until = off;
+SELECT pg_reload_conf();
+\set ECHO none
+\o /dev/null
+SELECT 'SELECT pg_sleep(0.1) WHERE current_setting(''pg_pass_policy.manage_valid_until'')::bool'
+  FROM generate_series(1, 50) \gexec
+\o
+\set ECHO all
+SHOW pg_pass_policy.manage_valid_until;
+CREATE ROLE regress_off2_grp NOLOGIN;
+SELECT pass_policy.create_rotation_pair('off2', 'regress_off2_a', 'regress_off2_b', 'regress_off2_grp');
+CREATE TEMP TABLE off2 (n int, active_role text, password text,
+                        previous_role text, previous_valid_until timestamptz);
+INSERT INTO off2 SELECT 1, * FROM pass_policy.switch_rotation_pair('off2');
+INSERT INTO off2 SELECT 2, * FROM pass_policy.switch_rotation_pair('off2');
+INSERT INTO off2 SELECT 3, * FROM pass_policy.switch_rotation_pair('off2');
+INSERT INTO ppp_test.secrets SELECT 'off2_' || n, password FROM off2;
+SELECT o3.active_role = o1.active_role AS back_to_first,
+       r.rolvaliduntil IS NULL OR r.rolvaliduntil = 'infinity' AS active_unbounded
+  FROM off2 o1, off2 o3 JOIN pg_roles r ON r.rolname = o3.active_role
+ WHERE o1.n = 1 AND o3.n = 3;
+SELECT abs(extract(epoch FROM r.rolvaliduntil - o.previous_valid_until)) < 2 AS previous_bounded
+  FROM off2 o JOIN pg_roles r ON r.rolname = o.previous_role
+ WHERE o.n = 3;
+SELECT ppp_test.leaks();
+DROP TABLE off2;
+ALTER SYSTEM RESET pg_pass_policy.manage_valid_until;
+SELECT pg_reload_conf();
+\set ECHO none
+\o /dev/null
+SELECT 'SELECT pg_sleep(0.1) WHERE NOT current_setting(''pg_pass_policy.manage_valid_until'')::bool'
+  FROM generate_series(1, 50) \gexec
+\o
+\set ECHO all
+SHOW pg_pass_policy.manage_valid_until;

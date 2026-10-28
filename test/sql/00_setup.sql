@@ -76,8 +76,8 @@ SELECT p.proname
  WHERE p.pronamespace = 'pass_policy'::regnamespace
    AND p.proname IN ('check_password', 'generate_password', 'failed_attempts',
                      'shmem_reload', 'shmem_lock_role', 'shmem_unlock_role',
-                     'shmem_reset_failures', 'worker_status', '_is_exempt',
-                     '_in_password_hook')
+                     'shmem_reset_failures', 'worker_status', '_is_exempt', '_shmem_is_locked',
+                     '_in_password_hook', '_generate_password_for')
    AND p.prolang <> (SELECT oid FROM pg_language WHERE lanname = 'c')
  ORDER BY 1;
 

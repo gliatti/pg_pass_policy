@@ -113,15 +113,17 @@ check_eq "trois refus journalisés (LOG password_rejected, code seul)" "3" "$n"
 out=$(psql_admin "SELECT count(*) FROM pass_policy.audit_log WHERE details::text LIKE '%leakprobe%'")
 check_eq "aucun mot de passe refusé dans l'audit" "0" "$out"
 
-# ERROR levée par check_password() hors des refus PPP-xxx (ici : extension
-# absente de la base) : la ligne STATEMENT contiendrait le mot de passe passé
-# en argument. La fonction C est déclarée à la main dans une base sans
-# l'extension pour atteindre ce chemin.
+# ERROR levée par check_password() au lieu d'un motif renvoyé (ici : base
+# autre que pg_pass_policy.database, sans l'extension ; PPP-003 depuis la
+# vérification 6, le contrôle de la base précédant celui de l'extension) : la
+# ligne STATEMENT contiendrait le mot de passe passé en argument. La fonction
+# C est déclarée à la main dans une base sans l'extension pour atteindre ce
+# chemin.
 psql_admin "CREATE DATABASE ppp_noext" >/dev/null
 out=$("$PPP_BINDIR/psql" -X -q -At -h 127.0.0.1 -p "$PPP_PORT" -U "$PPP_SUPERUSER" -d ppp_noext \
 	-c "CREATE FUNCTION public.ppp_check(text, text) RETURNS text AS 'pg_pass_policy', 'ppp_check_password' LANGUAGE C STRICT" \
 	-c "SELECT public.ppp_check('bob', 'LeakProbeUnique-2026')" 2>&1) || true
-check_contains "check_password() sans extension : ERROR" 'not installed in this database' "$out"
+check_contains "check_password() hors de la base de la politique, sans extension : ERROR PPP-003" 'ERROR: +PPP-003' "$out"
 sleep 0.5
 n=$(grep -cF -- 'LeakProbeUnique-2026' "$PPP_TMP/server.log" || true)
 check_eq "check_password() en erreur : mot de passe absent du log serveur" "0" "$n"
@@ -139,6 +141,12 @@ out=$(psql_other "ALTER ROLE regress_notify PASSWORD 'Other-Db#Pass-2026'") || t
 check_contains "extension dans une autre base, ALTER ROLE : PPP-003" 'PPP-003' "$out"
 out=$(psql_other "SELECT count(*) FROM pass_policy.password_history")
 check_eq "autre base : aucun historique écrit" "0" "$out"
+# (vérification 6) check_password() et generate_password() suivent le hook :
+# hors de pg_pass_policy.database, PPP-003 (check_password() : toujours)
+out=$(psql_other "SELECT pass_policy.check_password('regress_notify', 'Other-Db#Check-2026')") || true
+check_contains "autre base, check_password() : PPP-003" 'ERROR: +PPP-003' "$out"
+out=$(psql_other "SELECT pass_policy.generate_password()") || true
+check_contains "autre base, generate_password() : PPP-003 (enforce_database = on)" 'ERROR: +PPP-003' "$out"
 # enforce_database = off : WARNING, politique non appliquée (pas d'historique)
 psql_admin "ALTER SYSTEM SET pg_pass_policy.enforce_database = off" >/dev/null
 psql_admin "SELECT pg_reload_conf()" >/dev/null
@@ -147,6 +155,11 @@ out=$(psql_other "ALTER ROLE regress_notify PASSWORD 'Other-Db#Pass-2027'") || t
 check_contains "enforce_database = off, autre base : WARNING politique non appliquée" 'password policy not applied outside database' "$out"
 out=$(psql_other "SELECT count(*) FROM pass_policy.password_history")
 check_eq "enforce_database = off, autre base : aucun historique écrit" "0" "$out"
+out=$(psql_other "SELECT pass_policy.check_password('regress_notify', 'Other-Db#Check-2027')") || true
+check_contains "enforce_database = off, autre base, check_password() : toujours PPP-003" 'ERROR: +PPP-003' "$out"
+out=$(psql_other "SELECT length(pass_policy.generate_password())") || true
+check_contains "enforce_database = off, autre base, generate_password() : WARNING" 'WARNING: +pg_pass_policy: password policy not applied outside database' "$out"
+check_contains "enforce_database = off, autre base, generate_password() : mot de passe produit" '^24$' "$(printf '%s\n' "$out" | grep -v WARNING)"
 psql_admin "ALTER SYSTEM RESET pg_pass_policy.enforce_database" >/dev/null
 psql_admin "SELECT pg_reload_conf()" >/dev/null
 

@@ -1,12 +1,19 @@
 <tbody class="role">
 {% if r %}
 <tr class="role-row">
-  <td><strong>{{ r.role_name }}</strong>{% if r.must_change %} <span class="badge must-change" title="must change at next login">must change</span>{% endif %}</td>
+  {# exempt role (pg_pass_policy.exempt_roles): its expiry is not enforced,
+     shown greyed, without must change / days left / Expire; a locked role
+     shows the state of its password apart from the lock #}
+  {% set expiry = r.expiry_state or 'unknown' %}
+  <td><strong>{{ r.role_name }}</strong>{% if r.must_change and not r.is_exempt %} <span class="badge must-change" title="must change at next login">must change</span>{% endif %}</td>
   <td>{{ r.profile }}</td>
-  <td><span class="badge status-{{ r.status }}">{{ r.status.replace('_', ' ') }}</span></td>
+  <td><span class="badge status-{{ r.status }}">{{ r.status.replace('_', ' ') }}</span>
+    {%- if r.is_exempt %}<br><small class="expiry muted" title="not enforced: role listed in pg_pass_policy.exempt_roles">password: {{ expiry.replace('_', ' ') }}</small>
+    {%- elif r.status != expiry %}<br><small class="expiry expiry-{{ expiry }}" title="state of the password, apart from the lock">password: {{ expiry.replace('_', ' ') }}</small>
+    {%- endif %}</td>
   <td class="nowrap">{{ r.password_changed_at|ts }}</td>
-  <td class="nowrap">{{ r.expires_at|ts }}</td>
-  <td>{{ r.days_left if r.days_left is not none else '—' }}</td>
+  <td class="nowrap{% if r.is_exempt %} muted{% endif %}">{{ r.expires_at|ts }}</td>
+  <td>{% if r.is_exempt %}<span class="muted">—</span>{% else %}{{ r.days_left if r.days_left is not none else '—' }}{% endif %}</td>
   <td class="nowrap">{{ r.locked_until|ts }}{% if r.lock_reason %}<br><small class="muted">{{ r.lock_reason }}</small>{% endif %}</td>
   <td>{{ r.failed_count }}</td>
   <td class="actions">
@@ -34,7 +41,7 @@
       <button class="btn btn-warn">Lock</button>
     </form>
     {% endif %}
-    {% if r.status != 'expired' %}
+    {% if not r.is_exempt and expiry != 'expired' %}
     <form hx-post="{{ path_for('role_expire', role=r.role_name) }}" hx-target="closest tbody" hx-swap="outerHTML"
           hx-confirm="Expire the password of {{ r.role_name }} now? The role must get a new password before connecting again.">
       <button class="btn btn-warn">Expire</button>

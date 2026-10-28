@@ -117,6 +117,11 @@ ppp_start() {
 		echo "unix_socket_directories = ''"
 		echo "pg_pass_policy.database = '$PPP_DB'"
 		echo "pg_pass_policy.worker_interval = 2"
+		# Superutilisateur de test exempté : la fenêtre de démarrage refuse
+		# (57P03) tout rôle non exempté, quelle que soit la méthode (trust
+		# compris, SPEC §6.3) ; les scripts doivent pouvoir administrer
+		# l'instance pendant une fenêtre tenue ouverte.
+		echo "pg_pass_policy.exempt_roles = '$PPP_SUPERUSER'"
 		echo "log_connections = on"
 		echo "log_line_prefix = '%m [%p] %q%u@%d '"
 		echo "fsync = off"

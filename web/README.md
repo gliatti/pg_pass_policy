@@ -21,6 +21,16 @@ Pages :
 | `/maintenance` | exécution manuelle de `run_maintenance()` |
 | `/healthz` | sonde de vie (sans authentification, ne touche pas la base) |
 
+Statut et état du mot de passe : la colonne `status` de `v_role_status`
+montre d'abord le verrou (`locked`) puis l'exemption (`exempt`) ; l'état du
+mot de passe seul (`expiry_state` : `ok`, `warning`, `grace`, `expired`,
+`never_expires`, `unknown`) est affiché à part, sous le statut, quand il en
+diffère (rôle verrouillé dont le mot de passe a expiré, par exemple). Pour
+un rôle exempté (`pg_pass_policy.exempt_roles`), l'expiration n'est pas
+appliquée : cet état est grisé, le badge « must change », les jours
+restants et le bouton « Expire » ne sont pas affichés, et le rôle
+n'apparaît jamais dans la liste « Expiring or expired » du tableau de bord.
+
 ## Installation
 
 Prérequis : Python ≥ 3.11, FastAPI ≥ 0.118 (dépendances déclarées avec

@@ -221,3 +221,73 @@ SELECT ppp_test.try($$SELECT * FROM pass_policy.switch_rotation_pair('no_such_pa
 (1 row)
 
 DROP TABLE ppp_test.switches;
+-- (vérification 6) manage_valid_until = off : _rotate_role() ne relève
+-- qu'une borne passée (mode unblock). Après deux basculements rapides, le
+-- rôle qui redevient actif garde la borne future posée par le premier
+-- (previous_valid_until) : elle est levée (mode release), sinon le rôle actif
+-- serait bloqué à la fin de grace_period. L'ancien rôle reste borné.
+ALTER SYSTEM SET pg_pass_policy.manage_valid_until = off;
+SELECT pg_reload_conf();
+ pg_reload_conf 
+----------------
+ t
+(1 row)
+
+\set ECHO none
+SHOW pg_pass_policy.manage_valid_until;
+ pg_pass_policy.manage_valid_until 
+-----------------------------------
+ off
+(1 row)
+
+CREATE ROLE regress_off2_grp NOLOGIN;
+SELECT pass_policy.create_rotation_pair('off2', 'regress_off2_a', 'regress_off2_b', 'regress_off2_grp');
+ create_rotation_pair 
+----------------------
+ 
+(1 row)
+
+CREATE TEMP TABLE off2 (n int, active_role text, password text,
+                        previous_role text, previous_valid_until timestamptz);
+INSERT INTO off2 SELECT 1, * FROM pass_policy.switch_rotation_pair('off2');
+INSERT INTO off2 SELECT 2, * FROM pass_policy.switch_rotation_pair('off2');
+INSERT INTO off2 SELECT 3, * FROM pass_policy.switch_rotation_pair('off2');
+INSERT INTO ppp_test.secrets SELECT 'off2_' || n, password FROM off2;
+SELECT o3.active_role = o1.active_role AS back_to_first,
+       r.rolvaliduntil IS NULL OR r.rolvaliduntil = 'infinity' AS active_unbounded
+  FROM off2 o1, off2 o3 JOIN pg_roles r ON r.rolname = o3.active_role
+ WHERE o1.n = 1 AND o3.n = 3;
+ back_to_first | active_unbounded 
+---------------+------------------
+ t             | t
+(1 row)
+
+SELECT abs(extract(epoch FROM r.rolvaliduntil - o.previous_valid_until)) < 2 AS previous_bounded
+  FROM off2 o JOIN pg_roles r ON r.rolname = o.previous_role
+ WHERE o.n = 3;
+ previous_bounded 
+------------------
+ t
+(1 row)
+
+SELECT ppp_test.leaks();
+ leaks 
+-------
+     0
+(1 row)
+
+DROP TABLE off2;
+ALTER SYSTEM RESET pg_pass_policy.manage_valid_until;
+SELECT pg_reload_conf();
+ pg_reload_conf 
+----------------
+ t
+(1 row)
+
+\set ECHO none
+SHOW pg_pass_policy.manage_valid_until;
+ pg_pass_policy.manage_valid_until 
+-----------------------------------
+ on
+(1 row)
+

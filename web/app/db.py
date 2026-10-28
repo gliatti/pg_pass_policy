@@ -432,6 +432,9 @@ def recent_audit(conn: Connection, limit: int = 20) -> list[dict[str, Any]]:
 _ROLE_SELECT = (
     "SELECT v.role_name, v.profile, v.password_changed_at, v.expires_at, v.grace_until,"
     "       v.days_left, v.locked_until, v.failed_count, v.status,"
+    # is_exempt / expiry_state: the expiry of the password alone, that
+    # status hides behind 'locked' or 'exempt'
+    "       v.is_exempt, v.expiry_state,"
     "       s.locked_by, s.lock_reason, s.must_change"
     "  FROM pass_policy.v_role_status v"
     # by OID: role_state.role_name keeps the former name after ALTER ROLE
@@ -471,7 +474,7 @@ def list_roles(
 
 def expiring_roles(conn: Connection, limit: int = 50) -> list[dict[str, Any]]:
     return conn.execute(
-        "SELECT role_name, profile, expires_at, grace_until, days_left, status"
+        "SELECT role_name, profile, expires_at, grace_until, days_left, status, expiry_state"
         "  FROM pass_policy.v_expiring ORDER BY expires_at NULLS LAST, role_name LIMIT %s",
         (limit,),
     ).fetchall()

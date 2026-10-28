@@ -267,7 +267,7 @@ check_eq "F4 : unlock_role() lève le nouveau verrou" "regress_lock" "$out"
 
 # --- exempt_roles ---------------------------------------------------------------
 psql_admin "CREATE ROLE regress_exempt LOGIN PASSWORD '$GOOD'"
-psql_admin "ALTER SYSTEM SET pg_pass_policy.exempt_roles = 'regress_exempt'"
+psql_admin "ALTER SYSTEM SET pg_pass_policy.exempt_roles = 'regress_exempt, $PPP_SUPERUSER'"
 psql_admin "SELECT pg_reload_conf()" >/dev/null
 sleep 1
 for i in 1 2 3 4 5 6 7; do psql_as regress_exempt "$BAD" >/dev/null || true; done
@@ -280,7 +280,7 @@ check_eq "rôle exempté : aucun verrou en shmem" "0" "$out"
 psql_admin "CREATE ROLE \"Regress_Q\" LOGIN PASSWORD '$GOOD'"
 out=$(psql_admin "ALTER SYSTEM SET pg_pass_policy.exempt_roles = 'regress_exempt,,x'" 2>&1) || true
 check_contains "exempt_roles : liste invalide refusée par le check hook" "invalid value|List syntax" "$out"
-psql_admin "ALTER SYSTEM SET pg_pass_policy.exempt_roles = 'regress_exempt, \"Regress_Q\"'"
+psql_admin "ALTER SYSTEM SET pg_pass_policy.exempt_roles = 'regress_exempt, \"Regress_Q\", $PPP_SUPERUSER'"
 psql_admin "SELECT pg_reload_conf()" >/dev/null
 sleep 1
 out=$(psql_admin "SELECT pass_policy._is_exempt('regress_exempt'), pass_policy._is_exempt('Regress_Q'), pass_policy._is_exempt('regress_q')")
@@ -335,6 +335,20 @@ check_eq "F5 : aucune ligne d'audit par nom inexistant" "0" "$out"
 out=$(psql_admin "SELECT count(*) || ':' || string_agg((details->>'unknown_roles') || '/' || (details->>'attempts'), ',')
                     FROM pass_policy.audit_log WHERE id > $id0 AND event_type = 'auth_failed' AND role_name IS NULL")
 check_eq "F5 : une seule ligne auth_failed agrégée (3 noms, 6 tentatives)" "1:3/6" "$out"
+# (vérification 6) failed_attempts() : les noms inexistants (champ utilisateur
+# saisi par le client, peut-être un mot de passe) ne sont lus par leur nom que
+# par un superutilisateur ; pass_policy_viewer en reçoit une seule ligne
+# agrégée, role_name NULL
+psql_admin "CREATE ROLE regress_fa_viewer LOGIN PASSWORD '$GOOD' IN ROLE pass_policy_viewer" >/dev/null
+out=$(psql_admin "SELECT count(*) FROM pass_policy.failed_attempts() WHERE role_name LIKE 'regress_ghost%'")
+check_eq "failed_attempts() superutilisateur : noms inexistants visibles" "3" "$out"
+out=$(psql_as regress_fa_viewer "$GOOD" "SELECT count(*) FROM pass_policy.failed_attempts() WHERE role_name LIKE 'regress_ghost%' OR role_name = 'regress_nobody'")
+check_eq "failed_attempts() viewer : aucun nom inexistant" "0" "$out"
+out=$(psql_as regress_fa_viewer "$GOOD" "SELECT count(*), bool_and(failed_count >= 6) FROM pass_policy.failed_attempts() WHERE role_name IS NULL")
+check_eq "failed_attempts() viewer : une ligne agrégée (role_name NULL, compteurs sommés)" "1|t" "$out"
+out=$(psql_as regress_fa_viewer "$GOOD" "SELECT count(*) FROM pass_policy.v_role_status WHERE role_name IS NULL")
+check_eq "failed_attempts() viewer : la ligne agrégée ne rejoint aucun rôle de v_role_status" "0" "$out"
+psql_admin "DROP ROLE regress_fa_viewer" >/dev/null
 psql_admin "ALTER SYSTEM RESET pg_pass_policy.worker_interval"
 psql_admin "SELECT pg_reload_conf()" >/dev/null
 
@@ -667,6 +681,16 @@ psql_admin "DROP ROLE regress_rec" >/dev/null
 # worker_interval reste à 0 : le rechargement doit être retenté sans SIGHUP
 # (revue finale 7, constat 1).
 psql_admin "CREATE ROLE regress_su SUPERUSER LOGIN PASSWORD '$GOOD'" >/dev/null
+# (vérification 6) rôle verrouillé dans role_state et authentifié par une
+# méthode sans secret (trust) : refusé lui aussi pendant la fenêtre (57P03),
+# puis « locked » une fois les verrous réinjectés
+psql_admin "CREATE ROLE regress_trust_locked LOGIN" >/dev/null
+psql_admin "SELECT pass_policy.lock_role('regress_trust_locked', NULL, 'trust test')" >/dev/null
+cp "$PPP_TMP/data/pg_hba.conf" "$PPP_TMP/pg_hba.conf.orig"
+{
+	echo "host all regress_trust_locked 127.0.0.1/32 trust"
+	cat "$PPP_TMP/pg_hba.conf.orig"
+} >"$PPP_TMP/data/pg_hba.conf"
 psql_admin "ALTER TABLE pass_policy.role_state RENAME TO role_state_hidden" >/dev/null
 log0=$(wc -l <"$PPP_TMP/server.log")
 restart_server
@@ -676,6 +700,8 @@ client_out="$out"
 out=$(psql_as regress_lock "$BAD" "SELECT current_user") || true
 check_contains "fenêtre : mauvais mot de passe, même réponse (pas d'oracle)" "FATAL: +pg_pass_policy: lock state not loaded yet, retry" "$out"
 client_out="$client_out$out"
+out=$(psql_as regress_trust_locked "" "SELECT current_user") || true
+check_contains "fenêtre : rôle verrouillé par trust refusé aussi (57P03)" "FATAL: +pg_pass_policy: lock state not loaded yet, retry" "$out"
 psql_admin "CREATE ROLE regress_window LOGIN PASSWORD '$GOOD'" >/dev/null
 # 4 mauvais + bon + mauvais : l'entrée n'est pas modifiée pendant la fenêtre
 # (ni échec compté, ni remise à zéro par le succès), toujours 57P03
@@ -733,6 +759,12 @@ out=$(psql_as regress_window "$GOOD" "SELECT current_user") || true
 check_eq "fenêtre fermée : rôle non verrouillé accepté (échecs de la fenêtre non comptés)" "regress_window" "$out"
 out=$(psql_admin "SELECT locks_loaded FROM pass_policy.worker_status()")
 check_eq "fenêtre fermée : worker_status().locks_loaded = true" "t" "$out"
+out=$(psql_as regress_trust_locked "" "SELECT current_user") || true
+check_contains "fenêtre fermée : rôle verrouillé par trust refusé (locked)" "is locked by pg_pass_policy" "$out"
+cp "$PPP_TMP/pg_hba.conf.orig" "$PPP_TMP/data/pg_hba.conf"
+psql_admin "SELECT pg_reload_conf()" >/dev/null
+psql_admin "SELECT pass_policy.unlock_role('regress_trust_locked')" >/dev/null
+psql_admin "DROP ROLE regress_trust_locked" >/dev/null
 psql_admin "SELECT pass_policy.unlock_role('regress_lock')" >/dev/null
 out=$(psql_as regress_lock "$GOOD" "SELECT current_user") || true
 check_eq "fenêtre fermée : unlock_role, connexion acceptée" "regress_lock" "$out"

@@ -68,6 +68,29 @@ SELECT role_name, status FROM pass_policy.v_expiring
  WHERE role_name LIKE 'regress\_maint%' ORDER BY role_name;
 SELECT days_left IS NULL AS never_days_left_null
   FROM pass_policy.v_role_status WHERE role_name = 'regress_maint_never';
+-- (vérification 6) Colonnes is_exempt, expiry_state et valid_until : l'état
+-- d'expiration est calculé indépendamment du verrou et de l'exemption
+SELECT role_name, status, is_exempt, expiry_state,
+       valid_until IS NOT DISTINCT FROM (SELECT rolvaliduntil FROM pg_roles r
+                                          WHERE r.rolname = v.role_name) AS valid_until_ok
+  FROM pass_policy.v_role_status v
+ WHERE role_name IN ('regress_maint', 'regress_maint_grace',
+                     'regress_maint_warn', 'regress_maint_never')
+ ORDER BY role_name;
+-- Rôle verrouillé ET expiré : status = locked, expiry_state = expired, et
+-- présent dans v_expiring (filtre sur expiry_state, pas sur status)
+CREATE ROLE regress_maint_lockexp LOGIN;
+ALTER ROLE regress_maint_lockexp PASSWORD 'Maint-LockExp#2024';
+INSERT INTO ppp_test.secrets VALUES ('maint_lockexp', 'Maint-LockExp#2024');
+SELECT pass_policy.expire_password('regress_maint_lockexp');
+SELECT pass_policy.lock_role('regress_maint_lockexp', NULL, 'locked and expired') = 'infinity' AS locked;
+SELECT status, is_exempt, expiry_state, valid_until <= now() AS valid_until_past
+  FROM pass_policy.v_role_status WHERE role_name = 'regress_maint_lockexp';
+SELECT status, expiry_state FROM pass_policy.v_expiring
+ WHERE role_name = 'regress_maint_lockexp';
+SELECT role_name FROM pass_policy.v_locked WHERE role_name = 'regress_maint_lockexp';
+SELECT pass_policy.unlock_role('regress_maint_lockexp');
+DROP ROLE regress_maint_lockexp;
 
 -- VALID UNTIL synchronisé = grace_until (manage_valid_until = on)
 SELECT r.rolname,

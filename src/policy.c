@@ -48,6 +48,7 @@
 
 PG_FUNCTION_INFO_V1(ppp_check_password);
 PG_FUNCTION_INFO_V1(ppp_generate_password);
+PG_FUNCTION_INFO_V1(ppp_generate_password_for);
 PG_FUNCTION_INFO_V1(ppp_in_password_hook);
 PG_FUNCTION_INFO_V1(ppp_record_done);
 
@@ -1041,6 +1042,22 @@ ppp_password_reused(const char *username, Oid roleid, const char *password,
 }
 
 /*
+ * May the minimum age and history of the role be checked for this caller?
+ * caller is the user id and caller_is_super its superuser() status, both
+ * read before any elevation; roleid is the target role (InvalidOid when it
+ * does not exist yet: the history is then checked by name, as CREATE ROLE
+ * ... PASSWORD does).  Shared by the hook and check_password(): a caller
+ * who may not change the role's password must not learn anything about its
+ * passwords or the date of its last change (SPEC 6.2, step 5).
+ */
+static bool
+ppp_may_check_history(Oid caller, bool caller_is_super, Oid roleid)
+{
+	return caller_is_super || !OidIsValid(roleid) || roleid == caller ||
+		PPP_MAY_SET_PASSWORD_OF(caller, roleid);
+}
+
+/*
  * Full evaluation shared by the hook and check_password() for a clear-text
  * password: complexity, minimum age, history.  Returns the code of the first
  * failed rule or NULL.
@@ -1065,6 +1082,43 @@ ppp_evaluate_plain(const char *username, Oid roleid, const char *password,
 	if (check_history && ppp_password_reused(username, roleid, password, p))
 		return "PPP-031";
 	return NULL;
+}
+
+/*
+ * Evaluation of a candidate password of any type, shared by the hook and
+ * check_password() so that the function answers what the hook would
+ * (SPEC 6.2, steps 3 to 6).  password_type is the type PostgreSQL computed
+ * (get_password_type()).  Returns the code of the first failed rule or NULL.
+ *
+ * - pre-hashed: PPP-001 (reject_prehashed), PPP-002 (MD5 with require_scram),
+ *   then the minimum age (PPP-030) when check_history and the caller is not
+ *   a superuser; complexity and history cannot be checked on a verifier;
+ * - clear text: PPP-002 when password_encryption is md5 with require_scram,
+ *   then complexity (skipped for a superuser caller with superuser_bypass),
+ *   minimum age and history (ppp_evaluate_plain()).
+ */
+static const char *
+ppp_evaluate_password(const char *username, Oid roleid, const char *password,
+					  PasswordType password_type, const pppProfile *p,
+					  bool check_history, bool caller_is_super)
+{
+	if (password_type != PASSWORD_TYPE_PLAINTEXT)
+	{
+		if (p->reject_prehashed)
+			return "PPP-001";
+		if (password_type == PASSWORD_TYPE_MD5 && ppp_require_scram)
+			return "PPP-002";
+		if (check_history && !caller_is_super &&
+			ppp_min_age_violated(username, roleid, p))
+			return "PPP-030";
+		return NULL;
+	}
+
+	if (ppp_require_scram && Password_encryption == PASSWORD_TYPE_MD5)
+		return "PPP-002";
+	return ppp_evaluate_plain(username, roleid, password, p,
+							  ppp_superuser_bypass && caller_is_super,
+							  check_history, caller_is_super);
 }
 
 
@@ -1237,6 +1291,43 @@ ppp_policy_not_applicable(const char *username, bool in_ppp_db)
 }
 
 /*
+ * check_password() and generate_password() outside pg_pass_policy.database:
+ * the hook applies no policy there (PPP-003 or nothing), and the tables of
+ * the extension, if installed, are not maintained by the worker.
+ * always_error (check_password()): ERROR PPP-003 whatever enforce_database,
+ * since an answer "compliant" would be meaningless.  Otherwise
+ * (generate_password()): ERROR PPP-003 with enforce_database, else a
+ * WARNING and the caller goes on (a random password harms nobody).
+ */
+static void
+ppp_require_policy_database(bool always_error)
+{
+	char	   *msg;
+	char	   *detail;
+	char	   *hint;
+	pppProfile	prof;
+
+	if (ppp_in_policy_database())
+		return;
+
+	memset(&prof, 0, sizeof(prof));
+	prof.name = "?";
+	ppp_describe("PPP-003", &prof, &msg, &detail, &hint);
+	if (always_error || ppp_enforce_database)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("PPP-003: %s", msg),
+				 errhint("%s", hint),
+				 errhidestmt(true),
+				 errhidecontext(true)));
+	ereport(WARNING,
+			(errmsg("pg_pass_policy: password policy not applied outside database \"%s\"",
+					ppp_database),
+			 errhidestmt(true),
+			 errhidecontext(true)));
+}
+
+/*
  * Steps 3 to 8 of SPEC 6.2, run inside the single SPI session opened by the
  * hook once the extension is known to be installed and trusted (step 2).
  * caller_is_super is superuser() of the caller, roleid the OID of the
@@ -1260,34 +1351,18 @@ ppp_apply_policy(const char *username, const char *shadow_pass,
 
 	ppp_load_effective_profile(username, &prof, cxt);
 
+	/* steps 3 to 6 (same evaluation as check_password()) */
+	code = ppp_evaluate_password(username, roleid, shadow_pass, password_type,
+								 &prof, may_check_history, caller_is_super);
+	if (code != NULL)
+		ppp_reject(username, code, &prof);
+
+	/* step 7: a pre-hashed verifier is recorded as is */
 	if (password_type != PASSWORD_TYPE_PLAINTEXT)
-	{
-		/* step 3: pre-hashed password, complexity cannot be checked */
-		if (prof.reject_prehashed)
-			ppp_reject(username, "PPP-001", &prof);
-		if (password_type == PASSWORD_TYPE_MD5 && ppp_require_scram)
-			ppp_reject(username, "PPP-002", &prof);
-		if (may_check_history && !caller_is_super &&
-			ppp_min_age_violated(username, roleid, &prof))
-			ppp_reject(username, "PPP-030", &prof);
 		verifier = pstrdup(shadow_pass);
-	}
 	else
-	{
-		if (ppp_require_scram && Password_encryption == PASSWORD_TYPE_MD5)
-			ppp_reject(username, "PPP-002", &prof);
-
-		/* steps 4 to 6 */
-		code = ppp_evaluate_plain(username, roleid, shadow_pass, &prof,
-								  ppp_superuser_bypass && caller_is_super,
-								  may_check_history, caller_is_super);
-		if (code != NULL)
-			ppp_reject(username, code, &prof);
-
-		/* step 7 */
 		verifier = encrypt_password(PASSWORD_TYPE_SCRAM_SHA_256, username,
 									shadow_pass);
-	}
 
 	/* step 8 */
 	ppp_record_change(username, verifier);
@@ -1334,9 +1409,8 @@ ppp_check_password_hook(const char *username, const char *shadow_pass,
 				 * check (SPEC 6.2, step 5).
 				 */
 				Oid			roleid = get_role_oid(username, true);
-				bool		may_check_history = caller_is_super ||
-					!OidIsValid(roleid) || roleid == save_userid ||
-					PPP_MAY_SET_PASSWORD_OF(save_userid, roleid);
+				bool		may_check_history =
+					ppp_may_check_history(save_userid, caller_is_super, roleid);
 
 				/* steps 3 to 8, in one elevated SPI session */
 				ppp_spi_begin(&st);
@@ -1396,27 +1470,9 @@ ppp_check_secret(FunctionCallInfo fcinfo, const char *username, Oid roleid,
 		pwtext = PG_GETARG_TEXT_PP(1);
 		password = text_to_cstring(pwtext);
 
-		switch (get_password_type(password))
-		{
-			case PASSWORD_TYPE_PLAINTEXT:
-				if (ppp_require_scram && Password_encryption == PASSWORD_TYPE_MD5)
-					code = "PPP-002";
-				else
-					code = ppp_evaluate_plain(username, roleid, password, prof,
-											  false, may_check_history,
-											  caller_is_super);
-				break;
-			case PASSWORD_TYPE_MD5:
-				if (prof->reject_prehashed)
-					code = "PPP-001";
-				else if (ppp_require_scram)
-					code = "PPP-002";
-				break;
-			default:
-				if (prof->reject_prehashed)
-					code = "PPP-001";
-				break;
-		}
+		code = ppp_evaluate_password(username, roleid, password,
+									 get_password_type(password), prof,
+									 may_check_history, caller_is_super);
 	}
 	PG_FINALLY();
 	{
@@ -1477,6 +1533,8 @@ ppp_check_password(PG_FUNCTION_ARGS)
 		Oid			roleid;
 		bool		may_check_history;
 
+		/* outside pg_pass_policy.database the hook never applies the policy */
+		ppp_require_policy_database(true);
 		/* catalog lookups only: checked before the elevation */
 		(void) ppp_require_extension(true);
 		ppp_spi_begin(&st);
@@ -1485,9 +1543,8 @@ ppp_check_password(PG_FUNCTION_ARGS)
 		ppp_load_effective_profile(username, &prof, cxt);
 		roleid = get_role_oid(username, true);
 		/* same predicate as the hook (explicit user id, no elevation) */
-		may_check_history = caller_is_super ||
-			!OidIsValid(roleid) || roleid == caller ||
-			PPP_MAY_SET_PASSWORD_OF(caller, roleid);
+		may_check_history = ppp_may_check_history(caller, caller_is_super,
+												  roleid);
 
 		code = ppp_check_secret(fcinfo, username, roleid, &prof,
 								may_check_history, caller_is_super);
@@ -1544,27 +1601,29 @@ ppp_random_char(const char *alphabet)
 }
 
 /*
- * pass_policy.generate_password(length int DEFAULT 24, profile text
- * DEFAULT NULL) RETURNS text
+ * Generator shared by generate_password() and _generate_password_for().
  *
  * Builds a password from pg_strong_random only, satisfying the class minima
  * of the given profile (or "default"), then shuffles it (Fisher-Yates).
  * Runs in one elevated SPI session (profile lookup), like check_password();
  * the work buffer is wiped on every path.
+ *
+ * rolename (NULL for generate_password()) is the role that will receive
+ * the password: with reject_username in the profile, draws that contain
+ * its name or its reverse (PPP-017, any case, names of 3 characters or
+ * more) are drawn again, so that rotate_password() never fails at random
+ * on its own hook for a short role name.
  */
-Datum
-ppp_generate_password(PG_FUNCTION_ARGS)
+static text *
+ppp_generate(int32 length, const char *profname, const char *rolename)
 {
 	MemoryContext cxt = CurrentMemoryContext;
-	int32		length;
-	char	   *profname;
 	Oid			save_userid;
 	int			save_sec_context;
 	pppSpiState st;
 	char	   *volatile buf = NULL;
 	text	   *volatile result = NULL;
 
-	length = PG_ARGISNULL(0) ? 24 : PG_GETARG_INT32(0);
 	if (length < PPP_GEN_MIN_LENGTH || length > PPP_GEN_MAX_LENGTH)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -1573,7 +1632,6 @@ ppp_generate_password(PG_FUNCTION_ARGS)
 				 errhidestmt(true),
 				 errhidecontext(true)));
 
-	profname = PG_ARGISNULL(1) ? "default" : text_to_cstring(PG_GETARG_TEXT_PP(1));
 	GetUserIdAndSecContext(&save_userid, &save_sec_context);
 
 	PG_TRY();
@@ -1587,6 +1645,8 @@ ppp_generate_password(PG_FUNCTION_ARGS)
 		int			nclasses_forced;
 		int			tries;
 
+		/* PPP-003 (enforce_database) or WARNING outside the policy database */
+		ppp_require_policy_database(false);
 		/* catalog lookups only: checked before the elevation */
 		(void) ppp_require_extension(true);
 		ppp_spi_begin(&st);
@@ -1625,9 +1685,12 @@ ppp_generate_password(PG_FUNCTION_ARGS)
 					 errmsg("password length %d is too small for the character class minima of profile \"%s\"",
 							length, prof.name)));
 
-		/* the generated password is re-validated without username/dictionary */
+		/*
+		 * The generated password is re-validated without the dictionary,
+		 * and with the role name only when the target role is known.
+		 */
 		genprof = prof;
-		genprof.reject_username = false;
+		genprof.reject_username = prof.reject_username && rolename != NULL;
 		genprof.reject_dictionary = false;
 
 		buf = palloc(length + 1);
@@ -1659,13 +1722,14 @@ ppp_generate_password(PG_FUNCTION_ARGS)
 				buf[j] = tmp;
 			}
 
-			if (ppp_validate("", buf, &genprof, &code))
+			if (ppp_validate(rolename ? rolename : "", buf, &genprof, &code))
 				break;
 			/*
 			 * Length and class minima are checked above and the class
 			 * composition is guaranteed by construction; the special
-			 * alphabet has no space (PPP-020).  The only rule random draws
-			 * can keep breaking is max_repeat (PPP-019): a profile whose
+			 * alphabet has no space (PPP-020).  A draw containing the role
+			 * name (PPP-017) is rare and drawn again.  The only rule random
+			 * draws can keep breaking is max_repeat (PPP-019): a profile whose
 			 * class minima force many characters from a small class (for
 			 * instance min_digit close to the length) with a low max_repeat
 			 * is practically infeasible.  That is a profile problem
@@ -1710,7 +1774,44 @@ ppp_generate_password(PG_FUNCTION_ARGS)
 	}
 	PG_END_TRY();
 
-	PG_RETURN_TEXT_P(result);
+	return result;
+}
+
+/*
+ * pass_policy.generate_password(length int DEFAULT 24, profile text
+ * DEFAULT NULL) RETURNS text
+ *
+ * Not STRICT: length NULL = 24, profile NULL = "default".  The target role
+ * is unknown: the role name rule (PPP-017) is not applied to the draws.
+ */
+Datum
+ppp_generate_password(PG_FUNCTION_ARGS)
+{
+	int32		length = PG_ARGISNULL(0) ? 24 : PG_GETARG_INT32(0);
+	char	   *profname = PG_ARGISNULL(1) ? "default" :
+		text_to_cstring(PG_GETARG_TEXT_PP(1));
+
+	PG_RETURN_TEXT_P(ppp_generate(length, profname, NULL));
+}
+
+/*
+ * pass_policy._generate_password_for(role name, length int, profile text)
+ * RETURNS text (addition to SPEC 4, internal, used by _rotate_role())
+ *
+ * Same as generate_password(), and the draws containing the role name or
+ * its reverse are rejected (PPP-017).  Not STRICT: length NULL = 24,
+ * profile NULL = "default"; role NULL = no role name rule.
+ */
+Datum
+ppp_generate_password_for(PG_FUNCTION_ARGS)
+{
+	const char *rolename = PG_ARGISNULL(0) ? NULL :
+		NameStr(*PG_GETARG_NAME(0));
+	int32		length = PG_ARGISNULL(1) ? 24 : PG_GETARG_INT32(1);
+	char	   *profname = PG_ARGISNULL(2) ? "default" :
+		text_to_cstring(PG_GETARG_TEXT_PP(2));
+
+	PG_RETURN_TEXT_P(ppp_generate(length, profname, rolename));
 }
 
 /*

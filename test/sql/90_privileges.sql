@@ -313,7 +313,31 @@ SELECT r AS role_name, pass_policy._is_exempt(r) AS sql_exempt,
 -- ne le resynchroniserait jamais), il relève seulement une borne passée
 INSERT INTO ppp_test.secrets SELECT 'exempt_rot', pass_policy.rotate_password('regress_exempt_u');
 SELECT rolvaliduntil IS NULL AS exempt_rotate_no_valid_until FROM pg_roles WHERE rolname = 'regress_exempt_u';
-SELECT pass_policy.expire_password('regress_exempt_u');
+-- (vérification 6) expire_password() et lock_role() refusés pour un rôle
+-- exempté (22023) : le VALID UNTIL now() bloquerait le rôle sans que
+-- v_role_status le montre autrement que 'exempt', et le hook d'authentification
+-- ignore le verrou d'un rôle exempté ; rien n'est écrit
+SELECT ppp_test.try($$SELECT pass_policy.expire_password('regress_exempt_u')$$) AS expire_exempt;
+SELECT ppp_test.try($$SELECT pass_policy.lock_role('regress_exempt_u')$$) AS lock_exempt;
+SELECT r.rolvaliduntil IS NULL AS exempt_no_valid_until,
+       NOT s.must_change AS exempt_not_expired, s.locked_until IS NULL AS exempt_not_locked
+  FROM pg_roles r JOIN pass_policy.role_state s ON s.role_oid = r.oid
+ WHERE r.rolname = 'regress_exempt_u';
+SELECT count(*) AS exempt_refusals_audited FROM pass_policy.audit_log
+ WHERE role_name = 'regress_exempt_u' AND event_type IN ('password_expired', 'role_locked');
+-- Borne posée par l'extension avant l'exemption (expire_password() puis ajout
+-- du rôle à exempt_roles), simulée : must_change et VALID UNTIL passé écrit
+-- par l'extension (valid_until_synced)
+CREATE FUNCTION ppp_test.expired_before_exemption(r name) RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+  UPDATE pass_policy.role_state s
+     SET must_change = true, expires_at = '2021-06-01 00:00:00+00',
+         grace_until = '2021-06-01 00:00:00+00', valid_until_synced = '2021-06-01 00:00:00+00'
+   WHERE s.role_oid = r::text::regrole::oid;
+  EXECUTE format('ALTER ROLE %I VALID UNTIL %L', r, '2021-06-01 00:00:00+00');
+END $$;
+SELECT ppp_test.expired_before_exemption('regress_exempt_u');
 INSERT INTO ppp_test.secrets SELECT 'exempt_rot2', pass_policy.rotate_password('regress_exempt_u');
 SELECT rolvaliduntil = 'infinity' AS exempt_rotate_unblocked FROM pg_roles WHERE rolname = 'regress_exempt_u';
 -- Rôle exempté dont le mot de passe est changé par un ALTER ROLE direct (le
@@ -321,7 +345,7 @@ SELECT rolvaliduntil = 'infinity' AS exempt_rotate_unblocked FROM pg_roles WHERE
 -- relève le VALID UNTIL posé par expire_password() (mode unblock), sans
 -- jamais synchroniser (sync) ni signaler l'expiration d'un rôle exempté.
 CREATE TEMP TABLE ex_m0 AS SELECT * FROM pass_policy.run_maintenance();
-SELECT pass_policy.expire_password('regress_exempt_u');
+SELECT ppp_test.expired_before_exemption('regress_exempt_u');
 SELECT rolvaliduntil <= now() AS exempt_blocked FROM pg_roles WHERE rolname = 'regress_exempt_u';
 INSERT INTO ppp_test.secrets VALUES ('exempt_direct', 'exempt-direct-change');
 ALTER ROLE regress_exempt_u PASSWORD 'exempt-direct-change';
@@ -329,13 +353,15 @@ SELECT action, details->>'reason' AS reason, details->>'mode' AS mode
   FROM pass_policy.run_maintenance() WHERE role_name = 'regress_exempt_u' ORDER BY action;
 SELECT rolvaliduntil = 'infinity' AS exempt_direct_unblocked FROM pg_roles WHERE rolname = 'regress_exempt_u';
 -- (vérification 5) Statut 'exempt' : prioritaire sur warning / grace /
--- expired (expire_password() donnerait sinon 'expired'), rôle absent de
+-- expired (expiry_state, vérification 6, garde 'expired'), rôle absent de
 -- v_expiring ; lisible par pass_policy_viewer (EXECUTE sur _is_exempt())
-SELECT pass_policy.expire_password('regress_exempt_u');
-SELECT status FROM pass_policy.v_role_status WHERE role_name = 'regress_exempt_u';
+SELECT ppp_test.expired_before_exemption('regress_exempt_u');
+SELECT status, is_exempt, expiry_state, valid_until = '2021-06-01 00:00:00+00' AS valid_until_shown
+  FROM pass_policy.v_role_status WHERE role_name = 'regress_exempt_u';
 SELECT count(*) AS exempt_in_v_expiring FROM pass_policy.v_expiring WHERE role_name = 'regress_exempt_u';
 SET SESSION AUTHORIZATION regress_viewer;
-SELECT status AS viewer_status FROM pass_policy.v_role_status WHERE role_name = 'regress_exempt_u';
+SELECT status AS viewer_status, is_exempt AS viewer_is_exempt, expiry_state AS viewer_expiry_state
+  FROM pass_policy.v_role_status WHERE role_name = 'regress_exempt_u';
 RESET SESSION AUTHORIZATION;
 -- (vérification 5) VALID UNTIL passé posé à la main (compte désactivé) :
 -- rotate_password() d'un rôle exempté (mode unblock) ne le lève pas, ni

@@ -27,8 +27,7 @@ table.kv th { width: 12rem; }
 .tile.status-grace { border-left-color: var(--grace); }
 .tile.status-expired { border-left-color: var(--bad); }
 .tile.status-locked { border-left-color: var(--lock); }
-.tile.status-exempt { border-left-color: var(--muted); }
-.tile.status-never_expires, .tile.status-unknown { border-left-color: var(--muted); }
+.tile.status-exempt, .tile.status-never_expires, .tile.status-unknown { border-left-color: var(--muted); }
 .grid-2 { display:grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
 @media (max-width: 900px) { .grid-2 { grid-template-columns: 1fr; } }
 .badge { display:inline-block; padding:.1rem .5rem; border-radius:999px; font-size:.8rem; color:#fff; background:var(--muted); }
@@ -36,9 +35,13 @@ table.kv th { width: 12rem; }
 .badge.status-warning { background:var(--warn); }
 .badge.status-grace { background:var(--grace); }
 .badge.status-expired { background:var(--bad); }
-.badge.status-exempt { background:var(--muted); }
 .badge.status-locked { background:var(--lock); }
 .badge.must-change { background:var(--bad); }
+/* state of the password apart from the lock (roles, dashboard) */
+.expiry { font-size:.8rem; }
+.expiry.expiry-warning { color:var(--warn); }
+.expiry.expiry-grace { color:var(--grace); }
+.expiry.expiry-expired { color:var(--bad); }
 .event { font-family: ui-monospace, monospace; font-size:.85em; }
 .event.role_locked, .event.password_expired, .event.password_rejected, .event.auth_failed { color: var(--bad); }
 .event.role_unlocked, .event.password_changed, .event.password_rotated, .event.pair_switched { color: var(--ok); }

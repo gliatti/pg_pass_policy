@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 import logging
+import re
+import time
 
 import psycopg
 import pytest
+from psycopg import sql
 
+from app import db
 from tests.conftest import (
     CSRF_HX_HEADERS,
     T_GROUP,
     T_PAIR,
     T_PROFILE,
     T_SLASH,
+    T_STATUS_ROLES,
     csrf_token,
     revealed_password,
 )
@@ -1036,3 +1041,159 @@ def test_renamed_role_keeps_its_state_and_assignment(client, super_conn):
         )
     finally:
         drop()
+
+
+# --- status values and exempt roles ---------------------------------------------------
+
+S_EXEMPT = "web_t_s_exempt"
+
+
+def _set_exempt_roles(super_conn, value: str | None) -> None:
+    """ALTER SYSTEM on pg_pass_policy.exempt_roles (SIGHUP), then waits until
+    the setting is seen by a session."""
+    if value is None:
+        super_conn.execute("ALTER SYSTEM RESET pg_pass_policy.exempt_roles")
+    else:
+        super_conn.execute(
+            sql.SQL("ALTER SYSTEM SET pg_pass_policy.exempt_roles = {}").format(sql.Literal(value))
+        )
+    super_conn.execute("SELECT pg_reload_conf()")
+    expected = value is not None
+    for _ in range(100):
+        row = super_conn.execute("SELECT pass_policy._is_exempt(%s)", (S_EXEMPT,)).fetchone()
+        if row[0] is expected:
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"pg_pass_policy.exempt_roles not reloaded ({value!r})")
+
+
+@pytest.fixture
+def status_roles(super_conn):
+    """One login role per status of v_role_status: ok, warning (warn_before
+    past max_age), grace and an exempt role whose password is in grace too
+    (password_changed_at moved back), expired, locked with an expired
+    password, never_expires (max_age NULL) and unknown (no password ever
+    set).  The exempt role is listed in pg_pass_policy.exempt_roles for the
+    duration of the test."""
+    profiles = {
+        "web_t_s_p": '{"min_age": "0", "max_age": "30 days", "warn_before": "1 day",'
+        ' "grace_period": "7 days"}',
+        "web_t_s_pwarn": '{"min_age": "0", "max_age": "30 days", "warn_before": "60 days"}',
+        "web_t_s_pnever": '{"min_age": "0", "max_age": null}',
+    }
+    for name, settings in profiles.items():
+        super_conn.execute("SELECT pass_policy.create_profile(%s, %s::jsonb)", (name, settings))
+    profile_of = {"web_t_s_warn": "web_t_s_pwarn", "web_t_s_never": "web_t_s_pnever"}
+    for role in T_STATUS_ROLES:
+        super_conn.execute(sql.SQL("CREATE ROLE {} LOGIN").format(sql.Identifier(role)))
+        super_conn.execute(
+            "SELECT pass_policy.assign_profile(%s, %s)", (role, profile_of.get(role, "web_t_s_p"))
+        )
+        if role != "web_t_s_unknown":
+            super_conn.execute("SELECT pass_policy.rotate_password(%s)", (role,))
+    for role in ("web_t_s_grace", S_EXEMPT):
+        super_conn.execute(
+            "UPDATE pass_policy.role_state SET password_changed_at = now() - interval '31 days'"
+            " WHERE role_oid = (SELECT oid FROM pg_roles WHERE rolname = %s)",
+            (role,),
+        )
+    for role in ("web_t_s_exp", "web_t_s_lock"):
+        super_conn.execute("SELECT pass_policy.expire_password(%s)", (role,))
+    super_conn.execute("SELECT pass_policy.lock_role(%s, '1 hour', 'web test')", ("web_t_s_lock",))
+    _set_exempt_roles(super_conn, S_EXEMPT)
+    try:
+        yield
+    finally:
+        _set_exempt_roles(super_conn, None)
+        names = list(profiles)
+        super_conn.execute(
+            "DELETE FROM pass_policy.role_profile WHERE profile_id IN"
+            " (SELECT profile_id FROM pass_policy.profile WHERE name = ANY(%s))",
+            (names,),
+        )
+        for role in T_STATUS_ROLES:
+            super_conn.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(role)))
+        super_conn.execute("DELETE FROM pass_policy.profile WHERE name = ANY(%s)", (names,))
+
+
+def _view_rows(super_conn) -> dict[str, tuple[str, str, bool]]:
+    rows = super_conn.execute(
+        "SELECT role_name, status, expiry_state, is_exempt FROM pass_policy.v_role_status"
+    ).fetchall()
+    return {r[0]: (r[1], r[2], r[3]) for r in rows}
+
+
+def test_statuses_match_the_view(status_roles, super_conn):
+    rows = _view_rows(super_conn)
+    ours = {name: rows[name] for name in T_STATUS_ROLES}
+    assert {name: v[0] for name, v in ours.items()} == {
+        "web_t_s_ok": "ok",
+        "web_t_s_warn": "warning",
+        "web_t_s_grace": "grace",
+        "web_t_s_exp": "expired",
+        "web_t_s_lock": "locked",
+        S_EXEMPT: "exempt",
+        "web_t_s_never": "never_expires",
+        "web_t_s_unknown": "unknown",
+    }
+    # the fixture covers every status: db.STATUSES is exactly what the view returns
+    assert {v[0] for v in ours.values()} == set(db.STATUSES)
+    # and no role of the database has a status unknown to the interface
+    assert {v[0] for v in rows.values()} <= set(db.STATUSES)
+    # expiry_state: the same values, without locked and exempt
+    assert {v[1] for v in rows.values()} <= set(db.STATUSES) - {"locked", "exempt"}
+    assert ours["web_t_s_lock"][1] == "expired"
+    assert ours[S_EXEMPT][1:] == ("grace", True)
+
+
+def _tile_count(body: str, status: str) -> int:
+    match = re.search(
+        rf'class="tile status-{status}"[^>]*>\s*<span class="tile-value">(\d+)</span>', body
+    )
+    assert match, f"no tile for {status}"
+    return int(match.group(1))
+
+
+def test_exempt_role_on_the_dashboard(client, status_roles, super_conn):
+    body = client.get("/").text
+    exempt = super_conn.execute(
+        "SELECT count(*) FROM pass_policy.v_role_status WHERE status = 'exempt'"
+    ).fetchone()[0]
+    assert exempt >= 1
+    assert _tile_count(body, "exempt") == exempt
+    assert 'href="/roles?status=exempt"' in body
+    # the exempt role's password is in grace, yet it is not "expiring"
+    expiring = body.split("Expiring or expired", 1)[1].split("Recent events", 1)[0]
+    assert "web_t_s_grace" in expiring
+    assert S_EXEMPT not in expiring
+    # a locked role whose password expired is listed, with its expiry state
+    lock = expiring.split("web_t_s_lock", 1)[1].split("</tr>", 1)[0]
+    assert 'status-locked">locked' in lock
+    assert 'class="expiry expiry-expired">expired' in lock
+    listed = {r[0] for r in super_conn.execute("SELECT role_name FROM pass_policy.v_expiring")}
+    assert S_EXEMPT not in listed and "web_t_s_grace" in listed and "web_t_s_lock" in listed
+
+
+def test_exempt_filter_and_row(client, status_roles):
+    response = client.get("/roles/table", params={"status": "exempt"})
+    assert response.status_code == 200
+    names = set(re.findall(r"<strong>(web_t_[^<]+)</strong>", response.text))
+    assert names == {S_EXEMPT}
+    assert f"/roles/{S_EXEMPT}/expire" not in response.text
+    assert "must change" not in response.text
+    assert re.search(r'<small class="expiry muted"[^>]*>password: grace</small>', response.text)
+
+    response = client.get("/roles/table", params={"q": "web_t_s_lock"})
+    assert 'status-locked">locked' in response.text
+    assert re.search(
+        r'<small class="expiry expiry-expired"[^>]*>password: expired</small>', response.text
+    )
+    assert "/roles/web_t_s_lock/expire" not in response.text
+
+
+def test_expire_is_refused_for_an_exempt_role(client, status_roles, super_conn):
+    token = csrf_token(client, "/roles")
+    response = client.post(f"/roles/{S_EXEMPT}/expire", headers={"X-CSRF-Token": token})
+    assert response.status_code == 422, response.text
+    assert "is exempt from the policy" in response.text
+    assert _view_rows(super_conn)[S_EXEMPT][0] == "exempt"

@@ -61,6 +61,7 @@ PG_FUNCTION_INFO_V1(ppp_shmem_reload);
 PG_FUNCTION_INFO_V1(ppp_shmem_lock_role);
 PG_FUNCTION_INFO_V1(ppp_shmem_unlock_role);
 PG_FUNCTION_INFO_V1(ppp_shmem_reset_failures);
+PG_FUNCTION_INFO_V1(ppp_shmem_is_locked);
 
 static ClientAuthentication_hook_type prev_client_auth_hook = NULL;
 
@@ -666,10 +667,11 @@ ppp_auth_method_checks_secret(const Port *port)
  *   the connection is refused anyway).  The refusal of a locked role still
  *   applies;
  * - until the worker has loaded the persisted locks after the shared memory
- *   initialisation (ppp_shared->locks_loaded), the methods that check a
- *   secret are refused with FATAL 57P03 "lock state not loaded yet",
- *   whatever the status, and their failures are not counted (the answer is
- *   "retry" whatever the password).  Superusers are refused that way too,
+ *   initialisation (ppp_shared->locks_loaded), every non-exempt role is
+ *   refused with FATAL 57P03 "lock state not loaded yet", whatever the
+ *   authentication method (trust, peer, cert... included: a role locked in
+ *   role_state is not known yet) and the status, and failures are not
+ *   counted (the answer is "retry" whatever the password).  Superusers are refused that way too,
  *   unless the worker is demonstrably missing (no PID published
  *   PPP_WORKER_MISSING_GRACE_SECS after the shared memory initialisation):
  *   they then get the real answer and their failures are counted, so that
@@ -722,10 +724,12 @@ ppp_client_auth_hook(Port *port, int status)
 	 * Start-up window still open?  Read without the lock: locks_loaded only
 	 * goes from false to true (the shared memory initialisation, which sets
 	 * it back to false, restarts every backend), so "loaded" here is final;
-	 * "not loaded" is checked again under the lock below.
+	 * "not loaded" is checked again under the lock below.  Every method is
+	 * concerned, those that check no secret (trust, peer, cert, gss, sspi...)
+	 * included: a role locked in role_state must stay out whatever the line
+	 * of pg_hba.conf it matches.
 	 */
-	check_window = !ppp_shared->locks_loaded &&
-		ppp_auth_method_checks_secret(port);
+	check_window = !ppp_shared->locks_loaded;
 
 	/* catalog lookup and recovery state before taking the LWLock */
 	if (count_failure || check_window)
@@ -745,10 +749,12 @@ ppp_client_auth_hook(Port *port, int status)
 	/*
 	 * Fail-closed start-up window: until the worker has re-injected the
 	 * persisted locks, a role locked in role_state (manual "infinity" lock
-	 * of a compromised account included) is not known here.  The methods
-	 * that check a secret are refused whatever the status (after the
-	 * refusal of a lock already in shared memory, below), so that the answer
-	 * does not tell a right password from a wrong one; such a failure is not
+	 * of a compromised account included) is not known here.  Every
+	 * authentication method is refused whatever the status (after the
+	 * refusal of a lock already in shared memory, below): the methods that
+	 * check no secret (trust, peer, cert...) would otherwise let a role
+	 * locked in role_state in, and for the others the answer does not tell
+	 * a right password from a wrong one; such a failure is not
 	 * counted either, since the client is told to retry whatever the
 	 * password it sent, and a success does not reset the counter (see
 	 * below).  The exempt roles (above) never reach this point.
@@ -896,7 +902,7 @@ ppp_client_auth_hook(Port *port, int status)
 	if (log_worker_missing)
 		ereport(LOG,
 				(errmsg(PPP_LOG_PREFIX "worker has not loaded the lock state yet (worker_pid = 0)"),
-				 errdetail("No pg_pass_policy background worker is running %d seconds after the shared memory initialisation; roles authenticating with a password or a secret are refused meanwhile (at most one message per minute).",
+				 errdetail("No pg_pass_policy background worker is running %d seconds after the shared memory initialisation; roles not listed in pg_pass_policy.exempt_roles are refused meanwhile, whatever the authentication method (at most one message per minute).",
 						   PPP_WORKER_MISSING_GRACE_SECS),
 				 errhint("Check max_worker_processes and pg_pass_policy.database; superusers and roles listed in pg_pass_policy.exempt_roles can still connect.")));
 	if (hash_full)
@@ -940,7 +946,7 @@ ppp_client_auth_hook(Port *port, int status)
 		if (log_not_loaded)
 			ereport(LOG,
 					(errmsg(PPP_LOG_PREFIX "refusing connections until the background worker has loaded the lock state"),
-					 errdetail("Roles authenticating with a password or a secret are refused until the persisted locks are re-injected from role_state (at most one message per second)."),
+					 errdetail("Roles not listed in pg_pass_policy.exempt_roles are refused, whatever the authentication method, until the persisted locks are re-injected from role_state (at most one message per second)."),
 					 errhint("Check that the pg_pass_policy background worker is running (pass_policy.worker_status()); roles listed in pg_pass_policy.exempt_roles can still connect, superusers too once no worker has started for %d seconds.",
 							 PPP_WORKER_MISSING_GRACE_SECS)));
 		ereport(FATAL,
@@ -1628,6 +1634,7 @@ typedef struct pppAttemptRow
 	TimestampTz first_failure_at;
 	TimestampTz last_failure_at;
 	TimestampTz locked_until;
+	bool		role_missing;
 } pppAttemptRow;
 
 /*
@@ -1637,6 +1644,15 @@ typedef struct pppAttemptRow
  *
  * Only roles with failures or an active lock are returned.  Timestamps at
  * 0 are returned as NULL; a manual lock (DT_NOEND) as 'infinity'.
+ *
+ * Entries of non-existent user names (role_missing) are returned by name to
+ * superusers only.  Such a name is whatever a client typed in the user
+ * field, a password typed in the wrong field included; the server log
+ * (readable by superusers) already holds it, the viewer and admin roles
+ * must not read it.  For them, those entries are folded into a single row
+ * whose role_name is NULL (it can match no role, unlike a placeholder
+ * name): sum of the counters, earliest first failure, latest last failure
+ * and latest lock.
  */
 Datum
 ppp_failed_attempts(PG_FUNCTION_ARGS)
@@ -1650,9 +1666,12 @@ ppp_failed_attempts(PG_FUNCTION_ARGS)
 	pppRoleEntry *entry;
 	TimestampTz now;
 	int			i;
+	bool		show_missing = superuser();
+	pppAttemptRow agg;
 
 	ppp_check_shmem();
 	ppp_begin_materialize(fcinfo, &tupdesc, &tupstore, 5);
+	memset(&agg, 0, sizeof(agg));
 
 	/* copy the interesting entries under a shared lock, no palloc inside */
 	now = GetCurrentTimestamp();
@@ -1676,9 +1695,45 @@ ppp_failed_attempts(PG_FUNCTION_ARGS)
 		rows[nrows].first_failure_at = entry->first_failure_at;
 		rows[nrows].last_failure_at = entry->last_failure_at;
 		rows[nrows].locked_until = locked ? entry->locked_until : 0;
+		rows[nrows].role_missing = entry->role_missing;
 		nrows++;
 	}
 	LWLockRelease(ppp_shared->lock);
+
+	/* fold the non-existent names (see above), outside the lock */
+	if (!show_missing)
+	{
+		int			kept = 0;
+
+		for (i = 0; i < nrows; i++)
+		{
+			pppAttemptRow *r = &rows[i];
+
+			if (!r->role_missing)
+			{
+				if (kept != i)
+					rows[kept] = *r;
+				kept++;
+				continue;
+			}
+			if (!agg.role_missing)
+			{
+				agg = *r;
+				continue;
+			}
+			agg.failed_count += r->failed_count;
+			if (r->first_failure_at != 0 &&
+				(agg.first_failure_at == 0 || r->first_failure_at < agg.first_failure_at))
+				agg.first_failure_at = r->first_failure_at;
+			if (r->last_failure_at > agg.last_failure_at)
+				agg.last_failure_at = r->last_failure_at;
+			if (r->locked_until > agg.locked_until)
+				agg.locked_until = r->locked_until;
+		}
+		nrows = kept;
+		if (agg.role_missing)
+			rows[nrows++] = agg;	/* room: at least one row was dropped */
+	}
 
 	for (i = 0; i < nrows; i++)
 	{
@@ -1686,7 +1741,10 @@ ppp_failed_attempts(PG_FUNCTION_ARGS)
 		bool		nulls[5];
 
 		memset(nulls, 0, sizeof(nulls));
-		values[0] = CStringGetTextDatum(rows[i].rolename);
+		if (rows[i].role_missing && !show_missing)
+			nulls[0] = true;
+		else
+			values[0] = CStringGetTextDatum(rows[i].rolename);
 		values[1] = Int32GetDatum(rows[i].failed_count);
 		if (rows[i].first_failure_at != 0)
 			values[2] = TimestampTzGetDatum(rows[i].first_failure_at);
@@ -1840,6 +1898,40 @@ ppp_shmem_unlock_role(PG_FUNCTION_ARGS)
 	ppp_defer_op(PPP_OP_UNLOCK, rolename, 0, expired_only);
 
 	PG_RETURN_BOOL(true);
+}
+
+/*
+ * _shmem_is_locked(role text) RETURNS bool (STRICT)
+ *
+ * True if the shared memory holds an active lock of the role right now
+ * (HASH_FIND under a shared lock).  Used by unlock_role() to tell whether
+ * there was anything to unlock, without copying the whole hash as
+ * failed_attempts() does; shmem_unlock_role() cannot answer that (without
+ * expired_only it queues the unlock and returns true).
+ */
+Datum
+ppp_shmem_is_locked(PG_FUNCTION_ARGS)
+{
+	char		rolename[NAMEDATALEN];
+	pppRoleKey	key;
+	pppRoleEntry *entry;
+	bool		locked = false;
+
+	ppp_require_superuser("_shmem_is_locked");
+	ppp_check_shmem();
+
+	ppp_text_to_rolename(PG_GETARG_TEXT_PP(0), rolename);
+	if (ppp_role_hash == NULL)
+		PG_RETURN_BOOL(false);
+
+	ppp_make_key(&key, rolename);
+	LWLockAcquire(ppp_shared->lock, LW_SHARED);
+	entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key, HASH_FIND, NULL);
+	if (entry != NULL)
+		locked = ppp_is_locked(entry, GetCurrentTimestamp());
+	LWLockRelease(ppp_shared->lock);
+
+	PG_RETURN_BOOL(locked);
 }
 
 /*

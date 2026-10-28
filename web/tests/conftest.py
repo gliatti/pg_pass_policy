@@ -121,7 +121,11 @@ def super_conn(super_url):
 
 # T_SLASH: a role name that needs percent-encoding in the action URLs
 T_SLASH = "web_t_app/batch?#%"
-T_ROLES = ("web_t_alpha", "web_t_beta", "web_t_pa", "web_t_pb", T_SLASH)
+# one role per value of v_role_status.status (test_integration.status_roles)
+T_STATUS_ROLES = tuple(
+    f"web_t_s_{s}" for s in ("ok", "warn", "grace", "exp", "lock", "exempt", "never", "unknown")
+)
+T_ROLES = ("web_t_alpha", "web_t_beta", "web_t_pa", "web_t_pb", T_SLASH, *T_STATUS_ROLES)
 T_GROUP = "web_t_group"
 T_PROFILE = "web_t_profile"
 T_PAIR = "web_t_pair"

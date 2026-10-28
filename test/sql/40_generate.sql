@@ -78,6 +78,33 @@ SELECT pass_policy.create_profile('p_gen_norepeat',
 SELECT ppp_test.try($$SELECT pass_policy.generate_password(203, 'p_gen_norepeat')$$) AS infeasible_profile;
 SELECT pass_policy.drop_profile('p_gen_norepeat');
 
+-- (vérification 6) _generate_password_for() (utilisée par _rotate_role())
+-- connaît le rôle cible : aucun tirage ne contient son nom ni son inverse
+-- (PPP-017, toute casse), même pour un nom de 3 lettres. Sur 1000 mots de
+-- passe de 512 caractères, environ 16 tirages de generate_password() (qui
+-- ignore le rôle) contiennent « abc » ou « cba » : le filtre est donc exercé.
+SELECT pass_policy.create_profile('p_gen_name', '{"max_length": 512}') > 0 AS created;
+CREATE TEMP TABLE gen_name AS
+  SELECT pass_policy._generate_password_for('abc', 512, 'p_gen_name') AS pwd_for,
+         pass_policy.generate_password(512, 'p_gen_name') AS pwd_any
+    FROM generate_series(1, 1000);
+SELECT count(*) FILTER (WHERE lower(pwd_for) ~ '(abc|cba)') AS for_with_name,
+       count(*) FILTER (WHERE lower(pwd_any) ~ '(abc|cba)') > 0 AS any_with_name,
+       bool_and(length(pwd_for) = 512) AS for_length_ok
+  FROM gen_name;
+-- même vérification que le hook (PPP-017) sur les tirages filtrés
+CREATE ROLE abc LOGIN;
+SELECT pass_policy.assign_profile('abc', 'p_gen_name');
+SELECT count(*) FILTER (WHERE ppp_test.code(pass_policy.check_password('abc', pwd_for)) = 'PPP-017') AS for_ppp017
+  FROM (SELECT pwd_for FROM gen_name LIMIT 200) g;
+-- rotation d'un rôle de 3 lettres : jamais refusée par son propre hook
+SELECT bool_and(ppp_test.try('SELECT pass_policy.rotate_password(''abc'')') = 'ok') AS rotations_ok
+  FROM generate_series(1, 20);
+SELECT pass_policy.unassign_profile('abc');
+DROP ROLE abc;
+SELECT pass_policy.drop_profile('p_gen_name');
+DROP TABLE gen_name;
+
 -- generate_password n'écrit rien dans l'audit ni l'historique
 SELECT count(*) AS gen_events FROM pass_policy.audit_log
  WHERE role_name = 'regress_gen'

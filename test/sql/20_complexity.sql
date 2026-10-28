@@ -159,6 +159,41 @@ SELECT ppp_test.try($$ALTER ROLE regress_prehash PASSWORD 'Tr0ub4dour&Horse-42'$
 RESET password_encryption;
 SET client_min_messages = warning;
 SELECT rolpassword LIKE 'SCRAM-SHA-256$%' AS still_scram FROM pg_authid WHERE rolname = 'regress_prehash';
+-- (vérification 6) check_password() répond comme le hook (même fonction
+-- d'évaluation) : vérificateur pré-haché soumis à min_age pour un
+-- non-superutilisateur (le rôle lui-même, membre de pass_policy_admin pour
+-- appeler la fonction), ici changé à l'instant (min_age = 1 jour)
+GRANT pass_policy_admin TO regress_prehash;
+SET SESSION AUTHORIZATION regress_prehash;
+SELECT ppp_test.code(pass_policy.check_password('regress_prehash', 'SCRAM-SHA-256$4096:haqxM21W2X4JN2z5mNIhgQ==$6wQyAb1jy/PwU6taBTaUoM8DCeQcK961IfQ80mS4Iwk=:nYBdZfaOxx6o2q0ioUkoxD3rmW1Nff4RWaNnPPYCZiw=')) AS prehashed_min_age_check,
+       ppp_test.try($$ALTER ROLE regress_prehash PASSWORD 'SCRAM-SHA-256$4096:haqxM21W2X4JN2z5mNIhgQ==$6wQyAb1jy/PwU6taBTaUoM8DCeQcK961IfQ80mS4Iwk=:nYBdZfaOxx6o2q0ioUkoxD3rmW1Nff4RWaNnPPYCZiw='$$) AS prehashed_min_age_hook;
+RESET SESSION AUTHORIZATION;
+REVOKE pass_policy_admin FROM regress_prehash;
+-- superuser_bypass = on : un superutilisateur échappe aux règles de
+-- complexité, pour check_password() comme pour le hook (GUC SIGHUP : attente
+-- d'une instruction par tour, sortie masquée, comme dans 90_privileges)
+INSERT INTO ppp_test.secrets VALUES ('bypass_weak', 'weakbypass');
+ALTER SYSTEM SET pg_pass_policy.superuser_bypass = on;
+SELECT pg_reload_conf();
+\set ECHO none
+\o /dev/null
+SELECT 'SELECT pg_sleep(0.1) WHERE NOT current_setting(''pg_pass_policy.superuser_bypass'')::bool'
+  FROM generate_series(1, 50) \gexec
+\o
+\set ECHO all
+SHOW pg_pass_policy.superuser_bypass;
+SELECT ppp_test.code(pass_policy.check_password('regress_prehash', 'weakbypass')) AS bypass_check,
+       ppp_test.try($$ALTER ROLE regress_prehash PASSWORD 'weakbypass'$$) AS bypass_hook;
+ALTER SYSTEM RESET pg_pass_policy.superuser_bypass;
+SELECT pg_reload_conf();
+\set ECHO none
+\o /dev/null
+SELECT 'SELECT pg_sleep(0.1) WHERE current_setting(''pg_pass_policy.superuser_bypass'')::bool'
+  FROM generate_series(1, 50) \gexec
+\o
+\set ECHO all
+SHOW pg_pass_policy.superuser_bypass;
+SELECT ppp_test.code(pass_policy.check_password('regress_prehash', 'weakbypass')) AS no_bypass_check;
 
 -- enforce_database = on : hors de pg_pass_policy.database, le changement est refusé
 SELECT current_database() AS regress_db \gset
