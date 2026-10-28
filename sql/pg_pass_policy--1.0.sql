@@ -726,6 +726,9 @@ COMMENT ON FUNCTION _refresh_role_state(oid) IS 'Internal: recomputes expires_at
  *             'infinity' (bounded by a rotation pair only): the extension
  *             does not manage the expiry, it only lifts a block it caused.
  * Returns a jsonb description of the change, or NULL if nothing was done.
+ * Step d of run_maintenance() computes the same target value for all roles
+ * at once, to call this function only for those whose VALID UNTIL differs
+ * from it: keep both in step.
  */
 CREATE FUNCTION _apply_valid_until(p_oid oid, p_mode text DEFAULT 'sync')
 RETURNS jsonb
@@ -1810,15 +1813,41 @@ BEGIN
     -- (rewrites only a VALID UNTIL already in the past).  Exempt roles are
     -- kept for 'unblock', as in rotate_password(): their password may be
     -- changed by a plain ALTER ROLE, which the hook does not record.
+    -- The target value is computed here for all roles at once, as
+    -- _apply_valid_until() does (keep both in step): only the roles whose
+    -- current VALID UNTIL differs from it are passed to that function, which
+    -- keeps the final decision (shorter manual value, value not written by
+    -- us).  This filter is a necessary condition of any change made by the
+    -- function, so the pass leaves the other roles alone without one call
+    -- per role.
     FOR r IN
-        SELECT s.role_oid, a.rolname::text AS rname,
-               v_manage AND NOT x.exempt AS do_sync
-          FROM pass_policy.role_state s
-          JOIN pg_catalog.pg_authid a ON a.oid = s.role_oid
-         CROSS JOIN LATERAL (SELECT a.oid = ANY (v_exempt) AS exempt) x
-         WHERE a.rolcanlogin
-           AND ((v_manage AND NOT x.exempt)
-                OR (NOT s.must_change AND a.rolvaliduntil IS NOT DISTINCT FROM s.valid_until_synced))
+        SELECT q.role_oid, q.rname, q.do_sync
+          FROM (SELECT s.role_oid, a.rolname::text AS rname, a.rolvaliduntil,
+                       v_manage AND NOT x.exempt AS do_sync,
+                       pb.pair_bound,
+                       least(s.grace_until, pb.pair_bound) AS desired  -- least() ignores NULLs
+                  FROM pass_policy.role_state s
+                  JOIN pg_catalog.pg_authid a ON a.oid = s.role_oid
+                 CROSS JOIN LATERAL (SELECT a.oid = ANY (v_exempt) AS exempt) x
+                  LEFT JOIN (SELECT rp.previous_role, min(rp.previous_valid_until) AS pair_bound
+                               FROM pass_policy.rotation_pair rp
+                              WHERE rp.previous_valid_until IS NOT NULL
+                              GROUP BY rp.previous_role) pb
+                         ON pb.previous_role = a.rolname
+                 WHERE a.rolcanlogin
+                   AND ((v_manage AND NOT x.exempt)
+                        OR (NOT s.must_change AND a.rolvaliduntil IS NOT DISTINCT FROM s.valid_until_synced))) q
+         WHERE CASE
+                 -- 'sync': NULL target -> 'infinity', a missing VALID UNTIL
+                 -- being already unlimited
+                 WHEN q.do_sync AND q.desired IS NULL
+                   THEN coalesce(q.rolvaliduntil, 'infinity') <> 'infinity'
+                 WHEN q.do_sync
+                   THEN q.rolvaliduntil IS DISTINCT FROM q.desired
+                 -- 'unblock': VALID UNTIL already passed, other than its target
+                 ELSE q.rolvaliduntil <= now()
+                      AND q.rolvaliduntil IS DISTINCT FROM coalesce(q.pair_bound, 'infinity')
+               END
     LOOP
         v_res := pass_policy._apply_valid_until(r.role_oid, CASE WHEN r.do_sync THEN 'sync' ELSE 'unblock' END);
         IF v_res IS NOT NULL THEN

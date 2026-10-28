@@ -121,6 +121,7 @@ typedef struct pppPendingRow
 	TimestampTz audit_lock_set_at;	/* when that lock was set */
 	uint32		lost_episodes;	/* earlier episodes overwritten unaudited */
 	uint64		lock_seq;		/* entry->lock_seq when copied */
+	uint64		generation;		/* entry->generation when copied */
 	bool		state_written;	/* role_state upserted with locked_until */
 	bool		role_missing;	/* non-existent user name (authentication hook) */
 	Oid			role_oid;		/* OID of the role when it was locked
@@ -420,6 +421,7 @@ ppp_sync_pending(void)
 			rows[nrows].lost_episodes = entry->audit_lock_seq -
 				entry->audit_acked_seq - 1;
 		rows[nrows].lock_seq = entry->lock_seq;
+		rows[nrows].generation = entry->generation;
 		rows[nrows].state_written = false;
 		rows[nrows].role_missing = entry->role_missing;
 		rows[nrows].role_oid = entry->audit_role_oid;
@@ -788,15 +790,18 @@ ppp_ack_pending(void)
 		/*
 		 * The entry found under this name may not be the one copied: it
 		 * may have been evicted and entered again in between, its episode
-		 * numbers starting again from 0.  Such an entry (episode number
-		 * behind the copied one, or the same number for another lock) is
-		 * left as it is: what it holds was not written, and it is written
-		 * at the next cycle.  audit_acked_seq thus never gets ahead of
-		 * audit_lock_seq, and lost_episodes stays meaningful.  "Another
-		 * lock" is told by its end and by when it was set: two locks until
-		 * manual unlock (DT_NOEND) have the same end.
+		 * numbers starting again from 0.  Such an entry (another
+		 * incarnation, told by its generation even when both episode
+		 * numbers are 0; or, as a second guard, an episode number behind
+		 * the copied one, or the same number for another lock) is left as
+		 * it is: what it holds, failures included, was not written, and it
+		 * is written at the next cycle.  audit_acked_seq thus never gets
+		 * ahead of audit_lock_seq, and lost_episodes stays meaningful.
+		 * "Another lock" is told by its end and by when it was set: two
+		 * locks until manual unlock (DT_NOEND) have the same end.
 		 */
-		if ((int32) (entry->audit_lock_seq - r->audit_lock_seq) < 0 ||
+		if (entry->generation != r->generation ||
+			(int32) (entry->audit_lock_seq - r->audit_lock_seq) < 0 ||
 			(r->lock_pending_audit &&
 			 entry->audit_lock_seq == r->audit_lock_seq &&
 			 (entry->audit_locked_until != r->audit_locked_until ||

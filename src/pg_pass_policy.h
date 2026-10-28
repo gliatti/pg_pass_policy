@@ -136,6 +136,15 @@ typedef struct pppRoleEntry
 	uint32		lock_inflight;			/* PPP_OP_LOCK applied, not yet committed */
 	uint64		lock_seq;				/* ppp_shared->lock_seq of the last change */
 
+	/*
+	 * Incarnation number of the entry, given by ppp_init_entry() from
+	 * ppp_shared->entry_generation: an entry evicted and entered again under
+	 * the same name gets another one.  The worker acknowledges what it wrote
+	 * (ppp_ack_pending) only to the incarnation it copied, even when the
+	 * episode numbers of both are equal (0 before any lock).
+	 */
+	uint64		generation;
+
 	/* set by the authentication hook: user name not found in pg_authid */
 	bool		role_missing;
 
@@ -290,6 +299,12 @@ typedef struct pppSharedState
 	 * after that snapshot and is left alone by the reload.
 	 */
 	uint64		lock_seq;
+
+	/*
+	 * Last incarnation number given to a hash entry (ppp_init_entry, under
+	 * the lock exclusively): see pppRoleEntry.generation.
+	 */
+	uint64		entry_generation;
 } pppSharedState;
 
 extern pppSharedState *ppp_shared;

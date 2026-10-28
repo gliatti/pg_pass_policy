@@ -1183,18 +1183,31 @@ ppp_require_extension(bool absent_is_error)
  */
 
 /*
- * Password change while the extension is not installed in the current
- * database (SPEC 6.2 step 2): PPP-003 outside pg_pass_policy.database when
- * enforce_database is on, otherwise a WARNING once per session.  No SPI and
- * no audit row: there is no pass_policy schema to write to.
+ * Is the current database the one designated by pg_pass_policy.database?
+ * Only that database holds the tables maintained by the worker (SPEC 5).
  */
-static void
-ppp_extension_absent(const char *username)
+static bool
+ppp_in_policy_database(void)
 {
 	char	   *dbname = get_database_name(MyDatabaseId);
-	bool		in_ppp_db = (dbname != NULL && ppp_database != NULL &&
-							 strcmp(dbname, ppp_database) == 0);
 
+	return (dbname != NULL && ppp_database != NULL &&
+			strcmp(dbname, ppp_database) == 0);
+}
+
+/*
+ * Password change where the policy cannot be applied (SPEC 6.2 step 2):
+ * either outside pg_pass_policy.database, whether or not the extension is
+ * installed in the current database (in_ppp_db false), or in that database
+ * while the extension is not installed there (in_ppp_db true).  Outside
+ * that database: PPP-003 when enforce_database is on, otherwise a WARNING
+ * once per session and the policy is not applied, even if the extension is
+ * installed: its tables there would never be maintained by the worker.  No
+ * SPI and no audit row.
+ */
+static void
+ppp_policy_not_applicable(const char *username, bool in_ppp_db)
+{
 	if (!in_ppp_db && ppp_enforce_database)
 	{
 		pppProfile	prof;
@@ -1209,7 +1222,7 @@ ppp_extension_absent(const char *username)
 		if (in_ppp_db)
 			ereport(WARNING,
 					(errmsg("pg_pass_policy: extension is not installed in database \"%s\", password policy not applied",
-							dbname),
+							ppp_database),
 					 errhint("Run CREATE EXTENSION pg_pass_policy in this database."),
 					 errhidestmt(true),
 					 errhidecontext(true)));
@@ -1301,8 +1314,16 @@ ppp_check_password_hook(const char *username, const char *shadow_pass,
 		ppp_in_hook = true;
 		PG_TRY();
 		{
-			/* step 2, without SPI; PPP-004 if untrusted */
-			if (ppp_require_extension(false) == PPP_EXT_TRUSTED)
+			/*
+			 * step 2, without SPI: outside pg_pass_policy.database the
+			 * policy never applies (PPP-003 or WARNING), even when the
+			 * extension is installed there; PPP-004 if untrusted.
+			 */
+			bool		in_ppp_db = ppp_in_policy_database();
+
+			if (!in_ppp_db)
+				ppp_policy_not_applicable(username, false);
+			else if (ppp_require_extension(false) == PPP_EXT_TRUSTED)
 			{
 				/*
 				 * Read with the caller's identity: may the caller change the
@@ -1325,7 +1346,7 @@ ppp_check_password_hook(const char *username, const char *shadow_pass,
 				ppp_spi_end(&st);
 			}
 			else
-				ppp_extension_absent(username);
+				ppp_policy_not_applicable(username, true);
 		}
 		PG_CATCH();
 		{
@@ -1421,9 +1442,11 @@ ppp_check_secret(FunctionCallInfo fcinfo, const char *username, Oid roleid,
  *
  * The minimum age, history and current password checks are only done when
  * the caller is a superuser, the role itself, or may change the role's
- * password (PPP_MAY_SET_PASSWORD_OF, the predicate of the hook), so that the
- * function cannot be used as an oracle on the passwords of a role the
- * caller may not change, or on the date of its last change.
+ * password (PPP_MAY_SET_PASSWORD_OF), or when the role does not exist yet:
+ * the history is then checked by name, as CREATE ROLE ... PASSWORD would
+ * do it (same predicate as the hook).  The function cannot be used as an
+ * oracle on the passwords of an existing role the caller may not change, or
+ * on the date of its last change.
  *
  * The whole body runs in one elevated SPI session whose GUC guard keeps
  * STATEMENT/CONTEXT (which hold the password) out of the messages emitted
@@ -1463,8 +1486,8 @@ ppp_check_password(PG_FUNCTION_ARGS)
 		roleid = get_role_oid(username, true);
 		/* same predicate as the hook (explicit user id, no elevation) */
 		may_check_history = caller_is_super ||
-			(OidIsValid(roleid) &&
-			 (roleid == caller || PPP_MAY_SET_PASSWORD_OF(caller, roleid)));
+			!OidIsValid(roleid) || roleid == caller ||
+			PPP_MAY_SET_PASSWORD_OF(caller, roleid);
 
 		code = ppp_check_secret(fcinfo, username, roleid, &prof,
 								may_check_history, caller_is_super);

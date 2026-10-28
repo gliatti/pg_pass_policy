@@ -248,51 +248,25 @@ ppp_assign_exempt_roles(const char *newval, void *extra)
 bool
 ppp_role_is_exempt(const char *rolename)
 {
-	char	   *rawstring;
-	List	   *elemlist;
-	ListCell   *lc;
-	bool		result = false;
 	int			i;
 
 	if (rolename == NULL || ppp_exempt_roles == NULL ||
 		ppp_exempt_roles[0] == '\0')
 		return false;
 
-	if (ppp_exempt_list != NULL)
-	{
-		for (i = 0; i < ppp_exempt_list->count; i++)
-			if (strcmp(ppp_exempt_list->names[i], rolename) == 0)
-				return true;
-		return false;
-	}
-
 	/*
-	 * No list (cannot happen: the check hook always builds one for an
-	 * accepted value, the boot value included): parse here.
+	 * The check hook builds the list (extra) for every accepted non-empty
+	 * value, the boot value included, so it cannot be missing here.  Should
+	 * it ever be, no role is exempt: the policy applies (fail closed).
 	 */
-	rawstring = pstrdup(ppp_exempt_roles);
-	if (!SplitIdentifierString(rawstring, ',', &elemlist))
-	{
-		/* cannot happen thanks to the check hook, be conservative */
-		list_free(elemlist);
-		pfree(rawstring);
+	Assert(ppp_exempt_list != NULL);
+	if (ppp_exempt_list == NULL)
 		return false;
-	}
 
-	foreach(lc, elemlist)
-	{
-		const char *name = (const char *) lfirst(lc);
-
-		if (strcmp(name, rolename) == 0)
-		{
-			result = true;
-			break;
-		}
-	}
-
-	list_free(elemlist);
-	pfree(rawstring);
-	return result;
+	for (i = 0; i < ppp_exempt_list->count; i++)
+		if (strcmp(ppp_exempt_list->names[i], rolename) == 0)
+			return true;
+	return false;
 }
 
 /*

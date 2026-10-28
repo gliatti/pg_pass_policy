@@ -126,4 +126,28 @@ sleep 0.5
 n=$(grep -cF -- 'LeakProbeUnique-2026' "$PPP_TMP/server.log" || true)
 check_eq "check_password() en erreur : mot de passe absent du log serveur" "0" "$n"
 
+# Extension installée dans une autre base que pg_pass_policy.database : le
+# worker n'en maintient jamais les tables, la politique ne s'y applique pas.
+# enforce_database = on : PPP-003 comme si l'extension était absente.
+psql_admin "CREATE DATABASE ppp_otherdb" >/dev/null
+psql_other() {
+	"$PPP_BINDIR/psql" -X -q -At -v ON_ERROR_STOP=1 -h 127.0.0.1 -p "$PPP_PORT" \
+		-U "$PPP_SUPERUSER" -d ppp_otherdb -c "$1" 2>&1
+}
+psql_other "CREATE EXTENSION pg_pass_policy" >/dev/null
+out=$(psql_other "ALTER ROLE regress_notify PASSWORD 'Other-Db#Pass-2026'") || true
+check_contains "extension dans une autre base, ALTER ROLE : PPP-003" 'PPP-003' "$out"
+out=$(psql_other "SELECT count(*) FROM pass_policy.password_history")
+check_eq "autre base : aucun historique écrit" "0" "$out"
+# enforce_database = off : WARNING, politique non appliquée (pas d'historique)
+psql_admin "ALTER SYSTEM SET pg_pass_policy.enforce_database = off" >/dev/null
+psql_admin "SELECT pg_reload_conf()" >/dev/null
+sleep 1
+out=$(psql_other "ALTER ROLE regress_notify PASSWORD 'Other-Db#Pass-2027'") || true
+check_contains "enforce_database = off, autre base : WARNING politique non appliquée" 'password policy not applied outside database' "$out"
+out=$(psql_other "SELECT count(*) FROM pass_policy.password_history")
+check_eq "enforce_database = off, autre base : aucun historique écrit" "0" "$out"
+psql_admin "ALTER SYSTEM RESET pg_pass_policy.enforce_database" >/dev/null
+psql_admin "SELECT pg_reload_conf()" >/dev/null
+
 ppp_finish

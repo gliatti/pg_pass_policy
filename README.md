@@ -30,7 +30,10 @@ tests sont décrits dans [`docs/TESTING.md`](docs/TESTING.md).
 - l'extension n'est installée que dans **une seule base**, désignée par le
   paramètre `pg_pass_policy.database` (défaut `postgres`) : c'est là que le
   worker se connecte et que les changements de mot de passe doivent être faits
-  (voir `enforce_database` plus bas) ;
+  (voir `enforce_database` plus bas). Ne la créez pas dans une autre base :
+  le worker n'en maintiendrait jamais les tables, et le hook n'y applique pas
+  la politique (`PPP-003`, ou `WARNING` avec `enforce_database = off`), que
+  l'extension y soit installée ou non ;
 - `password_encryption = 'scram-sha-256'` (défaut depuis PostgreSQL 14) : les
   mots de passe MD5 sont refusés tant que `pg_pass_policy.require_scram = on`.
 
@@ -311,7 +314,7 @@ Tous préfixés `pg_pass_policy.`. Contexte `postmaster` = redémarrage ;
 | `exempt_roles` | liste | `''` | SIGHUP | rôles exemptés de la politique **et** du verrouillage, séparés par des virgules, règles des identifiants SQL : noms non cités mis en minuscules, noms entre guillemets conservés tels quels (`'postgres, "App User"'`). `rotate_password()`, `switch_rotation_pair()` et `run_maintenance()` ne posent pas de `VALID UNTIL` sur un rôle exempté : ils relèvent seulement une borne déjà passée (pour `run_maintenance()` : une borne posée par l'extension, `expire_password()` par exemple, une fois le mot de passe changé) |
 | `superuser_bypass` | bool | `off` | SIGHUP | `on` : les superutilisateurs échappent à la complexité (pas à l'historique) |
 | `require_scram` | bool | `on` | SIGHUP | refuse les mots de passe MD5 (`PPP-002`) |
-| `enforce_database` | bool | `on` | SIGHUP | hors de `database`, `ALTER ROLE … PASSWORD` est refusé (`PPP-003`) ; `off` : accepté sans contrôle avec un `WARNING` |
+| `enforce_database` | bool | `on` | SIGHUP | hors de `database`, `ALTER ROLE … PASSWORD` est refusé (`PPP-003`), même si l'extension est installée dans la base courante ; `off` : accepté sans contrôle avec un `WARNING` |
 
 ## Codes de refus `PPP-xxx`
 
@@ -327,7 +330,7 @@ transaction) : la trace est une ligne du log serveur,
 |---|---|
 | `PPP-001` | mot de passe pré-haché (MD5 ou SCRAM) refusé : la politique ne peut pas être vérifiée (`reject_prehashed`) |
 | `PPP-002` | mot de passe MD5 refusé (`require_scram = on`) |
-| `PPP-003` | changement de mot de passe hors de la base `pg_pass_policy.database` (`enforce_database = on`) |
+| `PPP-003` | changement de mot de passe hors de la base `pg_pass_policy.database` (`enforce_database = on`), extension installée ou non dans la base courante |
 | `PPP-004` | l'extension est installée mais son schéma `pass_policy` n'est pas fiable (propriétaire non superutilisateur) : tout changement de mot de passe est refusé (SQLSTATE `55000`) |
 | `PPP-010` | trop court (`min_length`) |
 | `PPP-011` | trop long (`max_length`) |

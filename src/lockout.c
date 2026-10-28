@@ -104,6 +104,7 @@ ppp_init_entry(pppRoleEntry *entry)
 	entry->lock_from_state = false;
 	entry->lock_inflight = 0;
 	entry->lock_seq = 0;
+	entry->generation = ++ppp_shared->entry_generation;
 	entry->role_missing = false;
 	entry->reload_profile_seen = false;
 	entry->reload_lock_seen = false;

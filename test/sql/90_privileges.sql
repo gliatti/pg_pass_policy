@@ -162,6 +162,15 @@ GRANT regress_target TO regress_hadmin WITH ADMIN OPTION;
 SET SESSION AUTHORIZATION regress_hadmin;
 SELECT ppp_test.code(pass_policy.check_password('regress_target', 'Unrelated-Valid#2026x')) AS admin_option_check_other;
 RESET SESSION AUTHORIZATION;
+-- Rôle inexistant : même prédicat que le hook, l'historique par nom (lignes
+-- sans OID écrites par CREATE ROLE … PASSWORD) est vérifié, comme le fera
+-- CREATE ROLE : PPP-031 pour un admin non superutilisateur
+INSERT INTO ppp_test.secrets VALUES ('ghost', 'Ghost-Pass#2026abc');
+CREATE ROLE regress_ghostpw LOGIN PASSWORD 'Ghost-Pass#2026abc';
+DROP ROLE regress_ghostpw;
+SET SESSION AUTHORIZATION regress_admin;
+SELECT ppp_test.code(pass_policy.check_password('regress_ghostpw', 'Ghost-Pass#2026abc')) AS admin_check_missing_role;
+RESET SESSION AUTHORIZATION;
 SET SESSION AUTHORIZATION regress_admin;
 SELECT ppp_test.try($$SELECT pass_policy.lock_role('regress_target', interval '1 hour', 'admin test')$$) AS lock;
 SELECT ppp_test.try($$SELECT pass_policy.unlock_role('regress_target')$$) AS unlock;
