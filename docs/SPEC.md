@@ -97,8 +97,13 @@ d'administration sont `SECURITY DEFINER` et vérifient l'appartenance).
 ### 3.2 `role_profile`
 
 `role_oid oid PK, role_name text NOT NULL, profile_id int REFERENCES profile,
-assigned_at timestamptz, assigned_by text`. Un rôle sans ligne utilise le profil
+assigned_at timestamptz, assigned_by text, cluster_id bigint NOT NULL DEFAULT
+_system_identifier()`. Un rôle sans ligne utilise le profil
 `default`. Pas de FK vers `pg_authid` : le worker purge les rôles disparus.
+`cluster_id` (vérification 15) : `system_identifier` de la grappe qui a écrit
+la ligne (`GetSystemIdentifier()`), emporté par `pg_dump` ; une ligne d'une
+autre valeur est une ligne restaurée, résolue par `_resolve_role_oid()`
+(§6.3, « rechargement » ; étape a0 de `run_maintenance()`).
 
 ### 3.3 `role_state`
 
@@ -114,6 +119,7 @@ assigned_at timestamptz, assigned_by text`. Un rôle sans ligne utilise le profi
 | lock_reason text | |
 | must_change bool | forcé par `expire_password()` |
 | valid_until_synced timestamptz | dernière valeur écrite dans pg_authid.rolvaliduntil par l'extension |
+| cluster_id bigint NOT NULL DEFAULT `_system_identifier()` | origine de la ligne, comme dans `role_profile` (vérification 15) |
 
 ### 3.4 `password_history`
 
@@ -182,12 +188,13 @@ dans `format('%I')` / `quote_ident()` : aucune concaténation brute.
 | `purge_audit(older_than interval DEFAULT '365 days')` | bigint | |
 | `load_dictionary(words text[])` | int | |
 | `audit(event_type text, role_name text, details jsonb DEFAULT '{}')` | void | insère + `pg_notify(current_setting('pg_pass_policy.notify_channel'), json)` ; utilisée par toutes les autres ; `EXECUTE` à `pass_policy_admin` seulement |
-| `failed_attempts()` | TABLE(role_name text, failed_count int, first_failure_at timestamptz, last_failure_at timestamptz, locked_until timestamptz) | **C** — lit la shmem ; les entrées de noms inexistants (aucun rôle de ce nom dans `pg_authid` au moment de l'appel : recherche syscache sur la copie, hors LWLock, faite seulement pour un appelant non superutilisateur, et non le drapeau `role_missing` de l'entrée, simple cache des classes d'éviction que le worker ne fait passer qu'à vrai, pour les entrées sans rien en attente : voulu, la vue doit être exacte au moment de la lecture, §12) ne sont nommées que pour un superutilisateur : pour les autres (viewer, admin), une seule ligne agrégée, `role_name` NULL (somme des compteurs, premier et dernier échec, verrou le plus tardif) |
-| `_shmem_is_locked(role text)` | bool | **C**, interne, superutilisateur — vrai si la shmem porte un verrou actif du rôle (`HASH_FIND`) ; utilisée par `unlock_role()` |
+| `failed_attempts()` | TABLE(role_name text, failed_count int, first_failure_at timestamptz, last_failure_at timestamptz, locked_until timestamptz, role_oid oid) | **C** — lit la shmem ; `role_oid` (vérification 15) est la clé de l'entrée, NULL pour une pseudo-entrée (nom sans rôle quand il a été essayé) ; `role_name` est le nom courant du rôle (recherche `AUTHOID` sur la copie, hors LWLock), ou le dernier nom connu de l'entrée une fois l'OID disparu ; les pseudo-entrées ne sont nommées que pour un superutilisateur : pour les autres (viewer, admin), toutes sont regroupées en une seule ligne, `role_name` et `role_oid` NULL (somme des compteurs, premier et dernier échec, verrou le plus tardif), d'après la clé seule (un rôle créé ensuite sous le nom a sa propre entrée) |
+| `_shmem_lock(role oid, until timestamptz)`, `_shmem_unlock(role oid, expired_only bool)`, `_shmem_reset(role oid)`, `_shmem_is_locked(role oid)` | void / bool / void / bool | **C**, internes, superutilisateur (vérification 15) — versions par OID de `shmem_lock_role()`, `shmem_unlock_role()` et `shmem_reset_failures()`, appelées par `lock_role()`, `unlock_role()` et l'étape f de `run_maintenance()` avec l'OID vérifié ; `_shmem_lock()` refuse un OID sans rôle (`42704`) ; `_shmem_is_locked()` : vrai si la shmem porte un verrou actif de l'OID (`HASH_FIND`), utilisée par `unlock_role()` |
+| `_system_identifier()`, `_resolve_role_oid(oid, text, bigint)` | bigint / oid | internes (vérification 15) — `system_identifier` de pg_control (défaut de `cluster_id`) ; rôle auquel appartient une ligne de `role_state` / `role_profile` (§6.3) |
 | `shmem_reload()` | void | **C** — superutilisateur seulement (comme les autres `shmem_*`) ; demande, à la validation de la transaction appelante, au worker de recharger les paramètres de verrouillage dans la shmem (un ROLLBACK annule la demande) |
-| `shmem_lock_role(role text, until timestamptz)` | void | **C** — `until` NULL = manuel (DT_NOEND) ; écriture shmem différée au COMMIT (annulée par ROLLBACK / ROLLBACK TO SAVEPOINT) ; nom sans rôle : ERROR `42704` ; l'OID du rôle est capturé à l'appel et appliqué au PRE_COMMIT même si le rôle est renommé ou supprimé ensuite dans la transaction (vérification 14 : plus d'ERROR au COMMIT) |
-| `shmem_unlock_role(role text, expired_only boolean DEFAULT false)` | bool | **C** — différée au COMMIT ; ne lève pas un verrou automatique posé après la demande ; `expired_only` : ne lève qu'un verrou expiré (étape f de `run_maintenance()`) et renvoie false, sans rien différer, si la shmem porte un verrou actif au moment de l'appel ; true sinon |
-| `shmem_reset_failures(role text)` | void | **C** — différée au COMMIT |
+| `shmem_lock_role(role text, until timestamptz)` | void | **C** — usage direct par un superutilisateur (standby compris) ; `until` NULL = manuel (DT_NOEND) ; écriture shmem différée au COMMIT (annulée par ROLLBACK / ROLLBACK TO SAVEPOINT) ; nom sans rôle : ERROR `42704` ; l'OID du rôle est capturé à l'appel et le verrou appliqué à cet OID au PRE_COMMIT (un renommage dans la transaction n'y change rien) |
+| `shmem_unlock_role(role text, expired_only boolean DEFAULT false)` | bool | **C** — vise l'OID du rôle qui porte le nom, ou, sans rôle de ce nom, la pseudo-entrée du nom (levée d'un pseudo-verrou) ; différée au COMMIT ; ne lève pas un verrou automatique posé après la demande ; `expired_only` : ne lève qu'un verrou expiré (étape f de `run_maintenance()`) et renvoie false, sans rien différer, si la shmem porte un verrou actif au moment de l'appel ; true sinon |
+| `shmem_reset_failures(role text)` | void | **C** — différée au COMMIT ; comme `shmem_unlock_role()`, vise l'OID du rôle qui porte le nom, ou la pseudo-entrée du nom sans rôle |
 | `worker_status()` | TABLE(pid int, last_run timestamptz, last_reload timestamptz, tracked_roles int, locks_loaded bool) | **C** — `locks_loaded` : faux tant que la fenêtre de démarrage refuse les connexions (§6.3, « Démarrage ») |
 
 Règles communes à l'API :
@@ -341,27 +348,41 @@ Les caractères sont comptés en points de code UTF-8 (`pg_mblen`) ; les classes
 Le hook s'exécute pendant `InitPostgres()`, **après** `InitCatalogCache()`,
 `StartTransactionCommand()` et `GetTransactionSnapshot()` :
 `PerformAuthentication()` est appelée une fois la transaction de démarrage
-ouverte (vérifié dans les sources 13.2, 16.4 et 17beta1), et
-`get_role_password()` y fait elle-même `SearchSysCache1(AUTHNAME)`. Le hook
-peut donc consulter le cache système ; il ne fait **qu'une** recherche
-(`SearchSysCache1(AUTHNAME)`, `ppp_role_lookup()` : existence du rôle, son
-OID, `rolvaliduntil` et, pendant la fenêtre de démarrage, `rolsuper` ; à
-chaque connexion, avant de prendre le LWLock, sautée si
-`!IsTransactionState()`), **aucun SPI**. Tout le reste vient de la shmem,
-remplie par le worker.
+ouverte (vérifié dans les sources 13.2, 16.4 et 17beta1 ; pour 14, 15 et 18,
+voir §11, vérification 15), et `get_role_password()` y fait elle-même
+`SearchSysCache1(AUTHNAME)`. Le hook peut donc consulter le cache système ;
+il fait **une** recherche à chaque connexion qu'il traite
+(`SearchSysCache1(AUTHNAME)`, `ppp_role_lookup()` : OID du rôle,
+`rolvaliduntil` et `rolsuper`), avant de prendre le LWLock, **aucun SPI**.
+Hors transaction (`!IsTransactionState()`, jamais observé), la connexion est
+refusée par le `57P03` générique, avec un LOG explicite (fail-closed). Tout
+le reste vient de la shmem, remplie par le worker.
 
+**Clé du hash** (vérification 15). L'entrée d'un rôle existant est indexée
+par son **OID** (`pppRoleKey.roleid`) : l'OID est l'identité du rôle. Un
+renommage garde l'entrée (verrou, compteurs, profil), un rôle supprimé puis
+recréé sous le même nom en a une autre. Un nom qui ne correspond à aucun rôle
+quand le hook le rencontre a une **pseudo-entrée**, indexée par le nom
+(`roleid = InvalidOid`, nom tronqué comme `port->user_name`). La clé (68
+octets, sans remplissage) est toujours construite par `ppp_make_key()`, qui
+la met à zéro : le hash est créé avec `HASH_ELEM | HASH_FUNCTION`
+(`ppp_key_hash()` : `hash_bytes_uint32()` de l'OID, ou `hash_bytes()` du nom,
+la valeur de `string_hash` et de `hashtext(nom COLLATE "C")`), et dynahash
+compare alors les clés par `memcmp()` (fonction de hachage autre que
+`string_hash`, sans `HASH_COMPARE`). L'entrée garde pour les messages le
+dernier nom connu (`rolename`, mis à jour par le hook, le PRE_COMMIT d'un
+verrou et le rechargement), lu seulement quand l'OID n'existe plus.
 ```
 static void ppp_client_auth_hook(Port *port, int status);
 ```
 
 1. si `!ppp_enabled` ou rôle exempt → chaîner au hook précédent et sortir ;
 2. sinon le hook précédent est appelé après l'étape 8, **avant** le FATAL de l'étape 5 (un module chargé avant nous, `auth_delay` par exemple, voit toujours la tentative et son statut réel) ;
-3. le rôle existe-t-il, quel est son OID, et son `rolvaliduntil` est-il passé (`SearchSysCache1(AUTHNAME)`, `ppp_role_lookup()`) ? La recherche n'est faite que si sa réponse sert (vérification 14) : échec à compter, fenêtre de démarrage, ou entrée trouvée d'abord sous verrou partagé (`HASH_FIND`) qui porte un verrou actif ou quelque chose en attente pour un OID connu (`ppp_lookup_needed()`) ; si l'entrée, retrouvée sous le verrou exclusif, en a besoin alors qu'elle n'en avait pas besoin sous le verrou partagé, le verrou exclusif est relâché pour la recherche puis repris ; Un rôle expiré refusé par une méthode à mot de passe stocké (`password`, `md5`, `scram-sha-256` : `get_role_password()` refuse alors même le bon mot de passe) n'est pas compté ; le refus d'un rôle verrouillé (étape 5) reste appliqué ;
-4. `LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE)` ; chercher `port->user_name` dans `ppp_role_hash` ; si absent **et** `status == STATUS_ERROR` → créer avec les paramètres par défaut (`ppp_shared->default_*`) en mode « comptage » (`ppp_enter_role(…, PPP_ENTER_COUNT, …)`, voir « Hash plein » ci-dessous) ; faute de place → `ereport(LOG)` et continuer sans compter (un verrou existant reste appliqué : il a toujours une entrée) ; `role_missing` reçoit le résultat de l'étape 3 à la création **et à chaque échec** (un rôle créé après coup perd le drapeau), et est effacé par un succès ; le worker le rafraîchit aussi à chaque synchronisation (`ppp_sync_cleanup()` : noms copiés sous verrou partagé, recherche syscache hors LWLock, écriture sous verrou exclusif dans la même incarnation de l'entrée, `generation`) ; il ne sert qu'au classement d'éviction et à la purge : `failed_attempts()` vérifie l'existence du nom à chaque appel d'un non-superutilisateur (§4) ;
-5. si `locked_until > now` (ou `DT_NOEND`) **et que le verrou n'est pas certainement celui d'un autre rôle** → `ereport(FATAL, (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION), errmsg("role \"%s\" is locked by pg_pass_policy"), errdetail("locked until %s")))` — **même si status == STATUS_OK**. Principe : dans le doute, le verrou s'applique (fail-closed, vérification 14). Le verrou est certainement celui d'un autre rôle (`ppp_lock_is_foreign()`) seulement si la recherche de l'étape 3 a été faite et que `lock_role_oid` est valide et différent de l'OID trouvé, ou que le verrou est un pseudo-verrou certain (`lock_on_missing` : posé par le hook sur un nom qui n'avait pas de rôle) et qu'un rôle porte maintenant le nom ; tout autre verrou à `lock_role_oid` invalide s'applique, de même qu'un verrou quand la recherche a été sautée ou a échoué. Le verrou d'un autre rôle (supprimé, ou renommé, dont le nom est repris) : si l'entrée n'a rien en attente (`ppp_entry_settled()`), elle repart de zéro pour ce rôle (`ppp_restart_entry()` : `ppp_init_entry()`, donc verrou, compteurs, audit et paramètres du profil remis aux valeurs par défaut, nouvelle `generation`, et `reload_requested` levé, le worker étant réveillé après le relâchement du verrou : le rechargement fixe le profil du rôle qui porte le nom et réinjecte sous son nouveau nom le verrou persisté d'un rôle renommé) et la connexion suit les étapes 6 et 7 ; sinon (audit en attente de l'autre rôle, verrou non validé) la connexion est **refusée comme verrouillée**, quel que soit le statut, jusqu'à ce que le worker ait audité l'entrée (§12 : disponibilité sacrifiée à la sûreté ; la laisser passer sans compter permettait une force brute illimitée) ;
-5 bis. propriétaire des compteurs (vérification 14) : `owner_oid` reçoit l'OID du rôle à chaque échec compté (recherche faite) ; pour un échec à compter ou un succès, si la recherche a été faite et que `owner_oid` est valide et différent de l'OID du rôle qui se connecte, l'entrée réglée repart de zéro (`ppp_restart_entry()`, comme à l'étape 5) avant de compter ; si quelque chose est en attente, la connexion est refusée comme verrouillée (« The role is temporarily locked; retry later. »), bon mot de passe compris (un succès admis alors que les échecs sont refusés serait un oracle), jusqu'au tour du worker. Le nouveau rôle n'hérite jamais des compteurs d'un rôle supprimé ;
-6. si `status == STATUS_OK` → `failed_count = 0` ;
-7. sinon (`STATUS_ERROR` d'une méthode qui vérifie un mot de passe ou un secret uniquement, voir « Méthodes comptées » ci-dessous et §11) : si la fenêtre est écoulée (`ppp_window_elapsed()`) → repartir à 0 ; incrémenter ; si `failed_count >= max_failures` et `max_failures > 0` → `locked_until = now + lock_duration` (ou `DT_NOEND`), `lock_pending_audit = true`, `audit_locked_until = locked_until`, `audit_lock_seq++` (numéro d'épisode ; `audit_acked_seq` rattrapé s'il n'y avait rien en attente), `lock_role_oid` = OID trouvé à l'étape 3, `lock_on_missing` = recherche faite et nom sans rôle, `ereport(LOG, "pg_pass_policy: role \"%s\" locked after %d failed attempts")` ;
+3. recherche du rôle (`ppp_role_lookup()`, avant tout LWLock) : clé `{OID}` si le rôle existe, sinon pseudo-clé `{InvalidOid, nom}` ; la clé ne dépend pas de l'état de l'entrée, la recherche n'est jamais refaite. Un rôle expiré refusé par une méthode à mot de passe stocké (`password`, `md5`, `scram-sha-256` : `get_role_password()` refuse alors même le bon mot de passe) n'est pas compté ; le refus d'un rôle verrouillé (étape 5) reste appliqué ;
+4. chemin rapide, sans échec à compter et fenêtre de démarrage fermée : `LW_SHARED` et `HASH_FIND` ; pas d'entrée → relâcher, chaîner, sortir (cas courant : **une seule acquisition, partagée**) ; verrou actif → relâcher, chaîner, FATAL de l'étape 5 ; succès avec `failed_count = 0`, ou statut ni OK ni compté → relâcher et sortir ; sinon (succès avec un compteur vivant) relâcher et passer en exclusif, avec la même clé. Chemin général : `LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE)` ; chercher la clé dans `ppp_role_hash` ; si absente **et** échec à compter → créer avec les paramètres par défaut (`ppp_shared->default_*`) en mode « comptage » (`ppp_enter_role(…, PPP_ENTER_COUNT, …)`, voir « Hash plein » ci-dessous) ; faute de place → `ereport(LOG)` et continuer sans compter (un verrou existant reste appliqué : il a toujours une entrée) ;
+5. si `locked_until > now` (ou `DT_NOEND`) → `ereport(FATAL, (errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION), errmsg("role \"%s\" is locked by pg_pass_policy"), errdetail("locked until %s")))` — **même si status == STATUS_OK**. La clé étant l'identité du rôle, aucun test d'appartenance n'est fait : le verrou de l'entrée est celui du rôle qui se connecte (vérification 15, qui retire `ppp_lock_is_foreign()`, `ppp_restart_entry()` et le refus « temporarily locked » des vérifications 13 et 14) ;
+6. si `status == STATUS_OK` → `failed_count = 0` (et `rolename` rafraîchi pour une entrée réelle) ;
+7. sinon (`STATUS_ERROR` d'une méthode qui vérifie un mot de passe ou un secret uniquement, voir « Méthodes comptées » ci-dessous et §11) : si la fenêtre est écoulée (`ppp_window_elapsed()`) → repartir à 0 ; incrémenter ; si `failed_count >= max_failures` et `max_failures > 0` → `locked_until = now + lock_duration` (ou `DT_NOEND`), `lock_pending_audit = true`, `audit_locked_until = locked_until`, `audit_lock_seq++` (numéro d'épisode ; `audit_acked_seq` rattrapé s'il n'y avait rien en attente), `ereport(LOG, "pg_pass_policy: role \"%s\" locked after %d failed attempts")` ;
 8. si le rôle n'est pas refusé à l'étape 5, que `ppp_shared->locks_loaded` est faux (quelle que soit la méthode d'authentification, `trust`, `peer` ou `cert` compris) et que le rôle n'est pas un superutilisateur (`rolsuper`) alors que le worker est démontrablement absent, ni un superutilisateur de `pg_pass_policy.rescue_roles` authentifié avec succès par `peer` (`ppp_auth_is_peer()`, `ppp_role_is_rescue()`) (voir « Démarrage ») → refus « état non chargé », **quel que soit le statut**, et les étapes 6 et 7 sont sautées : l'entrée n'est pas modifiée (voir « Démarrage » ci-dessous) ; `LWLockRelease` ; le FATAL `57P03` est levé après le hook précédent, comme celui de l'étape 5.
 
 **Méthodes comptées.** Seuls les échecs des méthodes où le client présente
@@ -385,7 +406,7 @@ mais au mauvais nom échoue avec la méthode de la ligne et est compté.
 vrais rôles : après `max_failures` échecs le client reçoit le même FATAL
 « role "x" is locked by pg_pass_policy ». Répondre autrement offrirait un
 oracle d'énumération des rôles (PostgreSQL simule de même un échange SCRAM
-pour un rôle inexistant). Leur entrée porte `role_missing` et est **toujours
+pour un rôle inexistant). Leur pseudo-entrée (clé par le nom) est **toujours
 évincable**, même « verrouillée » ou avec des échecs pas encore journalisés :
 perdre le pseudo-verrou ou l'audit `auth_failed` d'un nom inexistant est
 acceptable (le nom ne peut pas se connecter, le log serveur garde les
@@ -432,11 +453,18 @@ coûteuse à perdre à la plus coûteuse :
 
 | classe | entrée |
 |---|---|
-| `GHOST` | `role_missing` (quel que soit son état) |
+| `GHOST` | pseudo-entrée (clé sans OID), quel que soit son état |
 | `INACTIVE` | compteur nul ou fenêtre écoulée, rien à journaliser, pas de verrou actif, pas de profil ; ou verrou expiré à l'audit périmé (voir ci-dessus) et compteur inactif ; un verrou expiré dont les échecs de l'épisode n'ont pas encore été remis à zéro (`ppp_expire_lock()`, paresseux) compte comme un compteur nul |
 | `LIVE_COUNTER` | compteur encore dans sa fenêtre (ou sans fenêtre) |
 | `PENDING_AUDIT` | échecs pas encore journalisés (`pending_failures > 0`) |
 | `KEEP` | verrou actif, `lock_pending_audit` (sauf audit périmé, ci-dessus) ou `from_profile` : jamais évincée |
+
+L'entrée d'un rôle supprimé encore à auditer (`role_dropped`, posé par le
+worker, voir plus bas) est `PENDING_AUDIT` tant qu'elle a un audit en attente
+(`lock_pending_audit` ou `pending_failures`), `INACTIVE` ensuite : son verrou
+et son profil ne s'appliquent plus à personne. Sur un standby, l'audit en
+attente d'un rôle supprimé n'est donc pas évincé par le comptage, sans
+occuper une place `KEEP`.
 
 **Hash plein (fail-closed).** Il n'y a pas de réserve : toutes les
 `max_tracked_roles` entrées servent indifféremment. Une fois le hash plein,
@@ -552,92 +580,86 @@ vers `role_state` n'est faite que si `locked_until = audit_locked_until`
 porte un autre verrou : `lock_role()` ou verrou réinjecté depuis
 `role_state`, d'après `locked_until` non nul lors de la copie, que ce
 verrou soit encore actif ou déjà expiré ; un verrou expiré est conservé
-dans l'entrée tant que l'audit est en attente, `ppp_expire_lock()`). Les entrées `role_missing` ne
+dans l'entrée tant que l'audit est en attente, `ppp_expire_lock()`).
+
+Pour un rôle, l'upsert de `role_state` vient **d'abord**, par OID (CTE :
+`pg_authid` de l'OID, puis `INSERT … ON CONFLICT (role_oid) DO UPDATE …
+WHERE role_state.cluster_id = courant`), et la ligne `role_locked` découle de
+son résultat, sans recherche préalable qui pourrait courir avec l'écriture :
+écrite, l'audit porte le nom courant du rôle ; OID disparu (rôle supprimé),
+rien n'est écrit dans `role_state` et l'audit porte le dernier nom connu de
+l'entrée et `details.role_dropped = true` ; conflit avec une ligne restaurée
+d'une autre grappe pas encore remappée (`cluster_id` différent, collision
+d'OID, `worker_interval = 0`), la ligne n'est pas écrasée : le verrou n'est
+ni persisté ni audité, il reste en attente (`KEEP` en shmem), avec un LOG, et
+un tour suivant l'écrit une fois la ligne remappée par l'étape a0. Le
+`role_locked` automatique porte aussi `details.role_oid`. Les `auth_failed`
+d'un rôle portent son nom courant (`pg_authid` par OID), ou le dernier nom
+connu une fois l'OID disparu. Les pseudo-entrées ne
 produisent pas une ligne par nom : une seule ligne `auth_failed` par tour,
 `role_name` NULL, `details = {"unknown_roles": n, "attempts": total,
 "pseudo_locks": k, "last_failure_at": …, "source": "auth_hook"}` (un seul
 NOTIFY), leurs pseudo-verrous compris (aucune ligne `role_locked` ni
 `role_state` pour un nom inexistant) ; les vrais rôles restent journalisés
-un par un ;
-dans une seconde transaction il efface les verrous expirés déjà journalisés
-(en gardant les échecs comptés après l'expiration), purge les entrées
-`INACTIVE` qui n'ont rien à journaliser, les compteurs sans fenêtre (`failure_window` ≤ 0) dont le dernier
-échec date de plus de 24 h, et les entrées `role_missing` sans verrou actif
-ni rien à journaliser dont le dernier échec est plus ancien que leur
-`failure_window` (24 h si la fenêtre est ≤ 0) ; auparavant, le worker fait
-des fantômes (`role_missing` passé de faux à vrai) les entrées sans verrou
-actif de rôles supprimés ou renommés depuis la dernière tentative, et
-retire du hash les entrées verrouillées dont le rôle n'existe plus
-(vérification 11) ; seules sont concernées les entrées qui n'ont rien en
-attente (ni `lock_pending_audit`, ni `pending_failures`, ni épisode non
-acquitté `audit_acked_seq ≠ audit_lock_seq`, ni `lock_inflight` :
-`ppp_entry_settled()`). Une entrée verrouillée ne devient **jamais**
-fantôme (`ppp_entry_may_become_ghost()` refuse tout verrou actif) : des
-noms inventés pourraient l'évincer. Le verrou est rattaché à l'OID de son
-rôle (`lock_role_oid`, posé par le hook, par `shmem_lock_role()` au
-PRE_COMMIT et par la réinjection depuis `role_state`) ; une fois le verrou
-entièrement audité et acquitté, l'entrée est supprimée (`HASH_REMOVE`)
-quand cet OID n'existe plus (`SearchSysCache1(AUTHOID)` : rôle supprimé),
-avec un LOG « lock of dropped role "…" released », ou porte un autre nom
-(renommé) **et** que `role_state` a, pour cet OID, une ligne dont
-`locked_until` couvre le verrou, sur un primaire (`ppp_lock_persisted()`,
-vérification 14), avec un LOG « lock of role "…" renamed to "…": reloaded
-from role_state » et une demande de rechargement (`ppp_reload_pending`) :
-le verrou persisté est réinjecté par OID sous le nouveau nom dans le même
-tour (vérification 13). Sinon (verrou automatique non écrit avant le
-renommage, verrou local d'un standby, ligne `role_state` d'un OID périmé)
-l'entrée reste sous l'ancien nom : aucun verrou n'est perdu, et le hook ne
-l'applique pas à un autre rôle qui porterait l'ancien nom (étape 5) ; le
-rôle renommé, lui, n'est pas verrouillé sous son nouveau nom (§12). Un
-rôle recréé sous l'ancien nom n'hérite jamais du verrou d'un autre OID :
-tant que l'audit de l'ancien rôle est en attente, il est refusé comme
-verrouillé, puis l'entrée est retirée par le worker ou remise à zéro par
-le hook (étape 5). Recherche syscache hors LWLock limitée à ces deux sortes
-d'entrées (drapeau faux sans verrou, ou verrou d'OID connu), copiées en une
-seule passe sous verrou partagé (`ppp_alloc_hash_copy()`, une ligne par
-entrée plus `PPP_HASH_COPY_MARGIN`), compaction en place des lignes dont le
-rôle a disparu, écriture sous verrou exclusif pour la même incarnation
-(`generation`), sans mise à jour du hook ni nouveau verrou depuis la copie
-(`update_seq`, incrémenté à chaque succès ou échec compté, et partout où le
-drapeau est remis à faux) et si l'entrée remplit encore les mêmes
-conditions (même `lock_role_oid` pour un verrou). Une entrée qui a quelque
-chose en attente garde son état : le worker écrit ses lignes `role_gone` /
-`role_renamed` (`ppp_ack_pending()`), puis le nettoyage la retire. Le hook
-ne remet pas non plus le drapeau à jour sur une entrée qu'il refuse
-« locked », ni après un échec ni après un succès (vérification 12) ; le
-pseudo-verrou certain d'un nom inventé ne s'applique pas au rôle créé
-ensuite sous ce nom une fois l'entrée auditée ; avant, la connexion est
-refusée (étape 5, vérifications 13 et 14). Le passage de vrai à faux reste au hook
-d'authentification (succès, ou échec dont la recherche trouve le rôle) :
-un fantôme dont le nom est repris par un nouveau rôle ne lui transmet pas
-son pseudo-verrou par le worker. `failed_attempts()` garde sa propre
-recherche (§12). Il réinjecte ensuite
-les verrous de `role_state` des seuls rôles existants : par OID, ou, si
-l'OID n'existe pas (restauration avant le remappage de l'étape a0 de
-`run_maintenance()`), par nom, sous l'OID du rôle trouvé (vérification 12),
-pourvu que `role_state` n'ait aucune ligne pour cet OID (vérification 13 :
-la ligne réelle du rôle l'emporte sur une ligne périmée) ;
-une ligne dont ni l'OID ni le nom n'existent (rôle supprimé, purgée par
-`run_maintenance()`) est ignorée (vérification 11) et n'empêche pas la
-fermeture de la fenêtre
-**avant** de recharger les paramètres des
+un par un.
+
+Dans une seconde transaction, le worker traite d'abord les **rôles
+supprimés** (`ppp_sync_cleanup()`, une seule passe) : il copie sous verrou
+partagé les OID des entrées réelles ni `INACTIVE` ni déjà `role_dropped`,
+les cherche hors LWLock (`SearchSysCacheExists1(AUTHOID)`), puis, sous
+verrou exclusif, pour chaque OID disparu : une entrée réglée
+(`ppp_entry_settled()` : ni `lock_pending_audit`, ni `pending_failures`, ni
+épisode non acquitté `audit_acked_seq ≠ audit_lock_seq`, ni `lock_inflight`)
+est retirée (`HASH_REMOVE`), avec un LOG « lock of dropped role "…"
+released » si elle portait un verrou actif ; sinon l'entrée reçoit
+`role_dropped` (monotone : un OID ne revient pas, sauf bouclage, §12) et
+sera purgée comme `INACTIVE` une fois auditée. Aucun contrôle
+d'incarnation n'est nécessaire : le hook ne crée une entrée pour cet OID
+que si sa propre recherche l'a trouvé avant le `DROP`, et c'est alors bien
+l'entrée du rôle supprimé. Il efface ensuite les verrous expirés déjà
+journalisés (en gardant les échecs comptés après l'expiration), purge les
+entrées `INACTIVE` qui n'ont rien à journaliser, les compteurs sans fenêtre
+(`failure_window` ≤ 0) dont le dernier échec date de plus de 24 h, et les
+pseudo-entrées sans pseudo-verrou actif ni rien à journaliser dont le
+dernier échec est plus ancien que leur `failure_window` (24 h si la fenêtre
+est ≤ 0).
+
+Il réinjecte ensuite les verrous de `role_state`, **par OID**, résolus par
+`_resolve_role_oid(role_oid, role_name, cluster_id)` (vérification 15,
+§11) : une ligne de cette grappe (`cluster_id` égal au `system_identifier`
+courant) appartient à son OID seulement, ignorée si l'OID n'existe plus,
+quel que soit le rôle qui porte son nom (rôle supprimé puis recréé :
+plus de réinjection sur le rôle recréé) ; une ligne restaurée d'une autre
+grappe appartient au rôle qui porte son nom, sinon à son OID s'il existe
+(pg_upgrade), sinon à personne. Plusieurs lignes résolues vers le même rôle :
+le verrou le plus long l'emporte (fail-closed). Seules les lignes résolues
+comptent pour la fenêtre de démarrage. Puis il recharge les paramètres des
 profils (`max_failures`, `failure_window`, `lock_duration`, bornés à
 2^31 − 1 s ≈ 68 ans avant conversion en `int4`) pour chaque rôle de
-`role_profile` + les valeurs du profil `default` dans `ppp_shared->default_*`.
+`role_profile` résolu de même (une ligne de cette grappe l'emporte sur une
+ligne restaurée du même rôle) + les valeurs du profil `default` dans
+`ppp_shared->default_*`. Sur un standby, les OID sont répliqués avec
+`pg_authid` et le `system_identifier` est celui du primaire : la logique est
+la même.
 Un verrou `lock_from_state` (réinjecté depuis `role_state`, ou posé par
 `shmem_lock_role()` sur un primaire) qui ne figure plus dans `role_state` est
 levé, sur le primaire comme sur un standby ; les verrous automatiques du hook
 (`lock_from_state = false`) ne sont jamais levés par le rechargement. Un
 appel direct à `shmem_lock_role()` sur un primaire, sans ligne `role_state`,
 est donc levé au rechargement suivant (utiliser `lock_role()`) ;
-`shmem_lock_role()` refuse un nom sans rôle (ERROR `42704`, vérification
-12 : le verrou n'aurait pas d'OID et ne serait jamais libéré) et capture
-l'OID à l'appel : le PRE_COMMIT l'applique même si le rôle a été renommé
-ou supprimé depuis dans la transaction (vérification 14, qui remplace
-l'ERROR au COMMIT de la vérification 13), le nettoyage du worker gère
-ensuite le renommage ou la suppression ; sur un
-standby, un tel verrou local n'est pas marqué `lock_from_state` et survit
-aux rechargements.
+`shmem_lock_role()` refuse un nom sans rôle (ERROR `42704`) et capture
+l'OID à l'appel : le PRE_COMMIT l'applique sur cet OID, un renommage dans la
+même transaction n'y change rien, l'entrée d'un rôle supprimé depuis est
+retirée par le worker. `shmem_unlock_role()` et `shmem_reset_failures()`
+visent l'OID du rôle qui porte le nom, ou, sans rôle, la pseudo-entrée du
+nom (levée d'un pseudo-verrou). Les fonctions SQL (`lock_role()`,
+`unlock_role()`, étape f de `run_maintenance()`) passent par les fonctions
+internes `_shmem_lock(oid, timestamptz)`, `_shmem_unlock(oid, bool)`,
+`_shmem_reset(oid)` et `_shmem_is_locked(oid)`, avec l'OID qu'elles ont
+vérifié : un renommage concurrent entre `_require_target_allowed()` et
+l'appel ne peut pas verrouiller un rôle dans `role_state` et un autre en
+shmem. Sur un standby, un verrou local posé par `shmem_lock_role()` n'est
+pas marqué `lock_from_state` et survit aux rechargements.
 
 **Démarrage (fenêtre fail-closed).** Au démarrage (`shmem_startup`, y
 compris la réinitialisation qui suit un crash d'un processus), le hash est
@@ -804,7 +826,7 @@ Cas particuliers :
 - la base `pg_pass_policy.database` doit exister au démarrage : sinon `BackgroundWorkerInitializeConnection` lève le FATAL standard « database "x" does not exist » et le postmaster relance le worker toutes les 10 s (comportement standard des bgworkers, identique à pg_cron) ; le GUC étant `postmaster`, corriger puis redémarrer ;
 - premier tour d'un primaire après le démarrage, après une promotion ou après le retour de `enabled` à `on` (`ppp_sync_first`) : synchronisation shmem (nettoyage + rechargement **forcé**) **avant** `run_maintenance()` et l'étape d'audit, pour que les verrous de `role_state` soient réinjectés sans attendre une passe de maintenance (§6.3, « Démarrage ») ; la demande de rechargement est consommée, `run_maintenance()` en fait une nouvelle, servie par la synchronisation de fin de tour. En cas d'échec (erreur, verrous de `role_state` qui ne tiennent pas tous dans le hash), le tour suivant recommence par là, au plus 5 s plus tard tant que la fenêtre de démarrage est fermée ; ces relances ne refont que la synchronisation, le tour complet restant au rythme de `worker_interval` (§6.3) ; une extension absente efface la demande (rien à recharger, §6.3) ;
 - chaque tour : `StartTransactionCommand` → si l'extension n'est pas installée (`get_extension_oid("pg_pass_policy", true) == InvalidOid`) → attendre ; sinon `SPI_execute("SELECT * FROM pass_policy.run_maintenance()")`, puis synchronisation shmem (§6.3) ; `CommitTransactionCommand`. `run_maintenance()` prend `pg_advisory_xact_lock(hashtext('pg_pass_policy.run_maintenance'))` en tête : une passe du worker, de pg_cron ou manuelle attend la fin d'une passe concurrente au lieu d'agir sur les mêmes lignes (audits et NOTIFY en double) ;
-- l'étape d'audit regroupe les noms inexistants (`role_missing`) en une ligne `auth_failed` par tour (§6.3) : un flot de noms inventés ne produit plus une ligne et un NOTIFY par nom ;
+- l'étape d'audit regroupe les pseudo-entrées (noms inexistants) en une ligne `auth_failed` par tour (§6.3) : un flot de noms inventés ne produit plus une ligne et un NOTIFY par nom ;
 - sur un hot standby (`RecoveryInProgress()`), tour en **lecture seule** (`ppp_worker_cycle_standby`) : ni `run_maintenance()` ni l'étape d'audit en attente (elles écrivent) ; les échecs et verrous comptés localement par le hook **ne sont pas acquittés** : `pending_failures` et `lock_pending_audit` restent posés (les entrées de vrais rôles concernées ne sont alors pas évincables par le hook, c'est voulu, sauf celles dont le verrou a expiré : sur un standby leur audit est aussitôt « périmé » et elles redeviennent évincables, voir « Perte bornée » §6.3 ; un verrou local expiré n'est pas effacé par le worker mais ne bloque plus, voir « verrou expiré » §6.3) et le premier tour après promotion les écrit dans `audit_log` et `role_state`. Puis nettoyage + rechargement **forcé à chaque tour** (`shmem_reload()` du primaire ne peut pas atteindre le worker du standby) : SELECT uniquement, dans une transaction que PostgreSQL force en lecture seule pendant la récupération. Intervalle : `worker_interval`, 60 s s'il vaut 0 (le standby doit sonder, rien ne le réveille) ; tant que la fenêtre de démarrage est fermée (premier rechargement en échec), au plus 5 s. Un verrou réinjecté depuis `role_state` (`lock_from_state`) qui n'y figure plus est levé (unlock ou expiration sur le primaire) ; les verrous posés localement (hook, ou `shmem_lock_role()` sur le standby) ne sont pas levés par le rechargement : ils expirent selon `lock_duration`, ou un superutilisateur appelle `pass_policy.shmem_unlock_role()` sur le standby (fonctionne en lecture seule). Après promotion, le tour suivant est un tour normal avec audit des échecs et verrous en attente et rechargement complet ;
 - `pg_pass_policy.enabled = off` (`ppp_worker_suspended()`) : le tour entier est sauté, sur le primaire comme sur un standby (ni `run_maintenance()`, ni écriture d'audit ou de `role_state`, ni nettoyage ni rechargement de la shmem ; `worker_status().last_run` et `last_reload` n'avancent plus). Les échecs et verrous en attente restent en shmem (entrées `PENDING_AUDIT` / `KEEP`, éviction selon §6.3) ; une demande `shmem_reload()` est mémorisée. Le premier tour après le retour à `on` fait tout, avec un rechargement forcé (profils ou `role_state` ont pu changer, restauration par exemple). Un LOG à chaque transition (« worker suspended » / « worker resumed ») ;
 - sans `hot_standby`, aucune connexion n'est acceptée pendant la récupération : le worker démarre à la fin de celle-ci ;
@@ -1004,6 +1026,7 @@ basic ou en-tête reverse-proxy (`REMOTE_USER`), rôle PG dédié membre de
 - (vérification 12) Revue de `c4c09b9..1c96b67`, sept constats. (1) Le rechargement joignait `role_state` à `pg_roles` par OID seulement : après une restauration, avant que `run_maintenance()` ne remappe les OID (étape a0), un verrou persisté était perdu et la fenêtre de démarrage se fermait quand même. Décision : réinjection par OID si le rôle existe, sinon par nom si un rôle de ce nom existe (comportement d'avant la vérification 11), ligne ignorée seulement si ni l'OID ni le nom n'existent ; `lock_role_oid` reçoit l'OID du rôle trouvé. (2) `ppp_role_gone()` traitait un rôle renommé comme supprimé et libérait son verrou (sur un standby, un verrou local posé par `shmem_lock_role()` disparaissait ainsi). « Supprimé » signifie désormais que l'OID n'existe plus ; le verrou audité et acquitté d'un rôle renommé est déplacé sous le nouveau nom (`HASH_REMOVE` puis `ppp_enter_role()` sous le verrou exclusif, mêmes contrôles de `generation`, d'`update_seq` et de `lock_role_oid`, fusion en gardant le verrou le plus long si une entrée existe sous le nouveau nom, verrou laissé sous l'ancien nom si cette entrée a quelque chose en attente), LOG « lock of role "…" follows its rename to "…" ». (3) `shmem_lock_role()` sur un nom sans rôle posait un verrou d'OID inconnu, jamais libéré : ERROR `42704` « role "…" does not exist » (`get_role_oid(…, false)`) au moment de l'appel ; `lock_role()` vérifie déjà le rôle. (4) Le hook remettait `role_missing` à faux sur un succès refusé « locked » : le pseudo-verrou d'un nom inventé devenait le verrou permanent d'un rôle créé ensuite sous ce nom ; `role_missing` n'est plus touché quand la connexion est refusée pour verrou, succès comme échec. (5) `ppp_flush_rescue_log()` est appelée aussi après `ppp_sync_reload()` : la fermeture de la fenêtre dans le même tour vide les compteurs. (6) Coût d'une recherche `AUTHOID` par verrou et par tour : accepté (§12). (7) L'assertion de `hashfull.sh` sur le rechargement ne prouvait rien (la maintenance avait déjà purgé la ligne) : commentaire corrigé, et nouveau scénario sans maintenance (`worker_interval = 0`, redémarrage). Tests : `60_lock_unlock` (`shmem_lock_role()` d'un nom inexistant → `42704`, aucune entrée), `hashfull.sh` (pseudo-verrou d'un nom inventé, `CREATE ROLE` de ce nom, connexion refusée puis entrée évincée par des noms inventés ; lignes `role_state` écrites à la main, orphelin réel ignoré et fenêtre fermée, OID périmé portant le nom d'un rôle existant réinjecté par le nom, puis renommage : LOG « follows its rename »), `standby.sh` (verrou local d'un rôle renommé sur le primaire : il suit le nouveau nom, le rôle recréé sous l'ancien nom se connecte), `lockout.sh` (verrou automatique audité sous l'ancien nom après un renommage : il suit désormais le nouveau nom, LOG compris, au lieu de « le nouveau nom repart de zéro ») ; avec le code de `1c96b67`, les assertions de (1), (2), (3) et (4) échouent.
 - (vérification 13) Revue de `1c96b67..7ab9ae9` ; **remplace la décision (2) de la vérification 12**. Le déplacement du verrou au renommage introduisait cinq défauts : la fusion forçait `role_missing` à faux, si bien que le pseudo-verrou sans OID d'un nom inventé passait au rôle réel créé sous ce nom et n'était jamais libéré ; la fusion « verrou le plus long » gardait l'OID d'un rôle supprimé et faisait perdre le verrou déplacé ; l'entrée créée recevait les paramètres du profil par défaut ; `ppp_enter_role()` pouvait renvoyer NULL après le retrait ; le verrou automatique déplacé n'était pas dans `role_state` et se perdait au redémarrage. Décisions : (A) le déplacement est supprimé (code de fusion, LOG « follows its rename »). (B) Contrôle structurel dans le hook (étape 5 de §6.3) : un verrou ne s'applique à la connexion que si `lock_role_oid` est égal à l'OID du rôle qui se connecte, ou si `lock_role_oid` est invalide et que le nom n'a pas de rôle (pseudo-verrou) ; la recherche `ppp_role_lookup()` est désormais faite à chaque connexion (elle ne l'était qu'à un échec compté ou pendant la fenêtre de démarrage) et, sautée, le verrou s'applique. Le verrou d'un autre rôle ne s'applique pas : entrée sans rien en attente (`ppp_entry_settled()`, déplacée dans `pg_pass_policy.h`) → remise à zéro pour le nouveau rôle sous le verrou exclusif (`ppp_restart_entry()`, paramètres du profil gardés) et chemin normal (échec compté, succès) ; entrée avec un audit en attente de l'autre rôle → laissée telle quelle et connexion admise sans rien compter. Ce dernier choix est le plus simple et sûr : l'audit en attente appartient à l'autre rôle et ne doit être ni perdu ni mêlé aux échecs du nouveau, et la fenêtre se referme au tour suivant du worker, qui audite l'entrée (puis la retire, ou la connexion suivante la remet à zéro) (sur un standby, elle dure jusqu'à la promotion ou à l'éviction de l'entrée : limite §12). (C) Nettoyage : une entrée verrouillée, verrou audité et acquitté, dont `lock_role_oid` existe sous un autre nom est retirée du hash avec un LOG « lock of role "…" renamed to "…": reloaded from role_state », et `ppp_reload_pending` est levé : le rechargement du même tour réinjecte par OID, sous le nouveau nom, le verrou persisté. Vérifié : le verrou automatique audité est bien persisté dans `role_state` (upsert de `ppp_sync_pending()`, `locked_by = 'auto'`, par OID) sauf si le rôle a disparu ou a été renommé avant son audit ; ce dernier cas et le verrou local d'un standby (`shmem_lock_role()`) ne suivent pas le renommage : limite documentée (§12, README) plutôt qu'un nouveau mécanisme. OID disparu : inchangé (retrait, LOG « dropped »). (D) Rechargement : le repli par nom ne s'applique que si `role_state` n'a aucune ligne pour l'OID actuel du rôle trouvé par nom (`NOT EXISTS`) : une ligne périmée ne l'emporte plus sur la ligne réelle. (E) `ppp_apply_lock_ops()` : `get_role_oid(…, false)` au PRE_COMMIT, ERROR `42704` si le nom n'a plus de rôle (renommé ou supprimé dans la même transaction). (F) `standby.sh` : le `sleep 3` du scénario de renommage est remplacé par une attente bornée par sondage du LOG (`wait_until`). Tests : `60_lock_unlock` (`shmem_lock_role()` puis `ALTER ROLE … RENAME` dans la même transaction → `42704` au COMMIT, aucune entrée), `hashfull.sh` (pseudo-verrou d'un nom inventé puis `CREATE ROLE` : connexion réussie ; ligne périmée d'un rôle qui a sa propre ligne non verrouillée : pas de repli par le nom ; rôle réinjecté par le nom puis renommé : LOG « renamed to », rien à réinjecter), `lockout.sh` (verrou automatique audité et persisté, renommage puis recréation de l'ancien nom : LOG, le nouveau nom reste verrouillé après le tour du worker, l'ancien nom recréé se connecte ; verrou non persisté d'un rôle renommé avant l'audit : le nouveau nom repart de zéro ; `DROP ROLE` + `CREATE ROLE` du même nom, verrou en mémoire partagée seulement : le nouveau rôle se connecte avant le tour du worker ; verrou réglé d'un autre OID rencontré par le hook avant le worker : entrée remise à zéro, échec compté ; l'attente de 6 s de l'expiration est supprimée, l'entrée étant retirée une fois le verrou audité), `standby.sh` (verrou local d'un rôle renommé : LOG, le rôle renommé repart de zéro, le rôle recréé n'hérite de rien). Avec le code de `7ab9ae9`, échouent : le pseudo-verrou (connexion refusée), le repli par nom (rôle verrouillé à tort), la connexion du rôle recréé avant le tour du worker, le COMMIT de `60_lock_unlock` (accepté) et les LOG « renamed to » ; le scénario du verrou persisté renommé ne diffère que par le LOG (le rechargement par OID suffisait déjà au nouveau nom).
 - (vérification 14) Revue de `7ab9ae9..63a6575` : le contrôle par OID de la vérification 13 rendait le hook **permissif** dans plusieurs cas. Principe non négociable retenu : dans le doute, le verrou s'applique (fail-closed). (1) Verrou d'un autre rôle avec audit en attente : la connexion passait sans rien compter, d'où une force brute illimitée pendant la fenêtre (jusqu'à la promotion sur un standby) ; elle est désormais **refusée comme verrouillée**, quel que soit le statut, jusqu'à l'audit (limite §12 : disponibilité sacrifiée à la sûreté). (2) Un verrou à `lock_role_oid` invalide cédait dès que le nom avait un rôle ; il ne cède plus que s'il s'agit d'un pseudo-verrou certain (nouveau drapeau `lock_on_missing`, posé par le hook quand la recherche a été faite et que le nom n'avait pas de rôle ; effacé par `shmem_lock_role()` et la réinjection) et que le rôle existe maintenant ; tout autre verrou d'OID inconnu s'applique, comme un verrou quand la recherche est sautée ou échoue (`ppp_lock_is_foreign()`). (3) `ppp_restart_entry()` gardait les paramètres du profil de l'ancien rôle et ne demandait aucun rechargement : elle appelle maintenant `ppp_init_entry()` (valeurs par défaut) et lève `reload_requested` (le worker est réveillé après le relâchement du verrou, `ppp_signal_worker_reload()`) : le rechargement fixe le profil du nouveau rôle et réinjecte sous son nouveau nom le verrou persisté d'un rôle renommé. (4) Les compteurs d'un rôle supprimé étaient hérités par le rôle recréé sous le même nom (quatre échecs audités + un échec du nouveau rôle = verrou) : nouveau champ `owner_oid`, posé à chaque échec compté ; à un échec à compter ou à un succès, une entrée dont `owner_oid` est valide et différent de l'OID du rôle est remise à zéro (même chemin que (3)) si elle est réglée, sinon la connexion est refusée comme verrouillée (« temporarily locked »), bon mot de passe compris, jusqu'au tour du worker. (5) Renommage : le nettoyage retirait l'entrée de l'ancien nom même quand `role_state` n'avait pas le verrou, qui était alors perdu ; il ne la retire plus que si `role_state` a, pour l'OID, une ligne dont `locked_until` couvre le verrou (`ppp_lock_persisted()`, requête SPI sous un instantané récent) et que l'instance n'est pas un standby ; sinon l'entrée reste sous l'ancien nom, sans LOG (limite §12 : le verrou local d'un standby ne suit pas le renommage). (6) Repli par nom du rechargement conservé (sûreté après restauration) ; le cas `DROP ROLE` puis `CREATE ROLE` du même nom avant la maintenance, qui peut verrouiller le nouveau rôle, est documenté comme fail-closed (§12). (7) L'ERROR `42704` au PRE_COMMIT de la vérification 13 est retirée : `shmem_lock_role()` capture l'OID à l'appel (le rôle existe alors, sinon `42704` comme avant), passé à `ppp_defer_op()`, et le PRE_COMMIT l'utilise même si le rôle a été renommé ou supprimé dans la transaction ; le nettoyage du worker gère ensuite renommage et suppression. (8) La recherche `ppp_role_lookup()` n'est plus faite à chaque connexion : `HASH_FIND` d'abord sous verrou partagé, recherche seulement pour un échec à compter, pendant la fenêtre de démarrage, ou si l'entrée porte un verrou actif ou, pour que (4) ne soit pas un oracle, quelque chose en attente pour un OID connu (`ppp_lookup_needed()`) ; si l'entrée retrouvée sous le verrou exclusif en a besoin entre-temps, le verrou est relâché pour la recherche et repris. Tests (tous échouent avec `63a6575`, vérifié) : `lockout.sh` (`DROP ROLE` + `CREATE ROLE` avec verrou en attente d'audit → connexion du nouveau rôle refusée ; quatre échecs audités, `DROP ROLE` + `CREATE ROLE`, un échec → compteur à 1 sans verrou, puis connexion réussie ; mêmes échecs non audités → nouveau rôle refusé, accepté après le tour du worker ; verrou permanent non persisté d'un rôle renommé avant l'audit → entrée conservée sous l'ancien nom, aucun LOG de retrait ; scénario `regress_ren` : aucun LOG de retrait), `hashfull.sh` (pseudo-verrou d'un nom inventé, rôle créé avant l'audit → refusé, accepté après le tour du worker ; rôle réinjecté par le nom puis renommé, ligne `role_state` d'un OID périmé → aucun LOG de retrait), `standby.sh` (verrou local d'un rôle renommé : aucun LOG de retrait, verrou conservé sous l'ancien nom après deux tours du worker du standby ; le rôle recréé sous l'ancien nom se connecte), `60_lock_unlock` (`shmem_lock_role()` puis `ALTER ROLE … RENAME` dans la même transaction → COMMIT accepté, verrou sous l'ancien nom). Le cas d'un verrou d'OID inconnu qui n'est pas un pseudo-verrou (recherche sautée) n'est pas atteignable depuis un test : seul le pseudo-verrou en attente d'audit l'est (`hashfull.sh`).
+- (vérification 15) Revue de `63a6575..e590e35` : huit trous restaient, tous dus à la clé par nom du hash (un renommage, un `DROP ROLE` puis `CREATE ROLE` du même nom, un nom essayé avant la création d'un rôle exigeaient chacun un cas particulier : `lock_role_oid`, `lock_on_missing`, `owner_oid`, `role_missing`, `update_seq`, retrait au renommage, repli par nom du rechargement, refus « temporarily locked »). **Clé OID** : l'entrée d'un rôle existant est indexée par son OID, celle d'un nom sans rôle par le nom (pseudo-entrée, `pppRoleKey`, §6.3) ; hash `HASH_ELEM | HASH_FUNCTION` (`ppp_key_hash()`), comparaison `memcmp()` de dynahash (clé mise à zéro par `ppp_make_key()`). Le hook recherche le rôle à chaque connexion, avant le LWLock, et ne fait plus aucun test d'appartenance ; le chemin courant (succès sans état) ne prend qu'un verrou partagé ; hors transaction il refuse (`57P03`, fail-closed). Le code des cas particuliers est **supprimé**, pas adapté : `ppp_restart_entry()`, `ppp_lookup_needed()`, `ppp_lock_is_foreign()`, le refus « temporarily locked », `ppp_recheck_gone_roles()`, `ppp_lock_persisted()`, `ppp_role_gone()`, la requête de recherche et l'ERROR « disappeared » de l'étape d'audit, le LOG « renamed to … reloaded from role_state », le repli par nom du rechargement et la jointure des profils par nom. Le worker retire l'entrée réglée d'un OID disparu (LOG « lock of dropped role … released » s'il portait un verrou) ou la marque `role_dropped` tant qu'elle a un audit en attente (classe `PENDING_AUDIT`, puis `INACTIVE`) ; l'upsert de `role_state` vient avant l'audit, qui découle de son résultat (`role_dropped`, `role_oid` dans `details`). **Origine des lignes** : colonne `cluster_id` (`system_identifier`, `_system_identifier()`) dans `role_state` et `role_profile` ; `_resolve_role_oid()` résout une ligne de cette grappe par son OID seulement, une ligne restaurée par son nom, sinon par son OID (pg_upgrade), sinon pas du tout ; le rechargement (plus long verrou si plusieurs lignes donnent le même rôle) et l'étape a0 (qui ne remappe plus que les lignes restaurées, fusionne avec la ligne de cette grappe en gardant le verrou le plus long, et ne purge pas une ligne restaurée non résolue) l'utilisent ; l'upsert du worker n'écrase pas une ligne restaurée non remappée (verrou gardé en attente, LOG). Les fonctions SQL passent un OID au C (`_shmem_lock()`, `_shmem_unlock()`, `_shmem_reset()`, `_shmem_is_locked()` : un renommage concurrent ne peut plus verrouiller un rôle dans `role_state` et un autre en shmem) ; l'API texte (`shmem_*_role`) reste pour l'usage direct d'un superutilisateur. `failed_attempts()` gagne la colonne `role_oid` (NULL pour une pseudo-entrée) et regroupe pour les non-superutilisateurs toutes les pseudo-entrées, d'après la clé ; `v_role_status` la joint par OID (la jointure par nom était fausse après un renommage). Vérifications dans les sources : `hash_create()` choisit `memcmp` dès que la fonction de hachage n'est pas `string_hash` (`dynahash.c` 16.4 et 17beta1, logique introduite en 14 avec `HASH_STRINGS`) ; `GetSystemIdentifier()` est déclarée dans `access/xlog.h` en 13.2, 16.4 et 17beta1 ; `PerformAuthentication()` est appelée après `StartTransactionCommand()` et `GetTransactionSnapshot()` dans `InitPostgres()` (13.2, 16.4, 17beta1) ; pg_upgrade conserve les OID de `pg_authid` (`pg_dumpall --binary-upgrade` émet `binary_upgrade_set_next_pg_authid_oid()`, 13.2 et 16.4) et la nouvelle grappe vient d'un `initdb` (autre `system_identifier`). Sources 14, 15 et 18 non disponibles : l'API est supposée stable entre 13.2 et 17beta1, et le binaire 18.6 exporte `GetSystemIdentifier`, `hash_bytes`, `hash_bytes_uint32`, `IsTransactionState`, `ClientAuthentication_hook` et `binary_upgrade_next_pg_authid_oid` ; la matrice Docker 14 à 18 reste le contrôle de compilation et de comportement. Tests : `lockout.sh` (trous 1, 2, 5 et 6, scénarios de renommage et de recréation adaptés), `hashfull.sh` (trou 3 et lignes restaurées au rechargement), `standby.sh` (trou 4, renommage d'un verrou local), `60_lock_unlock`, `70_maintenance` (a0 sur des lignes restaurées, ligne de cette grappe à OID disparu purgée), `90_privileges`. Les scénarios des trous 1 à 6 échouent tous avec `e590e35` (script de contrôle hors dépôt, sans `role_oid` ni `cluster_id`).
 
 ## 12. Constats de revue acceptés
 
@@ -1028,63 +1051,6 @@ Points relevés en revue et volontairement non corrigés :
   vérificateurs SCRAM de sels différents ne se comparent pas, et les défauts
   (`enforce_database = on`, `enabled = on`) limitent le cas aux rôles
   exemptés.
-- **Renommage d'un rôle et verrou automatique** (vérification, constat 5) :
-  la shmem tient compteurs et verrous automatiques par nom, `role_state` par
-  OID. Après `ALTER ROLE … RENAME`, le nouveau nom repart de zéro (compteur
-  vide). Un verrou automatique déjà recopié dans `role_state` suit le rôle
-  au rechargement suivant (lu par OID) ; un verrou encore en attente
-  d'audit reste attaché à l'ancien nom, qui ne se connecte plus : il est
-  audité avec `role_missing` (et `role_renamed` / `renamed_to` si le nouveau
-  nom est connu) sans être recopié dans `role_state` ; une fois audité et
-  acquitté, l'entrée de l'ancien nom est conservée (vérification 14 : le
-  worker ne la retire que si `role_state` a, pour l'OID, une ligne qui
-  couvre le verrou, et jamais sur un standby) : le verrou n'est pas perdu,
-  mais il ne s'applique pas au rôle sous son nouveau nom. De même, le
-  verrou local posé sur un standby par `shmem_lock_role()` (absent de
-  `role_state`) reste sous l'ancien nom et ne suit pas un renommage rejoué
-  depuis le primaire (le renommage exige `CREATEROLE` sur le primaire, où
-  `lock_role()` est disponible). Si un autre rôle prend ensuite l'ancien
-  nom et se connecte, l'entrée réglée est remise à zéro pour lui (étape 5) :
-  ce verrou non persisté disparaît alors. Entre le renommage et le tour
-  suivant du worker, le nouveau nom n'a pas d'entrée : même un verrou
-  persisté ne s'applique à lui qu'après le rechargement de ce tour.
-  L'administrateur qui renomme un compte à bloquer durablement dispose de
-  `lock_role()` (persisté, réinjecté par OID). Un **autre rôle créé sous
-  l'ancien nom** (`DROP ROLE` puis `CREATE ROLE`, avant ou après le passage
-  du worker) ne reçoit ni le verrou ni les compteurs de l'ancien : le hook
-  n'applique un verrou qu'à l'OID qu'il désigne (vérification 13) et
-  remet à zéro, avant de compter, l'entrée réglée dont les compteurs
-  appartiennent à un autre OID (`owner_oid`, vérification 14) ; le worker
-  compare l'OID, n'écrit rien dans `role_state` pour lui et audite
-  `role_missing` / `role_recreated`. Une fois le verrou audité, le worker
-  retire l'entrée du hash (OID disparu, vérification 11, ou porté par un
-  autre nom avec un verrou persisté, vérifications 13 et 14), et le
-  rechargement ignore la ligne `role_state` d'un OID disparu dont le nom
-  n'existe plus : le nouveau rôle part d'une entrée propre.
-- **Nouveau rôle bloqué tant que l'audit de l'ancien est en attente**
-  (vérification 14) : tant que l'entrée garde un audit en attente d'un autre
-  rôle (verrou automatique, échecs non écrits), la connexion du rôle qui
-  porte maintenant le nom est refusée comme verrouillée, bon mot de passe
-  compris (étapes 5 et 5 bis de §6.3) : un tour du worker sur un primaire,
-  jusqu'à la promotion (ou l'éviction de l'entrée) sur un standby. La
-  disponibilité est sacrifiée à la sûreté : admettre la connexion sans rien
-  compter (vérification 13) ouvrait une force brute illimitée pendant cette
-  fenêtre. De même, un verrou dont l'OID est inconnu s'applique à quiconque
-  porte le nom, sauf pseudo-verrou certain d'un nom qui n'avait pas de rôle
-  (`lock_on_missing`), et un verrou s'applique quand la recherche du rôle a
-  été sautée.
-  Limite restante : `run_maintenance()` rattache par nom au nouvel OID les
-  lignes d'un OID disparu (cas d'une restauration, commentaire de l'étape
-  a0) et le rechargement fait de même tant que la maintenance n'est pas
-  passée (repli par nom, réservé à un rôle sans ligne `role_state` pour
-  son propre OID, vérification 13) ; un `DROP ROLE` puis `CREATE ROLE` du
-  même nom avant le passage de la maintenance est indiscernable d'une
-  restauration et fait donc hériter le nouveau rôle d'un verrou déjà
-  persisté, par l'étape a0 comme par le repli par nom. Le repli est
-  conservé (vérification 14) : il garantit la sûreté après une
-  restauration ; l'effet est fail-closed (un rôle verrouillé à tort, jamais
-  un verrou perdu) et il exige une action privilégiée (`CREATEROLE`) ;
-  `unlock_role()` lève le verrou hérité.
 - **Perte bornée d'audit sur standby / éviction** : une entrée dont le
   verrou a expiré et dont l'audit est en attente peut être évincée (tout de
   suite sur un standby, après 24 h sur un primaire) avec un LOG (§6.3,
@@ -1144,15 +1110,12 @@ Points relevés en revue et volontairement non corrigés :
   après un FATAL laisse aussi `worker_pid = 0` pendant `bgw_restart_time`
   (10 s) : si la fenêtre est encore fermée à ce moment, l'exception
   s'applique pendant ce délai.
-- **`failed_attempts()` garde sa propre recherche syscache** (vérification
-  9) : la fonction décide de l'existence de chaque nom par
-  `SearchSysCacheExists1(AUTHNAME)` au moment de l'appel (appelant non
-  superutilisateur), au lieu du drapeau `role_missing` que le worker tient
-  à jour. Voulu : la vue doit être exacte au moment de la lecture, le
-  drapeau n'est qu'un cache pour les classes d'éviction (passé à vrai par
-  le worker seulement pour les entrées sans rien en attente ni verrou
-  actif, à faux par le hook seulement). Coût accepté : une recherche syscache par entrée et par
-  appel, hors LWLock.
+- **`failed_attempts()` cherche le nom courant de chaque rôle** (vérification
+  9, reformulée en vérification 15) : une recherche `AUTHOID` par entrée
+  réelle et par appel, sur la copie, hors LWLock, pour afficher le nom
+  courant ; une fois l'OID disparu, le dernier nom connu de l'entrée. Le
+  regroupement des pseudo-entrées pour un non-superutilisateur dépend de la
+  clé seule, sans recherche.
 - **`_audit()` lève une erreur sans bibliothèque préchargée** : `_audit()`
   appelle la fonction C `_worker_pid()`, dont le chargement échoue quand la
   bibliothèque n'est pas dans `shared_preload_libraries` (`_PG_init()` le
@@ -1160,20 +1123,14 @@ Points relevés en revue et volontairement non corrigés :
   cohérent avec le choix fail-closed de §11 E6 : sans préchargement, ni le
   hook ni le verrouillage ne fonctionnent, et journaliser comme si de rien
   n'était masquerait la panne.
-- **Recherche `AUTHOID` par verrou et par tour** (vérification 12) : chaque
-  tour du nettoyage cherche dans le syscache l'OID de chaque entrée
-  verrouillée dont le verrou est audité (permanents compris) pour détecter
-  une suppression ou un renommage. Coût accepté : le nombre de verrous
-  actifs est faible, la recherche est faite hors LWLock et le syscache la
-  sert en mémoire. De même, le hook fait sa recherche `AUTHNAME` à un
-  échec compté, pendant la fenêtre de démarrage, et pour une entrée qui
-  porte un verrou actif ou quelque chose en attente pour un OID connu
-  (vérification 14 : l'OID dit à qui appartient un verrou ou un compteur ;
-  la vérification 13 la faisait à chaque connexion) : une recherche que
-  PostgreSQL vient de faire pour l'authentification, servie par le
-  syscache. Le nettoyage fait en outre une requête SPI sur `role_state` par
-  entrée verrouillée d'un rôle renommé, à chaque tour tant que l'entrée
-  reste sous l'ancien nom (vérification 14) : cas rare, coût accepté.
+- **Recherches syscache du hook et du worker** (vérification 12, reformulée
+  en vérification 15) : chaque tour du nettoyage cherche dans le syscache
+  (`AUTHOID`, hors LWLock) l'OID de chaque entrée réelle qui n'est pas
+  inactive, pour détecter une suppression ; le hook fait une recherche
+  `AUTHNAME` à chaque connexion non exemptée, celle que PostgreSQL vient de
+  faire pour les méthodes à mot de passe, servie par le syscache. Coût
+  accepté : le nombre d'entrées non inactives est borné par
+  `max_tracked_roles`, et ces recherches se font en mémoire.
 - **Refus `57P03` sans indication au client** (vérification 10) : le HINT
   ajouté en vérification 9, (8), qui rappelait la voie de secours
   (`rescue_roles` en `peer`), est retiré. La confidentialité vis-à-vis du
@@ -1181,14 +1138,34 @@ Points relevés en revue et volontairement non corrigés :
   générique, et l'administrateur trouve l'information complète
   (`exempt_roles`, `rescue_roles` en `peer`, superutilisateurs une fois le
   worker absent) dans le HINT du LOG serveur et dans la documentation.
-- **Tentatives antérieures à la création d'un rôle** (vérification 10) :
-  le worker ne fait que la transition `role_missing` faux → vrai, jamais
-  vrai → faux. Voulu : les tentatives faites sous un nom avant la création
-  du rôle restent des tentatives fantômes (évincables, purgées selon la
-  règle des noms inexistants) ; la première tentative du rôle réel
-  (succès, ou échec dont la recherche trouve le rôle) remet le drapeau à
-  faux. Un fantôme dont le nom est repris ne transmet pas ainsi son
-  pseudo-verrou par le worker.
+- **Tentatives antérieures à la création d'un rôle** (vérification 10,
+  renforcée en vérification 15) : les tentatives faites sous un nom avant la
+  création du rôle restent sur la pseudo-entrée du nom (évincable, purgée
+  selon la règle des noms inexistants), qui ne s'applique jamais au rôle
+  créé : celui-ci a sa propre entrée (clé OID). Le passage de « locked » à
+  « authentication failed » pour ce nom révèle la création du rôle à qui
+  l'avait pseudo-verrouillé, ce qui existait déjà après l'audit.
+- **Réutilisation d'un OID après bouclage** (vérification 15) : l'entrée
+  d'un rôle supprimé est retirée (ou marquée `role_dropped`) au tour
+  suivant du worker ; si 2³² OID étaient alloués entre la suppression et ce
+  tour (ou la maintenance qui purge `role_state`), un nouveau rôle du même
+  OID hériterait de l'entrée ou de la ligne : héritage fail-closed,
+  hautement improbable.
+- **Restaurations** (vérification 15) : entre grappes clonées (même
+  `system_identifier` : `pg_basebackup`, copie de fichiers), les lignes
+  restaurées passent pour des lignes de la grappe et ne sont pas remappées
+  par l'étape a0 : appeler `rebind_restored_roles()` (README). Un rôle
+  renommé avant la première maintenance qui suit une restauration perd le
+  verrou d'une ligne restaurée encore non résolue (elle ne se résout plus ni
+  par le nom ni par l'OID), comme avant pour l'étape a0. Une ligne restaurée
+  non résolue s'appliquera à un rôle créé plus tard sous ce nom : c'est la
+  sémantique voulue d'une restauration ; `rebind_restored_roles()` purge ces
+  lignes.
+- **Hook hors transaction** (vérification 15) : si le hook d'authentification
+  s'exécutait un jour hors transaction (non atteignable de 14 à 17 d'après
+  les sources, supposé pour 18), il refuserait toute connexion non exemptée
+  par le `57P03` générique (LOG explicite) plutôt que de laisser passer un
+  rôle dont il ne connaît pas l'OID.
 - **`check_password()` d'un superutilisateur et `min_age`** (vérification
   10) : appelée par un superutilisateur, la fonction ignore `min_age`
   (comme son `ALTER ROLE … PASSWORD`), alors que le rôle cible, en
@@ -1204,7 +1181,6 @@ Revue de clôture : constats restants, volontairement non traités.
 - **`verifier_pending` avec `enforce_database = off`** : maintenu, voir plus haut.
 - **Perte bornée d'audit sur standby** : maintenue, voir plus haut.
 - **Superutilisateurs pendant la fenêtre de démarrage** : ils ne passent que si le worker est absent, voir plus haut.
-- **Renommage a → b → a et recréation sous le même nom** (vérification 4) : limites déjà listées, maintenues ; voir « Renommage d'un rôle et verrou automatique » plus haut (verrou en attente d'audit attaché au nom jusqu'à son audit ; depuis la vérification 11, l'entrée d'un rôle supprimé ou renommé est ensuite retirée du hash) et §11, vérification 2, constat 4 (renommage aller-retour entre la copie et l'acquittement : la ligne `role_locked` déjà écrite garde `role_missing` ; état actuel du traitement dans le commentaire de `ppp_ack_pending()`, `worker.c`). La génération d'entrée ajoutée en vérification 4 (constat 2) ne change rien à ces limites : elle distingue une entrée évincée puis recréée, pas un rôle renommé ou recréé.
 - **Double formatage des logs web** : le filtre de masquage du web (`web/app/logfilter.py`) formate lui-même un enregistrement susceptible de contenir un secret, que son handler formate une seconde fois ; surcoût limité à ces enregistrements, accepté en échange du masquage avant tout handler (relève de `web/`).
 - **Vérification bcrypt à chaque requête web (authentification basic)** : chaque requête refait `bcrypt.checkpw()` (`web/app/auth.py`), sans cache de session ; coût CPU accepté pour une interface d'administration à faible trafic, et le travail constant (hachage factice pour un nom inconnu) n'expose pas l'existence d'un compte (relève de `web/`).
 - **Éviction anonymisée des avertissements web limités** (vérification 14) : les avertissements limités du web (`_ThrottledWarning`, `web/app/auth.py`) ne suivent que les 256 dernières clés vues (pair normalisé, ou nom refusé dans l'en-tête du proxy) ; au-delà, la clé la plus anciennement vue est oubliée et son compte en attente passe au compteur global « (all sources) », sans plus être attribué à cette clé. Accepté : l'état reste borné face à un balayage depuis de nombreuses adresses, et le comportement est documenté dans `web/README.md` (relève de `web/`).

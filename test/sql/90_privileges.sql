@@ -53,6 +53,10 @@ SELECT ppp_test.try($$SELECT pass_policy.purge_audit()$$) AS purge_audit;
 SELECT ppp_test.try($$SELECT pass_policy.audit('maintenance', 'regress_user')$$) AS forge_audit;
 SELECT ppp_test.try($$SELECT pass_policy.shmem_unlock_role('regress_target')$$) AS shmem_unlock;
 SELECT ppp_test.try($$SELECT pass_policy.shmem_lock_role('regress_target', NULL)$$) AS shmem_lock;
+SELECT ppp_test.try($$SELECT pass_policy._shmem_lock('regress_target'::regrole::oid, NULL)$$) AS shmem_lock_oid;
+SELECT ppp_test.try($$SELECT pass_policy._shmem_unlock('regress_target'::regrole::oid, false)$$) AS shmem_unlock_oid;
+SELECT ppp_test.try($$SELECT pass_policy._shmem_reset('regress_target'::regrole::oid)$$) AS shmem_reset_oid;
+SELECT ppp_test.try($$SELECT pass_policy._shmem_is_locked('regress_target'::regrole::oid)$$) AS shmem_is_locked;
 SELECT ppp_test.try($$SELECT * FROM pass_policy.switch_rotation_pair('app')$$) AS switch_pair;
 -- record_password_change : refusé pour un autre rôle ET pour soi-même : un appel
 -- direct permettrait de falsifier l'historique ou de repousser l'expiration sans

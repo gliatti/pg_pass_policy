@@ -6,13 +6,17 @@
  * The ClientAuthentication_hook runs during InitPostgres(), after the
  * catalog caches have been initialised and a transaction has been started
  * (PerformAuthentication() is called once StartTransactionCommand() and
- * GetTransactionSnapshot() have run, PG 13 to 17 at least): syscache lookups
- * work there, as get_role_password() itself does SearchSysCache1(AUTHNAME).
- * The hook only uses one (AUTHNAME), to know whether the user name is an
- * existing role, whether its rolvaliduntil has passed and, during the
- * start-up window, whether it is a superuser; no SPI.  Everything else
- * lives in shared memory (ppp_role_hash), which is filled by the background worker (profile parameters, persisted locks) and
- * read back by the worker to write audit rows and role_state (worker.c).
+ * GetTransactionSnapshot() have run: checked in the sources of 13.2, 16.4
+ * and 17beta1): syscache lookups work there, as get_role_password() itself
+ * does SearchSysCache1(AUTHNAME).  The hook makes one lookup (AUTHNAME) at
+ * every connection it handles, before taking any LWLock: the OID of the
+ * role is the key of its entry (pppRoleKey), and the lookup also tells
+ * whether its rolvaliduntil has passed and whether it is a superuser; no
+ * SPI.  Should the hook ever run outside a transaction, it refuses the
+ * connection (57P03, fail-closed).  Everything else lives in shared memory
+ * (ppp_role_hash), which is filled by the background worker (profile
+ * parameters, persisted locks) and read back by the worker to write audit
+ * rows and role_state (worker.c).
  *
  * This file also provides the C functions exposed in SQL:
  *	 failed_attempts(), shmem_reload(), shmem_lock_role(),
@@ -39,6 +43,7 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "catalog/pg_authid.h"
+#include "common/hashfn.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "libpq/auth.h"
@@ -62,6 +67,10 @@ PG_FUNCTION_INFO_V1(ppp_shmem_lock_role);
 PG_FUNCTION_INFO_V1(ppp_shmem_unlock_role);
 PG_FUNCTION_INFO_V1(ppp_shmem_reset_failures);
 PG_FUNCTION_INFO_V1(ppp_shmem_is_locked);
+PG_FUNCTION_INFO_V1(ppp_shmem_lock_oid);
+PG_FUNCTION_INFO_V1(ppp_shmem_unlock_oid);
+PG_FUNCTION_INFO_V1(ppp_shmem_reset_oid);
+PG_FUNCTION_INFO_V1(ppp_system_identifier);
 
 static ClientAuthentication_hook_type prev_client_auth_hook = NULL;
 
@@ -69,15 +78,42 @@ static void ppp_client_auth_hook(Port *port, int status);
 static void ppp_signal_worker_reload(void);
 
 
+/* the key is hashed and compared as a whole: no padding byte */
+StaticAssertDecl(sizeof(pppRoleKey) == sizeof(Oid) + NAMEDATALEN,
+				 "pppRoleKey must not contain padding");
+
 /*
- * Copy a role name into a hash key, truncated like the server does for
- * port->user_name (plain byte truncation to NAMEDATALEN - 1).
+ * Build a hash key (see pppRoleKey): the OID of an existing role, or, when
+ * roleid is InvalidOid, the name, truncated like the server does for
+ * port->user_name (plain byte truncation to NAMEDATALEN - 1).  The key is
+ * zeroed first: dynahash compares it with memcmp().
  */
 void
-ppp_make_key(pppRoleKey *key, const char *rolename)
+ppp_make_key(pppRoleKey *key, Oid roleid, const char *name)
 {
 	memset(key, 0, sizeof(pppRoleKey));
-	strlcpy(key->rolename, rolename, NAMEDATALEN);
+	if (OidIsValid(roleid))
+		key->roleid = roleid;
+	else
+		strlcpy(key->name, name, NAMEDATALEN);
+}
+
+/*
+ * Hash function of ppp_role_hash (HASH_FUNCTION).  A real key hashes its
+ * OID (hash_bytes_uint32, as uint32_hash does); a pseudo-key hashes its
+ * name as string_hash would (hash_bytes over strlen bytes), that is the
+ * value of hashtext(name COLLATE "C"), which test/shell/hashfull.sh uses to
+ * place a name in a chosen bucket.
+ */
+static uint32
+ppp_key_hash(const void *key, Size keysize)
+{
+	const pppRoleKey *k = (const pppRoleKey *) key;
+
+	if (OidIsValid(k->roleid))
+		return hash_bytes_uint32((uint32) k->roleid);
+	return hash_bytes((const unsigned char *) k->name,
+					  (int) strnlen(k->name, NAMEDATALEN - 1));
 }
 
 /*
@@ -85,8 +121,9 @@ ppp_make_key(pppRoleKey *key, const char *rolename)
  * Caller must hold ppp_shared->lock exclusively.
  */
 static void
-ppp_init_entry(pppRoleEntry *entry)
+ppp_init_entry(pppRoleEntry *entry, const char *rolename)
 {
+	strlcpy(entry->rolename, rolename, NAMEDATALEN);
 	entry->max_failures = ppp_shared->default_max_failures;
 	entry->failure_window_secs = ppp_shared->default_failure_window_secs;
 	entry->lock_duration_secs = ppp_shared->default_lock_duration_secs;
@@ -101,37 +138,14 @@ ppp_init_entry(pppRoleEntry *entry)
 	entry->audit_lock_seq = 0;
 	entry->audit_acked_seq = 0;
 	entry->audit_lock_set_at = 0;
-	entry->audit_role_oid = InvalidOid;
-	entry->lock_role_oid = InvalidOid;
-	entry->lock_on_missing = false;
-	entry->owner_oid = InvalidOid;
 	entry->lock_set_at = 0;
 	entry->lock_from_state = false;
 	entry->lock_inflight = 0;
 	entry->lock_seq = 0;
 	entry->generation = ++ppp_shared->entry_generation;
-	entry->role_missing = false;
-	entry->update_seq = 0;
+	entry->role_dropped = false;
 	entry->reload_profile_seen = false;
 	entry->reload_lock_seen = false;
-}
-
-/*
- * Start a settled entry (ppp_entry_settled) afresh for another role that
- * bears its name now: its lock, counters and profile parameters belonged to
- * the previous role.  The entry gets the default parameters (ppp_init_entry,
- * new generation: the worker's copies are stale), and a reload is requested
- * (reload_requested; the caller wakes the worker up once the lock is
- * released, ppp_signal_worker_reload): it sets the profile of the role that
- * bears the name now and, when the previous role was renamed, re-injects
- * its persisted lock under its new name.  Caller must hold ppp_shared->lock
- * exclusively.
- */
-static void
-ppp_restart_entry(pppRoleEntry *entry)
-{
-	ppp_init_entry(entry);
-	pg_atomic_write_u32(&ppp_shared->reload_requested, 1);
 }
 
 /*
@@ -167,9 +181,21 @@ ppp_lock_audit_stale(const pppRoleEntry *entry, TimestampTz now,
 }
 
 /*
- * Class of an entry, role existence aside (see pppEntryClass).  Caller holds
- * ppp_shared->lock.  in_recovery: RecoveryInProgress(), read by the caller
- * before taking the lock.
+ * Class of an entry (see pppEntryClass).  Caller holds ppp_shared->lock.
+ * in_recovery: RecoveryInProgress(), read by the caller before taking the
+ * lock.
+ *
+ * A pseudo-entry (key without OID: a user name that matched no role) is
+ * always PPP_CLASS_GHOST, even when it holds a pseudo-lock or failures not
+ * yet audited: losing them is harmless (the name cannot log in anyway, and
+ * a role created later under that name has its own entry, keyed by its
+ * OID), whereas keeping them would let a client that tries many
+ * non-existent names fill the hash and prevent the failures of real roles
+ * from being counted.
+ *
+ * The entry of a dropped role (role_dropped) keeps only its pending audit:
+ * PPP_CLASS_PENDING_AUDIT while it has one, PPP_CLASS_INACTIVE otherwise;
+ * its lock and profile apply to nobody any more.
  *
  * An expired lock whose audit is stale is classified on its counter only:
  * the failures and the lock it has not audited yet are given up (and
@@ -183,9 +209,13 @@ ppp_lock_audit_stale(const pppRoleEntry *entry, TimestampTz now,
  * counter, so the class must not depend on whether that reset has happened.
  */
 pppEntryClass
-ppp_entry_real_class(const pppRoleEntry *entry, TimestampTz now,
-					 bool in_recovery)
+ppp_entry_class(const pppRoleEntry *entry, TimestampTz now, bool in_recovery)
 {
+	if (!OidIsValid(entry->key.roleid))
+		return PPP_CLASS_GHOST;
+	if (entry->role_dropped)
+		return (entry->lock_pending_audit || entry->pending_failures > 0) ?
+			PPP_CLASS_PENDING_AUDIT : PPP_CLASS_INACTIVE;
 	if (entry->from_profile || ppp_is_locked(entry, now))
 		return PPP_CLASS_KEEP;
 	if (entry->lock_pending_audit)
@@ -202,22 +232,6 @@ ppp_entry_real_class(const pppRoleEntry *entry, TimestampTz now,
 		entry->first_failure_at < entry->locked_until)
 		return PPP_CLASS_INACTIVE;
 	return PPP_CLASS_LIVE_COUNTER;
-}
-
-/*
- * Class of an entry.  The entry of a non-existent role (role_missing, set
- * by the authentication hook) is always PPP_CLASS_GHOST, even when it holds
- * a pseudo-lock or failures not yet audited: losing them is harmless (the
- * name cannot log in anyway), whereas keeping them would let a client that
- * tries many non-existent names fill the hash and prevent the failures of
- * real roles from being counted.
- */
-pppEntryClass
-ppp_entry_class(const pppRoleEntry *entry, TimestampTz now, bool in_recovery)
-{
-	if (entry->role_missing)
-		return PPP_CLASS_GHOST;
-	return ppp_entry_real_class(entry, now, in_recovery);
 }
 
 /*
@@ -297,18 +311,16 @@ ppp_expire_lock(pppRoleEntry *entry, TimestampTz now, bool check_inflight)
  * max_size as long as the shared memory segment has free space left.
  */
 pppRoleEntry *
-ppp_enter_role(const char *rolename, pppEnterMode mode, TimestampTz now,
-			   bool in_recovery, pppEviction *ev)
+ppp_enter_role(const pppRoleKey *key, const char *rolename, pppEnterMode mode,
+			   TimestampTz now, bool in_recovery, pppEviction *ev)
 {
-	pppRoleKey	key;
 	pppRoleEntry *entry;
 	bool		found;
 
 	if (ev)
 		memset(ev, 0, sizeof(pppEviction));
 
-	ppp_make_key(&key, rolename);
-	entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key, HASH_FIND, NULL);
+	entry = (pppRoleEntry *) hash_search(ppp_role_hash, key, HASH_FIND, NULL);
 	if (entry)
 		return entry;
 
@@ -469,7 +481,7 @@ ppp_enter_role(const char *rolename, pppEnterMode mode, TimestampTz now,
 		{
 			ev->evicted = true;
 			ev->ghost = (best_class == PPP_CLASS_GHOST);
-			strlcpy(ev->rolename, victim->key.rolename, NAMEDATALEN);
+			strlcpy(ev->rolename, victim->rolename, NAMEDATALEN);
 			if (best_class >= PPP_CLASS_LIVE_COUNTER)
 				ev->lost_failed_count = victim->failed_count;
 			if (best_class != PPP_CLASS_GHOST)
@@ -495,18 +507,18 @@ ppp_enter_role(const char *rolename, pppEnterMode mode, TimestampTz now,
 		ppp_shared->evict_failed_at = 0;
 	}
 
-	entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key,
+	entry = (pppRoleEntry *) hash_search(ppp_role_hash, key,
 										 HASH_ENTER_NULL, &found);
 	if (entry && !found)
-		ppp_init_entry(entry);
+		ppp_init_entry(entry, rolename);
 	return entry;
 }
 
 /*
  * Report an eviction made by ppp_enter_role().  Must be called without
- * holding ppp_shared->lock.  Evicting the entry of a non-existent role or an
- * inactive entry is routine (DEBUG1); losing a live counter or unaudited
- * failures of an existing role is logged.
+ * holding ppp_shared->lock.  Evicting a pseudo-entry or an inactive entry
+ * is routine (DEBUG1); losing a live counter or unaudited failures of an
+ * existing role is logged.
  */
 void
 ppp_log_eviction(const pppEviction *ev)
@@ -541,9 +553,12 @@ ppp_log_eviction(const pppEviction *ev)
  * has been allocated and its LWLock assigned.  The caller holds
  * AddinShmemInitLock.
  *
- * The key is a NUL-terminated char[NAMEDATALEN]; HASH_STRINGS (available
- * since PG 14) compares at most keysize - 1 bytes with strncmp, so the key
- * does not need to be zero-padded.  We zero it anyway (ppp_make_key).
+ * The key is a pppRoleKey (OID, or name of a pseudo-entry), hashed by
+ * ppp_key_hash (HASH_FUNCTION).  Without HASH_COMPARE, dynahash compares
+ * keys with memcmp() whenever the hash function is not string_hash, and
+ * copies them with memcpy() (hash_create(), dynahash.c, unchanged from PG
+ * 14 to 17beta1): every key is zeroed before it is filled
+ * (ppp_make_key).
  *
  * The hash size must be accounted for in ppp_shmem_size():
  *	 hash_estimate_size(ppp_max_tracked_roles, sizeof(pppRoleEntry)).
@@ -559,12 +574,13 @@ ppp_lockout_shmem_init(void)
 	memset(&info, 0, sizeof(info));
 	info.keysize = sizeof(pppRoleKey);
 	info.entrysize = sizeof(pppRoleEntry);
+	info.hash = ppp_key_hash;
 
 	ppp_role_hash = ShmemInitHash("pg_pass_policy roles",
 								  ppp_max_tracked_roles,
 								  ppp_max_tracked_roles,
 								  &info,
-								  HASH_ELEM | HASH_STRINGS);
+								  HASH_ELEM | HASH_FUNCTION);
 }
 
 /*
@@ -578,35 +594,31 @@ ppp_lockout_init(void)
 }
 
 /*
- * Look a user name up in pg_authid: *missing when no role has that name,
- * *expired when its rolvaliduntil is in the past, *superuser when it has
- * rolsuper, *roleid its OID (InvalidOid when missing or not looked up).
- * The hook runs inside the transaction started by InitPostgres() for
- * authentication, with catalog caches available (see the file header); the
- * lookup is skipped (role assumed to exist, valid and not superuser, the
- * conservative answer; false returned) if that ever stops being true.
+ * Look a user name up in pg_authid: *roleid its OID (InvalidOid when no
+ * role has that name), *expired when its rolvaliduntil is in the past,
+ * *superuser when it has rolsuper.  The hook runs inside the transaction
+ * started by InitPostgres() for authentication, with catalog caches
+ * available (see the file header); false is returned, nothing being looked
+ * up, if that ever stops being true: the caller then refuses the
+ * connection (fail-closed).
  */
 static bool
 ppp_role_lookup(const char *rolename, TimestampTz now,
-				bool *missing, bool *expired, bool *superuser, Oid *roleid)
+				Oid *roleid, bool *expired, bool *superuser)
 {
 	HeapTuple	tup;
 	Datum		datum;
 	bool		isnull;
 
-	*missing = false;
+	*roleid = InvalidOid;
 	*expired = false;
 	*superuser = false;
-	*roleid = InvalidOid;
 	if (!IsTransactionState())
 		return false;
 
 	tup = SearchSysCache1(AUTHNAME, CStringGetDatum(rolename));
 	if (!HeapTupleIsValid(tup))
-	{
-		*missing = true;
 		return true;
-	}
 	datum = SysCacheGetAttr(AUTHNAME, tup, Anum_pg_authid_rolvaliduntil,
 							&isnull);
 	if (!isnull && DatumGetTimestampTz(datum) < now)
@@ -615,42 +627,6 @@ ppp_role_lookup(const char *rolename, TimestampTz now,
 	*roleid = ((Form_pg_authid) GETSTRUCT(tup))->oid;
 	ReleaseSysCache(tup);
 	return true;
-}
-
-/*
- * Does the authentication hook need the catalog lookup to handle this entry
- * when no failure is to be counted and the start-up window is closed?  Yes
- * when it holds an active lock (whose role is it?) or something pending for
- * a known role (owner_oid: are these the failures of the role that
- * connects?).  Caller holds ppp_shared->lock (shared or exclusive).
- */
-static bool
-ppp_lookup_needed(const pppRoleEntry *entry, TimestampTz now)
-{
-	if (entry == NULL)
-		return false;
-	return ppp_is_locked(entry, now) ||
-		(OidIsValid(entry->owner_oid) && !ppp_entry_settled(entry));
-}
-
-/*
- * Is the active lock of an entry certainly the lock of another role than
- * the one that connects (role_missing / role_oid: ppp_role_lookup)?  Only
- * when the lookup was made (looked_up) and either lock_role_oid is valid and
- * differs from role_oid, or the lock is a pseudo-lock set on a name that had
- * no role (lock_on_missing) and a role bears the name now.  Any other case,
- * an unknown lock_role_oid included, is not certain: the lock applies
- * (fail-closed).
- */
-static bool
-ppp_lock_is_foreign(const pppRoleEntry *entry, bool looked_up,
-					bool role_missing, Oid role_oid)
-{
-	if (!looked_up)
-		return false;
-	if (OidIsValid(entry->lock_role_oid))
-		return entry->lock_role_oid != role_oid;
-	return entry->lock_on_missing && !role_missing;
 }
 
 /*
@@ -836,8 +812,49 @@ ppp_flush_rescue_log(void)
 }
 
 /*
+ * FATAL refusal of a locked role (whatever the status, see
+ * ppp_client_auth_hook).  Never returns.
+ */
+static void
+ppp_fatal_locked(const char *rolename, TimestampTz locked_until)
+{
+	if (locked_until == DT_NOEND)
+		ereport(FATAL,
+				(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+				 errmsg("role \"%s\" is locked by pg_pass_policy", rolename),
+				 errdetail("The role is locked until manual unlock.")));
+	ereport(FATAL,
+			(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+			 errmsg("role \"%s\" is locked by pg_pass_policy", rolename),
+			 errdetail("The role is locked until %s.",
+					   timestamptz_to_str(locked_until))));
+}
+
+/*
+ * Generic 57P03 refusal of the start-up window, also used when the role
+ * cannot be looked up (fail-closed).  No hint: the client is not
+ * authenticated and must not learn anything about the configuration, the
+ * emergency paths included (rescue_roles, exempt_roles, superusers when the
+ * worker is missing).  The administrator finds them in the hint of the LOG
+ * of the caller and in the documentation (SPEC 12).  Never returns.
+ */
+static void
+ppp_fatal_not_loaded(void)
+{
+	ereport(FATAL,
+			(errcode(ERRCODE_CANNOT_CONNECT_NOW),
+			 errmsg(PPP_LOG_PREFIX "lock state not loaded yet, retry"),
+			 errdetail("The server has just started; retry in a few seconds.")));
+}
+
+/*
  * ClientAuthentication_hook: see SPEC 6.3.
  *
+ * - the entry of the connection is that of the OID of the role, looked up
+ *   by name in pg_authid before any LWLock is taken (ppp_role_lookup); a
+ *   name that matches no role has a pseudo-entry, keyed by the name.  A
+ *   rename keeps the entry of the role, a role created under the name of a
+ *   dropped one, or of a name tried earlier, gets its own;
  * - a locked role is refused with FATAL whatever the authentication result
  *   and the method, so that a correct password cannot be told apart from a
  *   wrong one while the role is locked;
@@ -846,7 +863,7 @@ ppp_flush_rescue_log(void)
  *   and non-existent user names alike: a non-existent name is "locked"
  *   after max_failures failures too, so that the answer does not reveal
  *   whether the role exists (like the mock SCRAM exchange of PostgreSQL).
- *   Its entry is flagged role_missing, which makes it always evictable;
+ *   Its pseudo-entry is always evictable (PPP_CLASS_GHOST);
  * - STATUS_EOF (client closed the connection when asked for a password, as
  *   psql does before prompting) is NOT counted: no password was tried;
  * - STATUS_ERROR of a password method (ppp_auth_method_checks_valid_until)
@@ -860,16 +877,19 @@ ppp_flush_rescue_log(void)
  *   refused with FATAL 57P03 "lock state not loaded yet", whatever the
  *   authentication method (trust, peer, cert... included: a role locked in
  *   role_state is not known yet) and the status, and failures are not
- *   counted (the answer is "retry" whatever the password).  Superusers are refused that way too,
- *   with two exceptions: the worker is demonstrably missing (no PID
- *   published PPP_WORKER_MISSING_GRACE_SECS after the shared memory
- *   initialisation): they then get the real answer and their failures are
- *   counted, so that an installation whose worker never starts can still be
- *   administered; or they are listed in pg_pass_policy.rescue_roles and
- *   authenticated successfully by peer (ppp_auth_is_peer), the emergency
- *   path when the window stays closed (worker running but unable to load
- *   the locks).  A lock present in shared memory still applies to them
- *   (SPEC 6.3, "Démarrage").
+ *   counted (the answer is "retry" whatever the password).  Superusers are
+ *   refused that way too, with two exceptions: the worker is demonstrably
+ *   missing (no PID published PPP_WORKER_MISSING_GRACE_SECS after the
+ *   shared memory initialisation): they then get the real answer and their
+ *   failures are counted, so that an installation whose worker never starts
+ *   can still be administered; or they are listed in
+ *   pg_pass_policy.rescue_roles and authenticated successfully by peer
+ *   (ppp_auth_is_peer), the emergency path when the window stays closed
+ *   (worker running but unable to load the locks).  A lock present in shared
+ *   memory still applies to them (SPEC 6.3, "Démarrage").
+ *
+ * The usual connection (success of a role without state, no start-up
+ * window) takes the LWLock once, shared.
  */
 static void
 ppp_client_auth_hook(Port *port, int status)
@@ -889,16 +909,11 @@ ppp_client_auth_hook(Port *port, int status)
 	bool		is_superuser = false;
 	bool		just_locked = false;
 	bool		hash_full = false;
-	bool		role_missing = false;
-	Oid			role_oid = InvalidOid;
-	bool		looked_up = false;
-	bool		lookup_done = false;
 	bool		expired = false;
-	bool		refuse_pending = false;
-	bool		restarted = false;
 	bool		count_failure;
 	bool		in_recovery;
 	int			failed_count = 0;
+	Oid			roleid;
 	pppRoleKey	key;
 	pppRoleEntry *entry;
 	pppEviction ev;
@@ -914,7 +929,6 @@ ppp_client_auth_hook(Port *port, int status)
 		return;
 	}
 
-	ppp_make_key(&key, rolename);
 	count_failure = (status == STATUS_ERROR &&
 					 ppp_auth_method_checks_secret(port));
 
@@ -932,47 +946,67 @@ ppp_client_auth_hook(Port *port, int status)
 	check_window = !ppp_shared->locks_loaded;
 
 	/*
-	 * Catalog lookup and recovery state before taking the LWLock.  The
-	 * lookup is only made when its answer is needed: a failure to count
-	 * (existence, expiry, OID of the role that owns the counters), the
-	 * start-up window (superuser), or an entry for which the OID tells
-	 * whose state it holds (ppp_lookup_needed: active lock, or something
-	 * pending for a known role).  The entry is first looked for under a
-	 * shared lock; should it need the lookup once found again under the
-	 * exclusive lock (changed meanwhile), the exclusive lock is released
-	 * for the lookup and taken again (below).
+	 * Catalog lookup, at every connection and before taking the LWLock (no
+	 * catalog access under an LWLock): it gives the key of the entry (the
+	 * OID; a pseudo-key for a name without role), the expiry of the role and
+	 * whether it is a superuser.  The key does not depend on the state of
+	 * the entry, so the lookup is never made again below.  Outside a
+	 * transaction (never seen: see the file header), the role cannot be
+	 * looked up: the connection is refused (fail-closed) rather than let
+	 * through without its lock state.
 	 */
-	if (count_failure || check_window)
-		lookup_done = true;
-	else
+	if (!ppp_role_lookup(rolename, now, &roleid, &expired, &is_superuser))
 	{
-		LWLockAcquire(ppp_shared->lock, LW_SHARED);
-		entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key, HASH_FIND,
-											 NULL);
-		lookup_done = ppp_lookup_needed(entry, now);
-		LWLockRelease(ppp_shared->lock);
+		if (prev_client_auth_hook)
+			prev_client_auth_hook(port, status);
+		ereport(LOG,
+				(errmsg(PPP_LOG_PREFIX "authentication hook called outside a transaction: connection of role \"%s\" refused",
+						rolename),
+				 errdetail("The role cannot be looked up in pg_authid, so its lock state is unknown; the connection is refused (fail-closed).")));
+		ppp_fatal_not_loaded();
+		return;
 	}
-	if (lookup_done)
-		looked_up = ppp_role_lookup(key.rolename, now, &role_missing,
-									&expired, &is_superuser, &role_oid);
+	ppp_make_key(&key, roleid, rolename);
 	if (count_failure && expired && ppp_auth_method_checks_valid_until(port))
 		count_failure = false;
 	in_recovery = RecoveryInProgress();
 
-	LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
-	if (!lookup_done)
+	/*
+	 * Fast path: nothing to count and the start-up window closed.  A shared
+	 * lock is enough to find whether the entry is locked; the exclusive lock
+	 * is only needed by a success that resets a live counter.
+	 */
+	if (!count_failure && !check_window)
 	{
+		bool		write_needed = false;
+
+		LWLockAcquire(ppp_shared->lock, LW_SHARED);
 		entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key, HASH_FIND,
 											 NULL);
-		if (ppp_lookup_needed(entry, now))
+		if (entry != NULL)
 		{
-			LWLockRelease(ppp_shared->lock);
-			looked_up = ppp_role_lookup(key.rolename, now, &role_missing,
-										&expired, &is_superuser, &role_oid);
-			lookup_done = true;
-			LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
+			if (ppp_is_locked(entry, now))
+			{
+				refuse = true;
+				locked_until = entry->locked_until;
+			}
+			else if (status == STATUS_OK && entry->failed_count > 0)
+				write_needed = true;
+		}
+		LWLockRelease(ppp_shared->lock);
+
+		if (!write_needed)
+		{
+			/* the previous hook still sees the attempt (see below) */
+			if (prev_client_auth_hook)
+				prev_client_auth_hook(port, status);
+			if (refuse)
+				ppp_fatal_locked(rolename, locked_until);
+			return;
 		}
 	}
+
+	LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
 
 	/*
 	 * Fail-closed start-up window: until the worker has re-injected the
@@ -1038,77 +1072,25 @@ ppp_client_auth_hook(Port *port, int status)
 	if (entry == NULL && count_failure)
 	{
 		/*
-		 * A plain counting entry: when the hash is full it only evicts the
-		 * entries of non-existent roles, then inactive entries.
+		 * A plain counting entry: when the hash is full it only evicts
+		 * pseudo-entries, then inactive entries.
 		 */
-		entry = ppp_enter_role(rolename, PPP_ENTER_COUNT, now, in_recovery,
-							   &ev);
+		entry = ppp_enter_role(&key, rolename, PPP_ENTER_COUNT, now,
+							   in_recovery, &ev);
 		if (entry == NULL)
 			hash_full = !ev.scan_skipped;
 	}
 
 	/*
-	 * Whose state does the entry hold?  When in doubt, the lock applies
-	 * (fail-closed, SPEC 12).  A lock applies unless it is certainly the
-	 * lock of another role (ppp_lock_is_foreign): lock_role_oid valid and
-	 * different from the OID of the role that connects, or pseudo-lock of
-	 * a name that had no role (lock_on_missing) now borne by a role.  The
-	 * lookup skipped or failed, it applies.
-	 *
-	 * The lock of another role (dropped or renamed, another role bearing
-	 * the name since): once the entry is settled (nothing left to audit
-	 * for the role that bore the name), it starts afresh for this role
-	 * (ppp_restart_entry: default parameters, reload requested) and the
-	 * connection is handled as usual.  Otherwise the connection is refused
-	 * as locked, whatever the status, until the worker has audited the
-	 * entry: let through without counting, it would allow an unlimited
-	 * brute force (on a standby, until the promotion).
+	 * The key is the identity of the role: a lock of the entry is the lock
+	 * of the role that connects, no membership test is needed.  A lock
+	 * already in shared memory wins over the start-up window.
 	 */
 	if (entry != NULL && ppp_is_locked(entry, now))
 	{
-		if (!ppp_lock_is_foreign(entry, looked_up, role_missing, role_oid))
-		{
-			/* a lock already in shared memory wins over the start-up window */
-			refuse = true;
-			locked_until = entry->locked_until;
-			not_loaded = false;
-		}
-		else if (!ppp_entry_settled(entry))
-		{
-			refuse = true;
-			locked_until = entry->locked_until;
-			not_loaded = false;
-		}
-		else if (!not_loaded)	/* else left strictly unchanged, see below */
-		{
-			ppp_restart_entry(entry);
-			restarted = true;
-		}
-	}
-
-	/*
-	 * Owner of the counters (owner_oid, set at every counted failure): the
-	 * failures of another role (dropped, its name taken by a new role)
-	 * are never inherited.  Settled, the entry starts afresh for this role
-	 * before anything is counted; otherwise the connection is refused,
-	 * whatever the status (a success let through while failures are
-	 * refused would be an oracle), until the worker has audited the
-	 * entry.  Unknown OID (lookup skipped): counted as usual.
-	 */
-	if (entry != NULL && !refuse && !not_loaded && looked_up &&
-		(count_failure || status == STATUS_OK) &&
-		OidIsValid(entry->owner_oid) && entry->owner_oid != role_oid)
-	{
-		if (ppp_entry_settled(entry))
-		{
-			ppp_restart_entry(entry);
-			restarted = true;
-		}
-		else
-		{
-			refuse = true;
-			refuse_pending = true;
-		}
+		refuse = true;
+		locked_until = entry->locked_until;
+		not_loaded = false;
 	}
 
 	/*
@@ -1118,80 +1100,59 @@ ppp_client_auth_hook(Port *port, int status)
 	 * wrong one would end in "locked" after the window only if the candidate
 	 * were wrong.
 	 */
-	if (entry != NULL && !not_loaded)
+	if (entry != NULL && !not_loaded && !refuse)
 	{
-		/*
-		 * Refreshed at every failure: a role created after its name was
-		 * first tried loses the flag.  A successful authentication proves
-		 * that the role exists.  Never while the entry is locked (the
-		 * connection is refused): a locked entry never becomes a ghost
-		 * (evictable), the worker removes the lock of a dropped role itself
-		 * (ppp_sync_cleanup).
-		 */
-		if (count_failure && !refuse)
-			entry->role_missing = role_missing;
-		else if (status == STATUS_OK && !refuse)
-			entry->role_missing = false;
-		/* tells ppp_sync_cleanup() that its catalog lookup may be stale */
-		if (count_failure || status == STATUS_OK)
-			entry->update_seq++;
+		/* current name of the role, for the messages of the worker */
+		if (OidIsValid(key.roleid))
+			strlcpy(entry->rolename, rolename, NAMEDATALEN);
 
-		if (!refuse)
+		/* expired lock, if any (ppp_sync_cleanup does the same) */
+		(void) ppp_expire_lock(entry, now, false);
+
+		if (status == STATUS_OK)
 		{
-			/* expired lock, if any (ppp_sync_cleanup does the same) */
-			(void) ppp_expire_lock(entry, now, false);
-
-			if (status == STATUS_OK)
+			entry->failed_count = 0;
+			entry->first_failure_at = 0;
+		}
+		else if (count_failure)
+		{
+			/* restart counting when the window has elapsed */
+			if (entry->failed_count == 0 ||
+				entry->first_failure_at == 0 ||
+				ppp_window_elapsed(entry, now))
 			{
 				entry->failed_count = 0;
-				entry->first_failure_at = 0;
+				entry->first_failure_at = now;
 			}
-			else if (count_failure)
-			{
-				/* restart counting when the window has elapsed */
-				if (entry->failed_count == 0 ||
-					entry->first_failure_at == 0 ||
-					ppp_window_elapsed(entry, now))
-				{
-					entry->failed_count = 0;
-					entry->first_failure_at = now;
-				}
-				entry->failed_count++;
-				entry->last_failure_at = now;
-				entry->pending_failures++;
-				if (looked_up)
-					entry->owner_oid = role_oid;
+			entry->failed_count++;
+			entry->last_failure_at = now;
+			entry->pending_failures++;
 
-				if (entry->max_failures > 0 &&
-					entry->failed_count >= entry->max_failures)
-				{
-					if (entry->lock_duration_secs < 0)
-						entry->locked_until = DT_NOEND;
-					else
-						entry->locked_until = TimestampTzPlusMilliseconds(now,
-																		  (int64) entry->lock_duration_secs * 1000);
-					/*
-					 * A previous automatic lock whose role_locked row has
-					 * not been written yet (worker late, standby) is
-					 * overwritten: audit_lock_seq numbers the episodes, so
-					 * that the worker reports how many were not audited
-					 * one by one (SPEC 6.3).
-					 */
-					if (!entry->lock_pending_audit)
-						entry->audit_acked_seq = entry->audit_lock_seq;
-					entry->audit_lock_seq++;
-					entry->lock_pending_audit = true;
-					entry->audit_locked_until = entry->locked_until;
-					entry->audit_lock_set_at = now;
-					entry->audit_role_oid = role_oid;
-					entry->lock_role_oid = role_oid;
-					entry->lock_on_missing = looked_up && role_missing;
-					entry->lock_set_at = now;
-					entry->lock_from_state = false;
-					just_locked = true;
-					locked_until = entry->locked_until;
-					failed_count = entry->failed_count;
-				}
+			if (entry->max_failures > 0 &&
+				entry->failed_count >= entry->max_failures)
+			{
+				if (entry->lock_duration_secs < 0)
+					entry->locked_until = DT_NOEND;
+				else
+					entry->locked_until = TimestampTzPlusMilliseconds(now,
+																	  (int64) entry->lock_duration_secs * 1000);
+				/*
+				 * A previous automatic lock whose role_locked row has not
+				 * been written yet (worker late, standby) is overwritten:
+				 * audit_lock_seq numbers the episodes, so that the worker
+				 * reports how many were not audited one by one (SPEC 6.3).
+				 */
+				if (!entry->lock_pending_audit)
+					entry->audit_acked_seq = entry->audit_lock_seq;
+				entry->audit_lock_seq++;
+				entry->lock_pending_audit = true;
+				entry->audit_locked_until = entry->locked_until;
+				entry->audit_lock_set_at = now;
+				entry->lock_set_at = now;
+				entry->lock_from_state = false;
+				just_locked = true;
+				locked_until = entry->locked_until;
+				failed_count = entry->failed_count;
 			}
 		}
 	}
@@ -1210,14 +1171,10 @@ ppp_client_auth_hook(Port *port, int status)
 		 * hide the other roles; when the table of roles is full, the
 		 * admission is logged anyway).
 		 */
-		log_rescue = ppp_rescue_log_due(key.rolename, now, &rescue_suppressed);
+		log_rescue = ppp_rescue_log_due(rolename, now, &rescue_suppressed);
 	}
 
 	LWLockRelease(ppp_shared->lock);
-
-	/* an entry started afresh asked for a reload (ppp_restart_entry) */
-	if (restarted)
-		ppp_signal_worker_reload();
 
 	/*
 	 * Every message of this hook is LOG (server log only), except the FATAL
@@ -1266,24 +1223,7 @@ ppp_client_auth_hook(Port *port, int status)
 		prev_client_auth_hook(port, status);
 
 	if (refuse)
-	{
-		if (refuse_pending)
-			ereport(FATAL,
-					(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
-					 errmsg("role \"%s\" is locked by pg_pass_policy", rolename),
-					 errdetail("The role is temporarily locked; retry later.")));
-		else if (locked_until == DT_NOEND)
-			ereport(FATAL,
-					(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
-					 errmsg("role \"%s\" is locked by pg_pass_policy", rolename),
-					 errdetail("The role is locked until manual unlock.")));
-		else
-			ereport(FATAL,
-					(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
-					 errmsg("role \"%s\" is locked by pg_pass_policy", rolename),
-					 errdetail("The role is locked until %s.",
-							   timestamptz_to_str(locked_until))));
-	}
+		ppp_fatal_locked(rolename, locked_until);
 
 	if (not_loaded)
 	{
@@ -1293,17 +1233,7 @@ ppp_client_auth_hook(Port *port, int status)
 					 errdetail("Roles not listed in pg_pass_policy.exempt_roles are refused, whatever the authentication method, until the persisted locks are re-injected from role_state (at most one message per second)."),
 					 errhint("Check that the pg_pass_policy background worker is running (pass_policy.worker_status()). Meanwhile, roles listed in pg_pass_policy.exempt_roles can connect, superusers listed in pg_pass_policy.rescue_roles through peer authentication only, and any superuser once no worker has published its PID %d seconds after the shared memory initialisation.",
 							 PPP_WORKER_MISSING_GRACE_SECS)));
-		/*
-		 * Generic refusal, without any hint: the client is not authenticated
-		 * and must not learn anything about the configuration, the
-		 * emergency paths included (rescue_roles, exempt_roles, superusers
-		 * when the worker is missing).  The administrator finds them in the
-		 * hint of the LOG above and in the documentation (SPEC 12).
-		 */
-		ereport(FATAL,
-				(errcode(ERRCODE_CANNOT_CONNECT_NOW),
-				 errmsg(PPP_LOG_PREFIX "lock state not loaded yet, retry"),
-				 errdetail("The server has just started; retry in a few seconds.")));
+		ppp_fatal_not_loaded();
 	}
 }
 
@@ -1326,10 +1256,10 @@ typedef enum pppShmemOp
 typedef struct pppPendingOp
 {
 	pppShmemOp	op;
-	char		rolename[NAMEDATALEN];
+	pppRoleKey	key;			/* PPP_OP_LOCK: always the OID of a role
+								 * that existed when it was requested */
+	char		dispname[NAMEDATALEN];	/* name for messages */
 	TimestampTz until;			/* PPP_OP_LOCK only */
-	Oid			roleid;			/* PPP_OP_LOCK: its role, looked up when
-								 * shmem_lock_role() was called */
 	TimestampTz queued_at;		/* when it was requested */
 	bool		expired_only;	/* PPP_OP_UNLOCK: lift an expired lock only */
 	bool		kept_newer;		/* PPP_OP_UNLOCK: a newer lock was kept */
@@ -1417,7 +1347,7 @@ ppp_op_overridden(const pppPendingOp *op)
 
 	for (o = op->next; o != NULL; o = o->next)
 		if (o->op == opposite &&
-			strncmp(o->rolename, op->rolename, NAMEDATALEN) == 0)
+			memcmp(&o->key, &op->key, sizeof(pppRoleKey)) == 0)
 			return true;
 	return false;
 }
@@ -1476,10 +1406,11 @@ ppp_apply_lock_ops(void)
 		if (op->op == PPP_OP_LOCK && !ppp_op_overridden(op))
 		{
 			/*
-			 * op->roleid was looked up when shmem_lock_role() was called
-			 * (the role existed then): kept even if the role has been
-			 * renamed or dropped since in this transaction, the worker's
-			 * clean-up handles that (ppp_sync_cleanup); no ERROR at commit
+			 * op->key is the OID of the role, looked up when the lock was
+			 * requested: a rename later in this transaction keeps the
+			 * entry, a DROP ROLE leaves an entry for an OID that no longer
+			 * exists, which the worker removes (ppp_sync_cleanup); no
+			 * ERROR at commit
 			 */
 			ops[nops++] = op;
 		}
@@ -1491,20 +1422,19 @@ ppp_apply_lock_ops(void)
 	for (i = 0; i < nops; i++)
 	{
 		pppRoleEntry *entry;
-		pppRoleKey	key;
 
 		op = ops[i];
-		ppp_make_key(&key, op->rolename);
-		entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key, HASH_FIND, NULL);
+		entry = (pppRoleEntry *) hash_search(ppp_role_hash, &op->key,
+											 HASH_FIND, NULL);
 		op->prev_existed = (entry != NULL);
 		if (entry != NULL)
 			memcpy(&op->prev, entry, sizeof(pppRoleEntry));
 		else
-			entry = ppp_enter_role(op->rolename, PPP_ENTER_PRIORITY, now,
-								   in_recovery, &op->ev);
+			entry = ppp_enter_role(&op->key, op->dispname, PPP_ENTER_PRIORITY,
+								   now, in_recovery, &op->ev);
 		if (entry == NULL)
 		{
-			missing = op->rolename;
+			missing = op->dispname;
 			break;
 		}
 
@@ -1514,9 +1444,8 @@ ppp_apply_lock_ops(void)
 		 * role_locked row (audit_locked_until), which the worker writes
 		 * without copying it to role_state (locked_until differs now).
 		 */
+		strlcpy(entry->rolename, op->dispname, NAMEDATALEN);
 		entry->locked_until = op->until;
-		entry->lock_role_oid = op->roleid;
-		entry->lock_on_missing = false;
 		entry->lock_set_at = now;
 
 		/*
@@ -1527,8 +1456,6 @@ ppp_apply_lock_ops(void)
 		 */
 		entry->lock_from_state = !in_recovery;
 		entry->lock_inflight++;
-		entry->role_missing = false;
-		entry->update_seq++;
 		op->applied = true;
 	}
 
@@ -1544,21 +1471,19 @@ ppp_apply_lock_ops(void)
 		 */
 		while (--i >= 0)
 		{
-			pppRoleKey	key;
 			pppRoleEntry *entry;
 
 			op = ops[i];
-			ppp_make_key(&key, op->rolename);
 			if (op->prev_existed)
 			{
-				entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key,
+				entry = (pppRoleEntry *) hash_search(ppp_role_hash, &op->key,
 													 HASH_FIND, NULL);
 				if (entry != NULL)
 					memcpy(entry, &op->prev, sizeof(pppRoleEntry));
 			}
 			else
 			{
-				hash_search(ppp_role_hash, &key, HASH_REMOVE, NULL);
+				hash_search(ppp_role_hash, &op->key, HASH_REMOVE, NULL);
 				if (op->ev.evicted)
 				{
 					bool		found;
@@ -1657,7 +1582,6 @@ ppp_finish_pending_ops(bool commit)
 	LWLockAcquire(ppp_shared->lock, LW_EXCLUSIVE);
 	for (op = ppp_pending_ops; op != NULL; op = op->next)
 	{
-		pppRoleKey	key;
 		pppRoleEntry *entry;
 
 		if (op->op == PPP_OP_LOCK && !op->applied)
@@ -1669,8 +1593,8 @@ ppp_finish_pending_ops(bool commit)
 			ppp_op_overridden(op))
 			continue;
 
-		ppp_make_key(&key, op->rolename);
-		entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key, HASH_FIND, NULL);
+		entry = (pppRoleEntry *) hash_search(ppp_role_hash, &op->key,
+											 HASH_FIND, NULL);
 		if (entry == NULL)
 			continue;
 
@@ -1731,7 +1655,7 @@ ppp_finish_pending_ops(bool commit)
 			if (op->kept_newer)
 				ereport(LOG,
 						(errmsg(PPP_LOG_PREFIX "unlock of role \"%s\" not applied in shared memory: the role holds a newer lock",
-								op->rolename),
+								op->dispname),
 						 op->expired_only ?
 						 errdetail("Only an expired lock was to be lifted; the active automatic lock set by new failures is kept, and copied to role_state by the worker.") :
 						 errdetail("An automatic lock set after the unlock was requested is kept, and copied to role_state by the worker.")));
@@ -1910,7 +1834,7 @@ ppp_password_recorded(const char *rolename)
 
 /* Queue a write for the end of the current (sub-)transaction. */
 static void
-ppp_defer_op(pppShmemOp opcode, const char *rolename, Oid roleid,
+ppp_defer_op(pppShmemOp opcode, const pppRoleKey *key, const char *dispname,
 			 TimestampTz until, bool expired_only)
 {
 	pppPendingOp *op;
@@ -1919,8 +1843,8 @@ ppp_defer_op(pppShmemOp opcode, const char *rolename, Oid roleid,
 
 	op = (pppPendingOp *) MemoryContextAlloc(TopTransactionContext, sizeof(pppPendingOp));
 	op->op = opcode;
-	strlcpy(op->rolename, rolename, NAMEDATALEN);
-	op->roleid = roleid;
+	memcpy(&op->key, key, sizeof(pppRoleKey));
+	strlcpy(op->dispname, dispname, NAMEDATALEN);
 	op->until = until;
 	op->queued_at = GetCurrentTimestamp();
 	op->expired_only = expired_only;
@@ -1994,30 +1918,37 @@ ppp_alloc_hash_copy(MemoryContext cxt, Size rowsize, int *maxrows,
 /* local copy of a hash entry, built under the lock */
 typedef struct pppAttemptRow
 {
+	Oid			roleid;			/* key of the entry, InvalidOid: pseudo-entry */
 	char		rolename[NAMEDATALEN];
 	int32		failed_count;
 	TimestampTz first_failure_at;
 	TimestampTz last_failure_at;
 	TimestampTz locked_until;
-	bool		role_missing;
 } pppAttemptRow;
 
 /*
  * failed_attempts() RETURNS TABLE(role_name text, failed_count int,
  *	 first_failure_at timestamptz, last_failure_at timestamptz,
- *	 locked_until timestamptz)
+ *	 locked_until timestamptz, role_oid oid)
  *
- * Only roles with failures or an active lock are returned.  Timestamps at
+ * Only entries with failures or an active lock are returned.  Timestamps at
  * 0 are returned as NULL; a manual lock (DT_NOEND) as 'infinity'.
  *
- * Entries of non-existent user names (no role of that name in pg_authid when
- * the function is called) are returned by name to superusers only.  Such a name is whatever a client typed in the user
- * field, a password typed in the wrong field included; the server log
- * (readable by superusers) already holds it, the viewer and admin roles
- * must not read it.  For them, those entries are folded into a single row
- * whose role_name is NULL (it can match no role, unlike a placeholder
- * name): sum of the counters, earliest first failure, latest last failure
- * and latest lock.
+ * role_oid is the key of the entry (NULL for a pseudo-entry) and role_name
+ * the current name of that role, looked up by OID outside the LWLock; once
+ * the OID no longer exists (dropped role whose audit is pending), the last
+ * name stored in the entry.
+ *
+ * Pseudo-entries (user names that matched no role when they were tried)
+ * are returned by name to superusers only.  Such a name is whatever a client
+ * typed in the user field, a password typed in the wrong field included;
+ * the server log (readable by superusers) already holds it, the viewer and
+ * admin roles must not read it.  For them, every pseudo-entry is folded
+ * into a single row whose role_name and role_oid are NULL (it can match no
+ * role, unlike a placeholder name): sum of the counters, earliest first
+ * failure, latest last failure and latest lock.  This is decided on the key
+ * alone: a role created since under such a name has an entry of its own,
+ * keyed by its OID, and the pseudo-entry is not its state.
  */
 Datum
 ppp_failed_attempts(PG_FUNCTION_ARGS)
@@ -2032,10 +1963,11 @@ ppp_failed_attempts(PG_FUNCTION_ARGS)
 	TimestampTz now;
 	int			i;
 	bool		show_missing = superuser();
+	bool		have_agg = false;
 	pppAttemptRow agg;
 
 	ppp_check_shmem();
-	ppp_begin_materialize(fcinfo, &tupdesc, &tupstore, 5);
+	ppp_begin_materialize(fcinfo, &tupdesc, &tupstore, 6);
 	memset(&agg, 0, sizeof(agg));
 
 	/* copy the interesting entries under a shared lock, no palloc inside */
@@ -2055,52 +1987,53 @@ ppp_failed_attempts(PG_FUNCTION_ARGS)
 			hash_seq_term(&seq);
 			break;
 		}
-		strlcpy(rows[nrows].rolename, entry->key.rolename, NAMEDATALEN);
+		rows[nrows].roleid = entry->key.roleid;
+		strlcpy(rows[nrows].rolename, entry->rolename, NAMEDATALEN);
 		rows[nrows].failed_count = entry->failed_count;
 		rows[nrows].first_failure_at = entry->first_failure_at;
 		rows[nrows].last_failure_at = entry->last_failure_at;
 		rows[nrows].locked_until = locked ? entry->locked_until : 0;
-		rows[nrows].role_missing = false;	/* set below if !show_missing */
 		nrows++;
 	}
 	LWLockRelease(ppp_shared->lock);
 
-	/* fold the non-existent names (see above), outside the lock */
+	/* current name of each role, outside the lock */
+	for (i = 0; i < nrows; i++)
+	{
+		HeapTuple	tup;
+
+		if (!OidIsValid(rows[i].roleid))
+			continue;
+		tup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(rows[i].roleid));
+		if (HeapTupleIsValid(tup))
+		{
+			strlcpy(rows[i].rolename,
+					NameStr(((Form_pg_authid) GETSTRUCT(tup))->rolname),
+					NAMEDATALEN);
+			ReleaseSysCache(tup);
+		}
+	}
+
+	/* fold the pseudo-entries (see above) */
 	if (!show_missing)
 	{
 		int			kept = 0;
-
-		/*
-		 * Does each name exist now?  Decided here, on the copy and outside
-		 * the LWLock, by a syscache lookup, for the callers that see the
-		 * folded row only (a superuser sees every name, the flag is not
-		 * used for him).  The role_missing flag of the entry is not used on
-		 * purpose: it is only a cache for the eviction classes, set by an
-		 * authentication attempt and turned on by the synchronisation pass
-		 * of the worker (ppp_sync_cleanup, false -> true only, for entries
-		 * with nothing pending), so a role created (or renamed) under a
-		 * name tried earlier would stay folded, and a role renamed away
-		 * would keep its old name visible, until then.  The view must be
-		 * exact at the time it is read: its own lookup is kept (SPEC 12).
-		 */
-		for (i = 0; i < nrows; i++)
-			rows[i].role_missing =
-				!SearchSysCacheExists1(AUTHNAME, CStringGetDatum(rows[i].rolename));
 
 		for (i = 0; i < nrows; i++)
 		{
 			pppAttemptRow *r = &rows[i];
 
-			if (!r->role_missing)
+			if (OidIsValid(r->roleid))
 			{
 				if (kept != i)
 					rows[kept] = *r;
 				kept++;
 				continue;
 			}
-			if (!agg.role_missing)
+			if (!have_agg)
 			{
 				agg = *r;
+				have_agg = true;
 				continue;
 			}
 			agg.failed_count += r->failed_count;
@@ -2113,17 +2046,17 @@ ppp_failed_attempts(PG_FUNCTION_ARGS)
 				agg.locked_until = r->locked_until;
 		}
 		nrows = kept;
-		if (agg.role_missing)
+		if (have_agg)
 			rows[nrows++] = agg;	/* room: at least one row was dropped */
 	}
 
 	for (i = 0; i < nrows; i++)
 	{
-		Datum		values[5];
-		bool		nulls[5];
+		Datum		values[6];
+		bool		nulls[6];
 
 		memset(nulls, 0, sizeof(nulls));
-		if (rows[i].role_missing && !show_missing)
+		if (!OidIsValid(rows[i].roleid) && !show_missing)
 			nulls[0] = true;
 		else
 			values[0] = CStringGetTextDatum(rows[i].rolename);
@@ -2140,6 +2073,10 @@ ppp_failed_attempts(PG_FUNCTION_ARGS)
 			values[4] = TimestampTzGetDatum(rows[i].locked_until);	/* DT_NOEND = infinity */
 		else
 			nulls[4] = true;
+		if (OidIsValid(rows[i].roleid))
+			values[5] = ObjectIdGetDatum(rows[i].roleid);
+		else
+			nulls[5] = true;
 
 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 	}
@@ -2191,21 +2128,78 @@ ppp_text_to_rolename(text *t, char *buf)
 }
 
 /*
+ * Key of a role given by name (shmem_unlock_role(), shmem_reset_failures()):
+ * its OID when a role bears that name, the pseudo-key of the name otherwise
+ * (so that a pseudo-lock of an invented name can be lifted).
+ */
+static void
+ppp_name_key(const char *rolename, pppRoleKey *key)
+{
+	ppp_make_key(key, get_role_oid(rolename, true), rolename);
+}
+
+/*
+ * Name of a role given by OID, for messages: ERROR 42704 when the OID does
+ * not exist unless missing_ok (the OID itself is then used).
+ */
+static void
+ppp_oid_dispname(Oid roleid, char *buf, bool missing_ok)
+{
+	HeapTuple	tup;
+
+	tup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(roleid));
+	if (!HeapTupleIsValid(tup))
+	{
+		if (!missing_ok)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("role with OID %u does not exist", roleid)));
+		snprintf(buf, NAMEDATALEN, "%u", roleid);
+		return;
+	}
+	strlcpy(buf, NameStr(((Form_pg_authid) GETSTRUCT(tup))->rolname),
+			NAMEDATALEN);
+	ReleaseSysCache(tup);
+}
+
+/* end of a lock: argument argno, NULL or 'infinity' = until manual unlock */
+static TimestampTz
+ppp_arg_until(FunctionCallInfo fcinfo, int argno)
+{
+	TimestampTz until;
+
+	if (PG_ARGISNULL(argno))
+		return DT_NOEND;
+	until = PG_GETARG_TIMESTAMPTZ(argno);
+	if (TIMESTAMP_IS_NOEND(until))
+		return DT_NOEND;
+	if (TIMESTAMP_IS_NOBEGIN(until))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("lock end time must not be -infinity")));
+	return until;
+}
+
+/*
  * shmem_lock_role(role text, until timestamptz) RETURNS void
  *
- * until NULL (or 'infinity') = locked until manual unlock.  The write is
- * applied at PRE_COMMIT.  If the shared memory has no room for it (every
- * entry holds an active lock, a lock not yet audited or profile parameters
- * of an existing role), the COMMIT fails with an ERROR (ppp_apply_lock_ops).
- * On a primary, a lock set this way without a role_state row (direct call,
- * not through lock_role()) is lifted by the next worker reload.
+ * Direct use by a superuser (standby included); lock_role() calls
+ * _shmem_lock() with the OID it has checked.  ERROR 42704 without a role of
+ * that name.  until NULL (or 'infinity') = locked until manual unlock.  The
+ * lock is queued for the OID of the role, captured now, and applied at
+ * PRE_COMMIT: a rename later in the transaction keeps it on the role.  If
+ * the shared memory has no room for it (every entry holds an active lock, a
+ * lock not yet audited or profile parameters of an existing role), the
+ * COMMIT fails with an ERROR (ppp_apply_lock_ops).  On a primary, a lock
+ * set this way without a role_state row (direct call, not through
+ * lock_role()) is lifted by the next worker reload.
  */
 Datum
 ppp_shmem_lock_role(PG_FUNCTION_ARGS)
 {
 	char		rolename[NAMEDATALEN];
 	TimestampTz until;
-	Oid			roleid;
+	pppRoleKey	key;
 
 	ppp_require_superuser("shmem_lock_role");
 	ppp_check_shmem();
@@ -2215,34 +2209,82 @@ ppp_shmem_lock_role(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
 				 errmsg("role name must not be NULL")));
 	ppp_text_to_rolename(PG_GETARG_TEXT_PP(0), rolename);
-	/*
-	 * ERROR 42704 without a role.  The OID is captured now and applied at
-	 * PRE_COMMIT even if the role is renamed or dropped later in the
-	 * transaction (ppp_apply_lock_ops).
-	 */
-	roleid = get_role_oid(rolename, false);
+	ppp_make_key(&key, get_role_oid(rolename, false), rolename);
+	until = ppp_arg_until(fcinfo, 1);
 
-	if (PG_ARGISNULL(1))
-		until = DT_NOEND;
-	else
-	{
-		until = PG_GETARG_TIMESTAMPTZ(1);
-		if (TIMESTAMP_IS_NOEND(until))
-			until = DT_NOEND;
-		else if (TIMESTAMP_IS_NOBEGIN(until))
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("lock end time must not be -infinity")));
-	}
-
-	ppp_defer_op(PPP_OP_LOCK, rolename, roleid, until, false);
+	ppp_defer_op(PPP_OP_LOCK, &key, rolename, until, false);
 
 	PG_RETURN_VOID();
 }
 
 /*
+ * _shmem_lock(role oid, until timestamptz) RETURNS void
+ *
+ * Internal (lock_role()): shmem_lock_role() for the OID the caller has
+ * checked, so that a rename between that check and this call cannot lock
+ * another role in shared memory than in role_state.  ERROR 42704 if the OID
+ * does not exist.
+ */
+Datum
+ppp_shmem_lock_oid(PG_FUNCTION_ARGS)
+{
+	char		dispname[NAMEDATALEN];
+	Oid			roleid;
+	TimestampTz until;
+	pppRoleKey	key;
+
+	ppp_require_superuser("_shmem_lock");
+	ppp_check_shmem();
+
+	if (PG_ARGISNULL(0))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("role OID must not be NULL")));
+	roleid = PG_GETARG_OID(0);
+	ppp_oid_dispname(roleid, dispname, false);
+	ppp_make_key(&key, roleid, NULL);
+	until = ppp_arg_until(fcinfo, 1);
+
+	ppp_defer_op(PPP_OP_LOCK, &key, dispname, until, false);
+
+	PG_RETURN_VOID();
+}
+
+/*
+ * Queue the unlock of an entry (see ppp_shmem_unlock_role).  Returns false,
+ * and queues nothing, when expired_only is set and the entry holds an
+ * active lock right now.
+ */
+static bool
+ppp_queue_unlock(const pppRoleKey *key, const char *dispname,
+				 bool expired_only)
+{
+	if (expired_only)
+	{
+		pppRoleEntry *entry;
+		bool		locked = false;
+
+		LWLockAcquire(ppp_shared->lock, LW_SHARED);
+		entry = (pppRoleEntry *) hash_search(ppp_role_hash, key, HASH_FIND, NULL);
+		if (entry != NULL)
+			locked = ppp_is_locked(entry, GetCurrentTimestamp());
+		LWLockRelease(ppp_shared->lock);
+		if (locked)
+			return false;
+	}
+
+	ppp_defer_op(PPP_OP_UNLOCK, key, dispname, 0, expired_only);
+	return true;
+}
+
+/*
  * shmem_unlock_role(role text, expired_only bool DEFAULT false) RETURNS bool
  * (STRICT)
+ *
+ * Direct use by a superuser (standby included); unlock_role() and
+ * run_maintenance() call _shmem_unlock() with an OID.  The entry is that of
+ * the OID of the role that bears the name, or, without such a role, the
+ * pseudo-entry of the name.
  *
  * Removes the lock at COMMIT, except a lock that the caller cannot have
  * seen (see ppp_unlock_allowed); with expired_only, only a lock that has
@@ -2261,36 +2303,36 @@ Datum
 ppp_shmem_unlock_role(PG_FUNCTION_ARGS)
 {
 	char		rolename[NAMEDATALEN];
-	bool		expired_only = PG_GETARG_BOOL(1);
+	pppRoleKey	key;
 
 	ppp_require_superuser("shmem_unlock_role");
 	ppp_check_shmem();
 
 	ppp_text_to_rolename(PG_GETARG_TEXT_PP(0), rolename);
+	ppp_name_key(rolename, &key);
 
-	if (expired_only)
-	{
-		pppRoleKey	key;
-		pppRoleEntry *entry;
-		bool		locked = false;
+	PG_RETURN_BOOL(ppp_queue_unlock(&key, rolename, PG_GETARG_BOOL(1)));
+}
 
-		ppp_make_key(&key, rolename);
-		LWLockAcquire(ppp_shared->lock, LW_SHARED);
-		entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key, HASH_FIND, NULL);
-		if (entry != NULL)
-			locked = ppp_is_locked(entry, GetCurrentTimestamp());
-		LWLockRelease(ppp_shared->lock);
-		if (locked)
-			PG_RETURN_BOOL(false);
-	}
+/* _shmem_unlock(role oid, expired_only bool) RETURNS bool (STRICT, internal) */
+Datum
+ppp_shmem_unlock_oid(PG_FUNCTION_ARGS)
+{
+	char		dispname[NAMEDATALEN];
+	Oid			roleid = PG_GETARG_OID(0);
+	pppRoleKey	key;
 
-	ppp_defer_op(PPP_OP_UNLOCK, rolename, InvalidOid, 0, expired_only);
+	ppp_require_superuser("_shmem_unlock");
+	ppp_check_shmem();
 
-	PG_RETURN_BOOL(true);
+	ppp_oid_dispname(roleid, dispname, true);
+	ppp_make_key(&key, roleid, NULL);
+
+	PG_RETURN_BOOL(ppp_queue_unlock(&key, dispname, PG_GETARG_BOOL(1)));
 }
 
 /*
- * _shmem_is_locked(role text) RETURNS bool (STRICT)
+ * _shmem_is_locked(role oid) RETURNS bool (STRICT)
  *
  * True if the shared memory holds an active lock of the role right now
  * (HASH_FIND under a shared lock).  Used by unlock_role() to tell whether
@@ -2301,7 +2343,6 @@ ppp_shmem_unlock_role(PG_FUNCTION_ARGS)
 Datum
 ppp_shmem_is_locked(PG_FUNCTION_ARGS)
 {
-	char		rolename[NAMEDATALEN];
 	pppRoleKey	key;
 	pppRoleEntry *entry;
 	bool		locked = false;
@@ -2309,9 +2350,7 @@ ppp_shmem_is_locked(PG_FUNCTION_ARGS)
 	ppp_require_superuser("_shmem_is_locked");
 	ppp_check_shmem();
 
-	ppp_text_to_rolename(PG_GETARG_TEXT_PP(0), rolename);
-
-	ppp_make_key(&key, rolename);
+	ppp_make_key(&key, PG_GETARG_OID(0), NULL);
 	LWLockAcquire(ppp_shared->lock, LW_SHARED);
 	entry = (pppRoleEntry *) hash_search(ppp_role_hash, &key, HASH_FIND, NULL);
 	if (entry != NULL)
@@ -2324,20 +2363,57 @@ ppp_shmem_is_locked(PG_FUNCTION_ARGS)
 /*
  * shmem_reset_failures(role text) RETURNS void (STRICT)
  *
- * Resets the failure counter at COMMIT.  Failures not yet written to the
- * audit log (pending_failures) are kept: they did happen.
+ * Resets the failure counter at COMMIT (entry chosen as by
+ * shmem_unlock_role()).  Failures not yet written to the audit log
+ * (pending_failures) are kept: they did happen.
  */
 Datum
 ppp_shmem_reset_failures(PG_FUNCTION_ARGS)
 {
 	char		rolename[NAMEDATALEN];
+	pppRoleKey	key;
 
 	ppp_require_superuser("shmem_reset_failures");
 	ppp_check_shmem();
 
 	ppp_text_to_rolename(PG_GETARG_TEXT_PP(0), rolename);
+	ppp_name_key(rolename, &key);
 
-	ppp_defer_op(PPP_OP_RESET, rolename, InvalidOid, 0, false);
+	ppp_defer_op(PPP_OP_RESET, &key, rolename, 0, false);
 
 	PG_RETURN_VOID();
+}
+
+/* _shmem_reset(role oid) RETURNS void (STRICT, internal: unlock_role()) */
+Datum
+ppp_shmem_reset_oid(PG_FUNCTION_ARGS)
+{
+	char		dispname[NAMEDATALEN];
+	Oid			roleid = PG_GETARG_OID(0);
+	pppRoleKey	key;
+
+	ppp_require_superuser("_shmem_reset");
+	ppp_check_shmem();
+
+	ppp_oid_dispname(roleid, dispname, true);
+	ppp_make_key(&key, roleid, NULL);
+
+	ppp_defer_op(PPP_OP_RESET, &key, dispname, 0, false);
+
+	PG_RETURN_VOID();
+}
+
+/*
+ * _system_identifier() RETURNS bigint
+ *
+ * pg_control's system identifier (GetSystemIdentifier(), PG 14 to 18):
+ * default of the cluster_id columns of role_state and role_profile, which
+ * tell the rows written in this cluster (or a physical replica of it) from
+ * rows restored from another one (SPEC 6.3, "Rechargement").  The uint64 is
+ * returned as its bit pattern, like pg_control_system().
+ */
+Datum
+ppp_system_identifier(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64((int64) GetSystemIdentifier());
 }

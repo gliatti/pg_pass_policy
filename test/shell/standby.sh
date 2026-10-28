@@ -284,12 +284,13 @@ echo "pg_pass_policy.worker_interval = 2" >>"$SB_DATA/postgresql.conf"
 sb_admin "SELECT pg_reload_conf()" >/dev/null
 psql_admin "SELECT pass_policy.alter_profile('default', '{\"max_failures\": 5, \"lock_duration\": \"30 minutes\"}')" >/dev/null
 
-# --- standby : rôle supprimé avec un verrou en attente d'audit (vérification 9)
+# --- standby : rôle supprimé avec un verrou en attente d'audit (vérifications 9 et 15)
 # Verrou local posé sur le standby (audit en attente jusqu'à la promotion),
-# puis rôle supprimé sur le primaire et rejoué : le worker du standby ne fait
-# pas de l'entrée un fantôme (quelque chose est en attente). Elle reste non
-# évincable : un remplissage par des noms inexistants ne la perd pas, et son
-# audit role_locked (role_missing) est écrit après la promotion (plus bas).
+# puis rôle supprimé sur le primaire et rejoué : le worker du standby marque
+# l'entrée role_dropped sans la retirer (quelque chose est en attente). Elle
+# passe en PPP_CLASS_PENDING_AUDIT, que le comptage n'évince pas : un
+# remplissage par des noms inexistants ne la perd pas, et son audit
+# role_locked (role_dropped) est écrit après la promotion (plus bas).
 psql_admin "CREATE ROLE regress_sb_gone LOGIN PASSWORD '$GOOD'"
 sb_catch_up || fail "vérification 9 : le standby n'a pas rejoué regress_sb_gone"
 sleep 3 # profil default rétabli rechargé par le worker du standby
@@ -303,39 +304,58 @@ for i in $(seq 1 24); do sb_as "phantom_sb_$i" "$BAD" >/dev/null || true; done
 out=$(sb_admin "SELECT count(*) FROM pass_policy.failed_attempts() WHERE role_name = 'regress_sb_gone' AND locked_until IS NOT NULL")
 check_eq "vérification 9 : l'entrée du rôle supprimé, verrou en attente d'audit, n'est pas évincée" "1" "$out"
 
-# --- standby : verrou local d'un rôle renommé (vérifications 13 et 14) -----
+# --- standby : verrou local d'un rôle renommé (vérifications 13 à 15) -----
 # Verrou local posé par shmem_lock_role() sur le standby (ni role_state ni
 # audit en attente), puis rôle renommé sur le primaire et un nouveau rôle créé
-# sous l'ancien nom. Le worker d'un standby ne retire jamais l'entrée d'un rôle
-# renommé (vérification 14) : le verrou reste sous l'ancien nom, sans LOG de
-# retrait. Le rôle renommé n'est pas verrouillé (verrou local, absent de
-# role_state : limite documentée, SPEC §12) ; le rôle recréé sous l'ancien nom
-# n'hérite pas d'un verrou d'un autre OID (entrée réglée remise à zéro).
+# sous l'ancien nom. La mémoire partagée est indexée par l'OID, répliqué avec
+# pg_authid : le rôle renommé reste verrouillé sur le standby (avec e590e35,
+# le verrou restait sous l'ancien nom) ; le rôle recréé sous l'ancien nom a
+# un autre OID et se connecte.
 psql_admin "CREATE ROLE regress_sb_ren LOGIN PASSWORD '$GOOD'"
-sb_catch_up || fail "vérification 14 : le standby n'a pas rejoué regress_sb_ren"
+sb_catch_up || fail "vérification 15 : le standby n'a pas rejoué regress_sb_ren"
 sb_admin "SELECT pass_policy.shmem_lock_role('regress_sb_ren', NULL)" >/dev/null
 out=$(sb_as regress_sb_ren "$GOOD") || true
-check_contains "vérification 14 : regress_sb_ren verrouillé localement sur le standby" "is locked by pg_pass_policy" "$out"
+check_contains "vérification 15 : regress_sb_ren verrouillé localement sur le standby" "is locked by pg_pass_policy" "$out"
 psql_admin "ALTER ROLE regress_sb_ren RENAME TO regress_sb_ren2" 2>/dev/null
-sb_catch_up || fail "vérification 14 : le standby n'a pas rejoué le renommage"
+sb_catch_up || fail "vérification 15 : le standby n'a pas rejoué le renommage"
 t_sb=$(sb_admin "SELECT clock_timestamp()")
 # deux tours du worker du standby après le renommage (ppp_sync_cleanup)
 wait_for_sb "SELECT coalesce(max(last_run) > '$t_sb'::timestamptz, false) FROM pass_policy.worker_status()" ||
-	fail "vérification 14 : pas de tour du worker du standby après le renommage"
+	fail "vérification 15 : pas de tour du worker du standby après le renommage"
 t_sb=$(sb_admin "SELECT clock_timestamp()")
 wait_for_sb "SELECT coalesce(max(last_run) > '$t_sb'::timestamptz, false) FROM pass_policy.worker_status()" ||
-	fail "vérification 14 : pas de second tour du worker du standby"
-n=$(grep -c 'lock of role "regress_sb_ren" renamed to' "$PPP_TMP/standby.log" || true)
-check_eq "vérification 14 : standby, aucun LOG de retrait au renommage" "0" "$n"
-out=$(sb_admin "SELECT locked_until = 'infinity' FROM pass_policy.failed_attempts() WHERE role_name = 'regress_sb_ren'")
-check_eq "vérification 14 : standby, verrou local conservé sous l'ancien nom" "t" "$out"
+	fail "vérification 15 : pas de second tour du worker du standby"
+n=$(grep -c 'renamed to' "$PPP_TMP/standby.log" || true)
+check_eq "vérification 15 : standby, aucun LOG « renamed to »" "0" "$n"
+out=$(sb_admin "SELECT role_name || ':' || (locked_until = 'infinity') FROM pass_policy.failed_attempts()
+                 WHERE role_oid = (SELECT oid FROM pg_roles WHERE rolname = 'regress_sb_ren2')")
+check_eq "vérification 15 : standby, verrou local visible sous le nouveau nom" "regress_sb_ren2:true" "$out"
 out=$(sb_as regress_sb_ren2 "$GOOD" "SELECT current_user") || true
-check_eq "vérification 14 : verrou local non persisté, le rôle renommé n'est pas verrouillé (limite)" "regress_sb_ren2" "$out"
+check_contains "vérification 15 : standby, le rôle renommé reste verrouillé" "is locked by pg_pass_policy" "$out"
 # autre mot de passe : l'historique refuserait le même (PPP-031)
 psql_admin "CREATE ROLE regress_sb_ren LOGIN PASSWORD 'Standby-Other#2025'"
-sb_catch_up || fail "vérification 14 : le standby n'a pas rejoué la recréation"
+sb_catch_up || fail "vérification 15 : le standby n'a pas rejoué la recréation"
 out=$(sb_as regress_sb_ren 'Standby-Other#2025' "SELECT current_user") || true
-check_eq "vérification 14 : le rôle recréé sous l'ancien nom n'hérite pas du verrou" "regress_sb_ren" "$out"
+check_eq "vérification 15 : le rôle recréé sous l'ancien nom n'hérite pas du verrou" "regress_sb_ren" "$out"
+sb_admin "SELECT pass_policy.shmem_unlock_role('regress_sb_ren2')" >/dev/null
+
+# --- standby : échecs en attente, DROP + CREATE rejoués (vérification 15, trou 4)
+# Deux échecs comptés sur le standby (audit en attente jusqu'à la promotion),
+# puis rôle supprimé et recréé sous le même nom sur le primaire : le nouveau
+# rôle (autre OID) se connecte sur le standby avant toute promotion (avec
+# e590e35, il était refusé « temporarily locked » tant que les échecs de
+# l'ancien rôle n'étaient pas audités, c'est-à-dire jusqu'à la promotion).
+psql_admin "CREATE ROLE regress_sb_rc LOGIN PASSWORD '$GOOD'"
+sb_catch_up || fail "trou 4 : le standby n'a pas rejoué regress_sb_rc"
+for i in 1 2; do sb_as regress_sb_rc "$BAD" >/dev/null || true; done
+check_eq "trou 4 : deux échecs en attente sur le standby" "2" \
+	"$(sb_admin "SELECT failed_count FROM pass_policy.failed_attempts() WHERE role_name = 'regress_sb_rc'")"
+psql_admin "DROP ROLE regress_sb_rc; CREATE ROLE regress_sb_rc LOGIN PASSWORD 'Standby-Recreated#2025'"
+sb_catch_up || fail "trou 4 : le standby n'a pas rejoué DROP + CREATE"
+out=$(sb_as regress_sb_rc 'Standby-Recreated#2025' "SELECT current_user") || true
+check_eq "trou 4 : rôle recréé, échecs de l'ancien en attente : connexion acceptée sur le standby" "regress_sb_rc" "$out"
+n=$(grep -c 'temporarily locked' "$PPP_TMP/standby.log" || true)
+check_eq "trou 4 : aucun refus « temporarily locked » sur le standby" "0" "$n"
 
 # --- lecture seule : aucune erreur d'écriture du worker du standby -----------
 n=$(tail -n "+$((sb_log0 + 1))" "$PPP_TMP/standby.log" | grep -cE 'pg_pass_policy: worker .* failed|read-only transaction' || true)
@@ -376,8 +396,8 @@ out=$(sb_admin "SELECT coalesce(sum((details->>'count')::int), 0) >= 2 FROM pass
 check_eq "nouveau primaire : échecs comptés sur le standby audités (auth_failed)" "t" "$out"
 out=$(sb_as regress_sb_auto "$GOOD") || true
 check_contains "nouveau primaire : le rôle reste verrouillé" "is locked by pg_pass_policy" "$out"
-if wait_for_sb "SELECT count(*) > 0 FROM pass_policy.audit_log WHERE event_type = 'role_locked' AND role_name = 'regress_sb_gone' AND (details->>'role_missing')::boolean"; then
-	ok "vérification 9 : nouveau primaire : audit role_locked (role_missing) du rôle supprimé écrit"
+if wait_for_sb "SELECT count(*) > 0 FROM pass_policy.audit_log WHERE event_type = 'role_locked' AND role_name = 'regress_sb_gone' AND (details->>'role_dropped')::boolean"; then
+	ok "vérification 9 : nouveau primaire : audit role_locked (role_dropped) du rôle supprimé écrit"
 else
 	fail "vérification 9 : nouveau primaire : pas d'audit role_locked pour regress_sb_gone" "$(sb_admin "SELECT event_type, details FROM pass_policy.audit_log WHERE role_name = 'regress_sb_gone'")"
 fi

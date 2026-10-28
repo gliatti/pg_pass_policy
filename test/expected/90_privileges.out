@@ -116,6 +116,30 @@ SELECT ppp_test.try($$SELECT pass_policy.shmem_lock_role('regress_target', NULL)
  42501
 (1 row)
 
+SELECT ppp_test.try($$SELECT pass_policy._shmem_lock('regress_target'::regrole::oid, NULL)$$) AS shmem_lock_oid;
+ shmem_lock_oid 
+----------------
+ 42501
+(1 row)
+
+SELECT ppp_test.try($$SELECT pass_policy._shmem_unlock('regress_target'::regrole::oid, false)$$) AS shmem_unlock_oid;
+ shmem_unlock_oid 
+------------------
+ 42501
+(1 row)
+
+SELECT ppp_test.try($$SELECT pass_policy._shmem_reset('regress_target'::regrole::oid)$$) AS shmem_reset_oid;
+ shmem_reset_oid 
+-----------------
+ 42501
+(1 row)
+
+SELECT ppp_test.try($$SELECT pass_policy._shmem_is_locked('regress_target'::regrole::oid)$$) AS shmem_is_locked;
+ shmem_is_locked 
+-----------------
+ 42501
+(1 row)
+
 SELECT ppp_test.try($$SELECT * FROM pass_policy.switch_rotation_pair('app')$$) AS switch_pair;
  switch_pair 
 -------------

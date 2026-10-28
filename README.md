@@ -247,36 +247,21 @@ est verrouillé pour `lock_duration` (NULL = jusqu'à déverrouillage manuel). U
 rôle verrouillé est refusé **même avec le bon mot de passe** : le client reçoit
 `FATAL: role "x" is locked by pg_pass_policy`.
 
-Le compteur et le verrou automatique sont tenus par **nom** de rôle, et
-chaque verrou retient l'OID du rôle verrouillé, chaque compteur celui du rôle
-dont il compte les échecs. Dans le doute, le verrou s'applique (fail-closed) :
-un verrou ne cède que s'il appartient certainement à un autre rôle (OID
-différent, ou pseudo-verrou posé sur un nom qui n'avait pas de rôle quand un
-rôle porte maintenant ce nom). Après `ALTER ROLE … RENAME`, le nouveau nom
-repart de zéro : un verrou déjà recopié dans `role_state` (indexée par OID :
-`lock_role()`, ou verrou automatique déjà audité) suit le rôle, réinjecté sous
-le nouveau nom au tour suivant du worker (LOG « lock of role "…" renamed to
-"…": reloaded from role_state »). Un verrou que `role_state` n'a pas reste
-sous l'ancien nom, sans être perdu, mais ne s'applique pas au nouveau nom :
-verrou automatique que le worker n'a pas encore écrit (audité sous l'ancien
-nom, `role_locked`, `details.role_missing`, et `role_renamed` / `renamed_to`
-quand le nouveau nom est connu, sans être recopié), ou verrou local d'un
-standby (`shmem_lock_role()`). Pour garder un compte bloqué pendant un
-renommage, utiliser `lock_role()`. Un autre rôle créé ensuite sous l'ancien
-nom (`DROP ROLE` puis `CREATE ROLE`) n'hérite ni du verrou ni des compteurs
-de l'ancien (audit `role_recreated`) ; mais tant que l'audit de l'ancien rôle
-est en attente (un tour du worker sur un primaire, jusqu'à la promotion sur
-un standby), sa connexion est **refusée comme verrouillée**, bon mot de passe
-compris : la disponibilité est sacrifiée à la sûreté. Une fois le verrou
-audité, le worker retire de la mémoire partagée le verrou d'un rôle supprimé
-(LOG « lock of dropped role "…" released ») ou d'un rôle renommé dont le
-verrou est persisté. Exception : un `DROP ROLE` suivi d'un `CREATE ROLE` du
-même nom avant le passage de `run_maintenance()`, indiscernable d'une
-restauration : la maintenance (étape a0) comme le rechargement (repli par
-nom, pour un rôle qui n'a pas de ligne `role_state` à son propre OID)
-rattachent alors au nouvel OID, par le nom, les lignes de `role_state` de
-l'ancien, et le nouveau rôle hérite d'un verrou déjà persisté (fail-closed :
-`unlock_role()` le lève).
+Compteurs, verrous et paramètres de profil sont tenus en mémoire partagée
+par **OID** de rôle : un nom qui ne correspond à aucun rôle a une entrée à
+part, indexée par le nom (pseudo-entrée). Après `ALTER ROLE … RENAME`, le
+rôle garde tout sous son nouveau nom, tout de suite, verrou automatique en
+attente d'audit compris (audité sous le nom courant, `details.role_oid`). Un
+autre rôle créé sous un ancien nom (`DROP ROLE` puis `CREATE ROLE`, ou nom
+essayé avant la création du rôle) a son propre OID : il n'hérite ni du
+verrou, ni des compteurs, ni du profil de l'ancien, et se connecte aussitôt.
+Le verrou d'un rôle supprimé est audité (`details.role_dropped`) puis retiré
+par le worker (LOG « lock of dropped role "…" released »). Les lignes de
+`role_state` et `role_profile` portent la grappe qui les a écrites
+(`cluster_id`, `system_identifier` de pg_control) : celles d'un rôle supprimé
+ne sont jamais rattachées par le nom à un rôle recréé ; seules des lignes
+restaurées depuis une autre grappe le sont (voir « Restauration dans un autre
+cluster »).
 
 Seuls les échecs des méthodes où le client présente un mot de passe ou un
 secret sont comptés : `password`, `md5`, `scram-sha-256`, `ldap`, `pam`,
@@ -365,15 +350,18 @@ partagée, il n'écrit pas de ligne `role_unlocked` (le rôle reste verrouillé)
 en mémoire partagée) remet le compteur d'échecs à zéro sans écrire de ligne
 `role_unlocked` ni envoyer de NOTIFY (simple NOTICE).
 Clés de `details` : `role_locked` porte `locked_by` (`auto` / `manual`),
-`locked_until` et `reason` ; `role_unlocked` porte `unlocked_by` (`auto` pour
+`locked_until` et `reason`, plus, pour un verrou automatique, `role_oid` et,
+si le rôle a été supprimé avant l'audit, `role_dropped` ; `role_unlocked` porte `unlocked_by` (`auto` pour
 l'expiration levée par `run_maintenance()`, `manual` pour `unlock_role()`). Les échecs sur des noms de
 rôles inexistants sont journalisés en une seule ligne `auth_failed` par tour
 du worker (`role_name` NULL, `details.unknown_roles` et `details.attempts`).
-De même, `failed_attempts()` ne nomme ces entrées que pour un
-superutilisateur (l'existence du nom est vérifiée à chaque appel : un rôle
-créé ou renommé sous ce nom apparaît aussitôt par son nom) : un nom saisi dans le champ utilisateur peut être un mot de
-passe. Les autres appelants (`pass_policy_viewer`, `pass_policy_admin`) en
-reçoivent une seule ligne de `role_name` NULL (compteurs additionnés).
+`failed_attempts()` donne pour chaque entrée sa clé (`role_oid`, NULL pour un
+nom sans rôle) et le nom courant du rôle ; elle ne nomme les entrées des noms
+inexistants que pour un superutilisateur : un nom saisi dans le champ
+utilisateur peut être un mot de passe. Les autres appelants
+(`pass_policy_viewer`, `pass_policy_admin`) en reçoivent une seule ligne de
+`role_name` et `role_oid` NULL (compteurs additionnés), y compris pour un nom
+qu'un rôle porte depuis (ses propres échecs ont leur ligne).
 `lock_role()` refuse un rôle de `exempt_roles` (`22023`) : le hook ignore le
 verrou d'un rôle exempté, qui s'appliquerait par surprise à sa sortie de la
 liste.
@@ -507,10 +495,18 @@ compte comme « spécial ».
   `pg_authid.rolpassword` et prend la date de la restauration comme date de
   changement des rôles restaurés (le compte à rebours de `max_age` repart de là).
 - **Restauration dans un autre cluster** : les OID des rôles changent, et
-  l'ancien OID d'un rôle peut appartenir à un autre. `run_maintenance()` suit
-  les OID (dans un cluster vivant, un OID existant sous un autre nom est un
-  renommage) : laissé seul, il réétiquetterait les verrous, profils et
-  historiques d'un rôle au nom de celui qui a hérité de son OID. Procédure :
+  l'ancien OID d'un rôle peut appartenir à un autre. Les lignes de
+  `role_state` et `role_profile` portent la grappe qui les a écrites
+  (`cluster_id`) : restaurées dans une grappe d'un autre `system_identifier`
+  (autre `initdb`, `pg_upgrade`), elles sont rattachées au rôle de leur nom,
+  sinon à leur OID s'il existe, par le rechargement du worker puis par
+  l'étape a0 de `run_maintenance()` ; une ligne dont le rôle est introuvable
+  reste en place sans s'appliquer. Une **grappe clonée** (`pg_basebackup`,
+  copie de fichiers) a le même `system_identifier` : ses lignes passent pour
+  locales, rattachées par OID seulement, et `run_maintenance()` laissé seul
+  réétiquetterait les verrous, profils et historiques d'un rôle au nom de
+  celui qui a hérité de son OID. Dans ce cas, et par précaution dans tous
+  les cas, procédure :
   1. `pg_pass_policy.enabled = off` (`ALTER SYSTEM` + `pg_reload_conf()`) :
      ni contrôle des mots de passe pré-hachés, ni tour du worker pendant la
      restauration (le worker est suspendu : ni `run_maintenance()`, ni
@@ -522,8 +518,9 @@ compte comme « spécial ».
      **avant** le premier `run_maintenance()` : chaque ligne de `role_state`,
      `role_profile` et `password_history` dont le couple (OID, nom) ne
      correspond à aucun rôle est rattachée au rôle de ce nom (`rebind`), ou
-     supprimée si aucun rôle ne porte ce nom (`purge`) ; une ligne
-     `maintenance` est écrite dans l'audit ;
+     supprimée si aucun rôle ne porte ce nom (`purge`), et devient une ligne
+     de la grappe (`cluster_id`) ; une ligne `maintenance` est écrite dans
+     l'audit ;
   4. remettre `enabled` à `on` (et réactiver la planification éventuelle) :
      le premier tour du worker recharge la mémoire partagée depuis les
      tables restaurées.

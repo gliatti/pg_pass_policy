@@ -136,13 +136,54 @@ CREATE TABLE profile (
 );
 COMMENT ON TABLE profile IS 'Password policy profiles; "default" applies to every role without an assignment';
 
+/*
+ * Origin of the rows of role_profile and role_state (SPEC §6.3,
+ * "Rechargement").  _system_identifier() is the system identifier of
+ * pg_control (GetSystemIdentifier()), the default of their cluster_id
+ * column: shared by a physical replica and a promoted standby, different in
+ * any other cluster (initdb, pg_upgrade).  pg_dump carries the value, so the
+ * rows restored into another cluster are told apart: their role_oid may be
+ * the OID of another role there.
+ *
+ * _resolve_role_oid(): the existing role a row of these tables belongs to,
+ * NULL if none.  A row of this cluster belongs to its OID only (a role
+ * dropped then created again under the same name is another role); a row
+ * restored from another cluster belongs (1) to the role that bears its
+ * name, or else (2) to its OID if it exists (pg_upgrade keeps the OIDs of
+ * pg_authid, binary_upgrade_set_next_pg_authid_oid(), and the name may be
+ * stale), or else (3) to nobody: it is neither applied nor purged
+ * automatically.  Used by the worker (reload) and by step a0 of
+ * run_maintenance(), which turns the resolved restored rows into rows of
+ * this cluster.
+ */
+CREATE FUNCTION _system_identifier()
+RETURNS bigint
+AS 'MODULE_PATHNAME', 'ppp_system_identifier'
+LANGUAGE C STABLE STRICT PARALLEL SAFE;
+COMMENT ON FUNCTION _system_identifier() IS 'Internal: system identifier of pg_control (origin of the role_state and role_profile rows)';
+
+CREATE FUNCTION _resolve_role_oid(p_oid oid, p_name text, p_cluster_id bigint)
+RETURNS oid
+LANGUAGE sql STABLE
+SET search_path = pg_catalog, pg_temp
+AS $$
+    SELECT CASE WHEN p_cluster_id = pass_policy._system_identifier()
+                THEN (SELECT a.oid FROM pg_catalog.pg_authid a WHERE a.oid = p_oid)
+                ELSE coalesce((SELECT a.oid FROM pg_catalog.pg_authid a WHERE a.rolname = p_name::name),
+                              (SELECT a.oid FROM pg_catalog.pg_authid a WHERE a.oid = p_oid))
+           END
+$$;
+COMMENT ON FUNCTION _resolve_role_oid(oid, text, bigint) IS 'Internal: role a role_state / role_profile row belongs to (by OID in this cluster; restored row: by name, else by OID)';
+
 -- 3.2 role_profile
 CREATE TABLE role_profile (
     role_oid    oid PRIMARY KEY,
     role_name   text NOT NULL,
     profile_id  int NOT NULL REFERENCES profile (profile_id),
     assigned_at timestamptz NOT NULL DEFAULT now(),
-    assigned_by text
+    assigned_by text,
+    -- Addition to SPEC §3.2: origin of the row (see _resolve_role_oid())
+    cluster_id  bigint NOT NULL DEFAULT pass_policy._system_identifier()
 );
 CREATE INDEX role_profile_profile_idx ON role_profile (profile_id);
 COMMENT ON TABLE role_profile IS 'Profile assigned to a role (no row = default profile)';
@@ -165,7 +206,9 @@ CREATE TABLE role_state (
     -- pg_authid differ (different SCRAM salt); this flag tells
     -- run_maintenance() that the mismatch is expected and that the history
     -- row must simply be replaced by the stored verifier.
-    verifier_pending    bool NOT NULL DEFAULT false
+    verifier_pending    bool NOT NULL DEFAULT false,
+    -- Addition to SPEC §3.3: origin of the row (see _resolve_role_oid())
+    cluster_id          bigint NOT NULL DEFAULT pass_policy._system_identifier()
 );
 CREATE INDEX role_state_locked_idx ON role_state (locked_until) WHERE locked_until IS NOT NULL;
 COMMENT ON TABLE role_state IS 'Per-role password lifecycle and lock state';
@@ -251,8 +294,10 @@ COMMENT ON TABLE rotation_pair IS 'Zero-downtime rotation pairs: two login roles
  *     existing row (settings of the dump win) instead of being inserted ;
  *   - dictionary: words are lower-cased and duplicates are silently skipped.
  * Caveat: a data-only restore with --disable-triggers bypasses this.
- * Role OIDs differ between clusters: run_maintenance() re-maps role_oid by
- * role name (pg_dumpall --globals restores the roles by name).
+ * Role OIDs differ between clusters: the rows of role_state and
+ * role_profile carry the cluster they were written in (cluster_id), and
+ * step a0 of run_maintenance() re-maps the restored ones by role name
+ * (pg_dumpall --globals restores the roles by name).
  */
 CREATE FUNCTION _profile_restore_trg() RETURNS trigger
 LANGUAGE plpgsql
@@ -390,9 +435,11 @@ AS 'MODULE_PATHNAME', 'ppp_generate_password_for'
 LANGUAGE C VOLATILE PARALLEL RESTRICTED;
 COMMENT ON FUNCTION _generate_password_for(name, int, text) IS 'Internal: generate_password() whose draws never contain the role name (PPP-017)';
 
+-- role_oid (addition to SPEC §4): key of the entry, NULL for a user name
+-- that matched no role (role_name then NULL too for non-superusers)
 CREATE FUNCTION failed_attempts()
 RETURNS TABLE (role_name text, failed_count int, first_failure_at timestamptz,
-               last_failure_at timestamptz, locked_until timestamptz)
+               last_failure_at timestamptz, locked_until timestamptz, role_oid oid)
 AS 'MODULE_PATHNAME', 'ppp_failed_attempts'
 LANGUAGE C VOLATILE PARALLEL SAFE;
 COMMENT ON FUNCTION failed_attempts() IS 'Authentication failure counters and locks held in shared memory';
@@ -403,6 +450,16 @@ AS 'MODULE_PATHNAME', 'ppp_shmem_reload'
 LANGUAGE C VOLATILE;
 COMMENT ON FUNCTION shmem_reload() IS 'Asks the worker to reload lockout parameters into shared memory';
 
+/*
+ * shmem_lock_role(), shmem_unlock_role(), shmem_reset_failures(): direct use
+ * by a superuser (standby included), by role name: its OID, or, for unlock
+ * and reset without a role of that name, the pseudo-entry of the name.  The
+ * SQL API (lock_role(), unlock_role(), run_maintenance()) goes through the
+ * internal _shmem_lock(), _shmem_unlock() and _shmem_reset(), which take the
+ * OID it has checked: a rename in between cannot make it lock another role
+ * in shared memory than in role_state.  Not regrole: it parses identifiers
+ * ('Alice' would become alice).
+ */
 -- Not STRICT: until NULL = manual lock (DT_NOEND).
 CREATE FUNCTION shmem_lock_role(role text, until timestamptz DEFAULT NULL)
 RETURNS void
@@ -425,12 +482,31 @@ AS 'MODULE_PATHNAME', 'ppp_shmem_reset_failures'
 LANGUAGE C STRICT VOLATILE;
 COMMENT ON FUNCTION shmem_reset_failures(text) IS 'Resets the shared-memory failure counter of a role';
 
+-- Not STRICT: until NULL = manual lock (DT_NOEND).
+CREATE FUNCTION _shmem_lock(role oid, until timestamptz DEFAULT NULL)
+RETURNS void
+AS 'MODULE_PATHNAME', 'ppp_shmem_lock_oid'
+LANGUAGE C VOLATILE;
+COMMENT ON FUNCTION _shmem_lock(oid, timestamptz) IS 'Internal: shmem_lock_role() for a role OID (superuser)';
+
+CREATE FUNCTION _shmem_unlock(role oid, expired_only boolean DEFAULT false)
+RETURNS bool
+AS 'MODULE_PATHNAME', 'ppp_shmem_unlock_oid'
+LANGUAGE C STRICT VOLATILE;
+COMMENT ON FUNCTION _shmem_unlock(oid, boolean) IS 'Internal: shmem_unlock_role() for a role OID (superuser)';
+
+CREATE FUNCTION _shmem_reset(role oid)
+RETURNS void
+AS 'MODULE_PATHNAME', 'ppp_shmem_reset_oid'
+LANGUAGE C STRICT VOLATILE;
+COMMENT ON FUNCTION _shmem_reset(oid) IS 'Internal: shmem_reset_failures() for a role OID (superuser)';
+
 -- Addition to SPEC §4: used by unlock_role() (was the role locked in shmem?)
-CREATE FUNCTION _shmem_is_locked(role text)
+CREATE FUNCTION _shmem_is_locked(role oid)
 RETURNS bool
 AS 'MODULE_PATHNAME', 'ppp_shmem_is_locked'
 LANGUAGE C STRICT VOLATILE;
-COMMENT ON FUNCTION _shmem_is_locked(text) IS 'Internal: true if shared memory holds an active lock of the role (superuser)';
+COMMENT ON FUNCTION _shmem_is_locked(oid) IS 'Internal: true if shared memory holds an active lock of the role OID (superuser)';
 
 CREATE FUNCTION worker_status()
 RETURNS TABLE (pid int, last_run timestamptz, last_reload timestamptz, tracked_roles int,
@@ -660,25 +736,25 @@ COMMENT ON FUNCTION _require_not_exempt(name) IS 'Internal: raises 22023 if the 
  * with its window): their failures are downgraded to WARNINGs so that they
  * never break maintenance or administration.
  */
-CREATE FUNCTION _shmem(p_op text, p_role text DEFAULT NULL, p_until timestamptz DEFAULT NULL)
+CREATE FUNCTION _shmem(p_op text, p_oid oid DEFAULT NULL, p_until timestamptz DEFAULT NULL)
 RETURNS bool
 LANGUAGE plpgsql
 SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN
     CASE p_op
-        WHEN 'lock'   THEN PERFORM pass_policy.shmem_lock_role(p_role, p_until);
+        WHEN 'lock'   THEN PERFORM pass_policy._shmem_lock(p_oid, p_until);
                            RETURN true;
-        WHEN 'unlock' THEN PERFORM pass_policy.shmem_unlock_role(p_role);
+        WHEN 'unlock' THEN PERFORM pass_policy._shmem_unlock(p_oid);
                            RETURN true;
         -- false: an active (newer) lock is held, nothing is lifted
-        WHEN 'unlock_expired' THEN RETURN pass_policy.shmem_unlock_role(p_role, true);
+        WHEN 'unlock_expired' THEN RETURN pass_policy._shmem_unlock(p_oid, true);
         ELSE NULL;
     END CASE;
     BEGIN
         CASE p_op
             WHEN 'reload' THEN PERFORM pass_policy.shmem_reload();
-            WHEN 'reset'  THEN PERFORM pass_policy.shmem_reset_failures(p_role);
+            WHEN 'reset'  THEN PERFORM pass_policy._shmem_reset(p_oid);
         END CASE;
     EXCEPTION WHEN OTHERS THEN
         RAISE WARNING 'pg_pass_policy: shared memory call "%" failed: %', p_op, SQLERRM;
@@ -687,7 +763,7 @@ BEGIN
     RETURN true;
 END
 $$;
-COMMENT ON FUNCTION _shmem(text, text, timestamptz) IS 'Internal: calls a shmem_* C function; lock/unlock errors are raised, reload/reset errors become warnings';
+COMMENT ON FUNCTION _shmem(text, oid, timestamptz) IS 'Internal: calls a shmem_* C function; lock/unlock errors are raised, reload/reset errors become warnings';
 
 -- Internal audit writer (no permission check: only called by trusted code).
 CREATE FUNCTION _audit(p_event_type text, p_role_name text, p_details jsonb DEFAULT '{}')
@@ -1244,9 +1320,12 @@ BEGIN
     END IF;
     INSERT INTO pass_policy.role_profile AS rp (role_oid, role_name, profile_id, assigned_at, assigned_by)
     VALUES (v_oid, v_role, v_pid, now(), session_user)
+    -- the whole row is replaced: a restored row of that OID (cluster_id of
+    -- another cluster) becomes a row of this cluster
     ON CONFLICT (role_oid) DO UPDATE
        SET role_name = EXCLUDED.role_name, profile_id = EXCLUDED.profile_id,
-           assigned_at = EXCLUDED.assigned_at, assigned_by = EXCLUDED.assigned_by;
+           assigned_at = EXCLUDED.assigned_at, assigned_by = EXCLUDED.assigned_by,
+           cluster_id = EXCLUDED.cluster_id;
     PERFORM pass_policy._refresh_role_state(v_oid);
     PERFORM pass_policy._audit('profile_assigned', v_role, jsonb_build_object('profile', $2));
     PERFORM pass_policy._shmem('reload');
@@ -1454,7 +1533,9 @@ BEGIN
     UPDATE pass_policy.role_state s
        SET locked_until = v_until, locked_by = 'manual', lock_reason = $3
      WHERE s.role_oid = v_oid;
-    PERFORM pass_policy._shmem('lock', v_role::text, CASE WHEN $2 IS NULL THEN NULL ELSE v_until END);
+    -- the OID checked above, not the name (a rename in between would lock
+    -- another role in shared memory than in role_state)
+    PERFORM pass_policy._shmem('lock', v_oid, CASE WHEN $2 IS NULL THEN NULL ELSE v_until END);
     PERFORM pass_policy._audit('role_locked', v_role,
             jsonb_build_object('locked_by', 'manual', 'locked_until', v_until, 'reason', $3));
     RETURN v_until;
@@ -1487,18 +1568,18 @@ BEGIN
     -- Was the role locked?  In role_state (row locked by _ensure_state()),
     -- even with an expired lock not yet cleaned by run_maintenance(), or in
     -- shared memory only (automatic lock still waiting for the worker).
-    -- shmem_unlock_role() without expired_only always queues the unlock and
-    -- returns true: _shmem_is_locked() (HASH_FIND of this role) is asked.
+    -- _shmem_unlock() without expired_only always queues the unlock and
+    -- returns true: _shmem_is_locked() (HASH_FIND of this OID) is asked.
     v_locked := (SELECT s.locked_until IS NOT NULL FROM pass_policy.role_state s
                   WHERE s.role_oid = v_oid)
-                OR pass_policy._shmem_is_locked(v_role::text);
+                OR pass_policy._shmem_is_locked(v_oid);
     UPDATE pass_policy.role_state s
        SET locked_until = NULL, locked_by = NULL, lock_reason = NULL
      WHERE s.role_oid = v_oid;
     -- queued in any case (harmless without a lock); the failure counter is
     -- reset even if the role was not locked
-    PERFORM pass_policy._shmem('unlock', v_role::text);
-    PERFORM pass_policy._shmem('reset', v_role::text);
+    PERFORM pass_policy._shmem('unlock', v_oid);
+    PERFORM pass_policy._shmem('reset', v_oid);
     -- no audit row nor NOTIFY when there was nothing to unlock
     IF NOT coalesce(v_locked, false) THEN
         RAISE NOTICE 'pg_pass_policy: role "%" is not locked', v_role;
@@ -1669,9 +1750,10 @@ COMMENT ON FUNCTION switch_rotation_pair(text, int) IS 'Rotates a pair: new pass
 /*
  * run_maintenance(): one pass of what the background worker does; may also
  * be scheduled with pg_cron (runs fine without the worker / shmem).
- *  a0. re-map by role name the rows whose role_oid no longer exists
- *      (restore on another cluster, CREATE ROLE ... PASSWORD), then follow
- *      role renames ;
+ *  a0. re-map the rows restored from another cluster (cluster_id) to the
+ *      role found by _resolve_role_oid(), and by role name the history
+ *      rows whose role_oid no longer exists (restore, CREATE ROLE ...
+ *      PASSWORD), then follow role renames ;
  *  a.  purge rows of roles that no longer exist ;
  *  b.  reconcile pg_authid.rolpassword with the history ;
  *  c.  recompute expires_at / grace_until ;
@@ -1701,6 +1783,10 @@ DECLARE
     v_summary  jsonb := '{}';
     v_actions  int := 0;
     v_exempt   oid[];
+    v_cluster  bigint;
+    v_rows     jsonb[];
+    v_j        jsonb;
+    v_merged   bool;
 BEGIN
     PERFORM pass_policy._require_admin();
     -- One pass at a time (worker, pg_cron, manual call): two concurrent
@@ -1716,40 +1802,75 @@ BEGIN
     END IF;
 
     ---------------------------------------------------------------- a0
-    -- Orphaned rows (their OID no longer exists) whose role_name exists with
-    -- another OID get that OID: restore on another cluster (OIDs differ,
-    -- names are kept).  A row whose OID still exists is never re-mapped,
-    -- even if another role now carries its former name (rename, then
-    -- creation of a role with the old name): locks, profile and history
-    -- follow the OID, and the renames below update the name.
-    -- Limit: a role dropped and re-created with the same name between two
-    -- passes cannot be told from a restore and inherits the rows.
-    FOR r IN
-        SELECT 'role_state' AS tbl, s.role_oid AS old_oid, a.oid AS new_oid, s.role_name AS rname
-          FROM pass_policy.role_state s JOIN pg_catalog.pg_authid a ON a.rolname = s.role_name
-         WHERE a.oid <> s.role_oid
-           AND NOT EXISTS (SELECT FROM pg_catalog.pg_authid o WHERE o.oid = s.role_oid)
-        UNION ALL
-        SELECT 'role_profile', p.role_oid, a.oid, p.role_name
-          FROM pass_policy.role_profile p JOIN pg_catalog.pg_authid a ON a.rolname = p.role_name
-         WHERE a.oid <> p.role_oid
-           AND NOT EXISTS (SELECT FROM pg_catalog.pg_authid o WHERE o.oid = p.role_oid)
+    -- Rows restored from another cluster (cluster_id differs, see
+    -- _resolve_role_oid()) whose role is found get its OID and become rows
+    -- of this cluster: by name first (OIDs differ between clusters, names
+    -- are kept), else by their own OID if it exists (pg_upgrade).  The
+    -- resolved rows are all removed first, then inserted again, so that two
+    -- rows exchanging their OIDs are handled whatever the order.  A row of
+    -- this cluster already held by the target role wins, except for the
+    -- lock of role_state: the longest one is kept (fail-closed).  A restored
+    -- row whose role is not found is left as it is (neither applied nor
+    -- purged).  A row of this cluster is never re-mapped, even if its OID
+    -- no longer exists and another role now bears its name (dropped then
+    -- created again): locks, profile and history follow the OID, step a
+    -- purges it, and the renames below update the name.
+    v_cluster := pass_policy._system_identifier();
+    WITH d AS (
+        DELETE FROM pass_policy.role_state s
+         WHERE s.cluster_id <> v_cluster
+           AND pass_policy._resolve_role_oid(s.role_oid, s.role_name, s.cluster_id) IS NOT NULL
+        RETURNING pg_catalog.to_jsonb(s) AS j,
+                  pass_policy._resolve_role_oid(s.role_oid, s.role_name, s.cluster_id) AS new_oid)
+    SELECT pg_catalog.array_agg(d.j || jsonb_build_object('new_oid', d.new_oid, 'new_name', a.rolname)
+                                ORDER BY d.new_oid, d.j->>'role_oid')
+      INTO v_rows
+      FROM d JOIN pg_catalog.pg_authid a ON a.oid = d.new_oid;
+    FOREACH v_j IN ARRAY coalesce(v_rows, '{}')
     LOOP
-        IF r.tbl = 'role_state' THEN
-            IF EXISTS (SELECT FROM pass_policy.role_state x WHERE x.role_oid = r.new_oid) THEN
-                DELETE FROM pass_policy.role_state x WHERE x.role_oid = r.old_oid;
-            ELSE
-                UPDATE pass_policy.role_state x SET role_oid = r.new_oid WHERE x.role_oid = r.old_oid;
-            END IF;
-        ELSE
-            IF EXISTS (SELECT FROM pass_policy.role_profile x WHERE x.role_oid = r.new_oid) THEN
-                DELETE FROM pass_policy.role_profile x WHERE x.role_oid = r.old_oid;
-            ELSE
-                UPDATE pass_policy.role_profile x SET role_oid = r.new_oid WHERE x.role_oid = r.old_oid;
-            END IF;
-        END IF;
-        action := 'remap'; role_name := r.rname;
-        details := jsonb_build_object('table', r.tbl, 'old_oid', r.old_oid, 'new_oid', r.new_oid);
+        v_merged := EXISTS (SELECT FROM pass_policy.role_state x
+                             WHERE x.role_oid = (v_j->>'new_oid')::oid);
+        INSERT INTO pass_policy.role_state AS x
+        SELECT (jsonb_populate_record(NULL::pass_policy.role_state,
+                v_j || jsonb_build_object('role_oid', v_j->'new_oid', 'role_name', v_j->'new_name',
+                                          'cluster_id', v_cluster))).*
+        ON CONFLICT (role_oid) DO UPDATE
+           SET locked_until = CASE WHEN EXCLUDED.locked_until > coalesce(x.locked_until, '-infinity')
+                                   THEN EXCLUDED.locked_until ELSE x.locked_until END,
+               locked_by    = CASE WHEN EXCLUDED.locked_until > coalesce(x.locked_until, '-infinity')
+                                   THEN EXCLUDED.locked_by ELSE x.locked_by END,
+               lock_reason  = CASE WHEN EXCLUDED.locked_until > coalesce(x.locked_until, '-infinity')
+                                   THEN EXCLUDED.lock_reason ELSE x.lock_reason END;
+        action := 'remap'; role_name := v_j->>'new_name';
+        details := jsonb_build_object('table', 'role_state', 'old_oid', (v_j->>'role_oid')::oid,
+                                      'new_oid', (v_j->>'new_oid')::oid)
+                   || CASE WHEN v_merged THEN '{"merged":true}'::jsonb ELSE '{}' END;
+        v_actions := v_actions + 1;
+        RETURN NEXT;
+    END LOOP;
+    v_rows := NULL;
+    WITH d AS (
+        DELETE FROM pass_policy.role_profile p
+         WHERE p.cluster_id <> v_cluster
+           AND pass_policy._resolve_role_oid(p.role_oid, p.role_name, p.cluster_id) IS NOT NULL
+        RETURNING pg_catalog.to_jsonb(p) AS j,
+                  pass_policy._resolve_role_oid(p.role_oid, p.role_name, p.cluster_id) AS new_oid)
+    SELECT pg_catalog.array_agg(d.j || jsonb_build_object('new_oid', d.new_oid, 'new_name', a.rolname)
+                                ORDER BY d.new_oid, d.j->>'role_oid')
+      INTO v_rows
+      FROM d JOIN pg_catalog.pg_authid a ON a.oid = d.new_oid;
+    FOREACH v_j IN ARRAY coalesce(v_rows, '{}')
+    LOOP
+        INSERT INTO pass_policy.role_profile
+        SELECT (jsonb_populate_record(NULL::pass_policy.role_profile,
+                v_j || jsonb_build_object('role_oid', v_j->'new_oid', 'role_name', v_j->'new_name',
+                                          'cluster_id', v_cluster))).*
+        ON CONFLICT (role_oid) DO NOTHING;
+        v_merged := NOT FOUND;
+        action := 'remap'; role_name := v_j->>'new_name';
+        details := jsonb_build_object('table', 'role_profile', 'old_oid', (v_j->>'role_oid')::oid,
+                                      'new_oid', (v_j->>'new_oid')::oid)
+                   || CASE WHEN v_merged THEN '{"merged":true}'::jsonb ELSE '{}' END;
         v_actions := v_actions + 1;
         RETURN NEXT;
     END LOOP;
@@ -1758,21 +1879,26 @@ BEGIN
      WHERE a.rolname = h.role_name AND h.role_oid IS DISTINCT FROM a.oid
        AND (h.role_oid IS NULL
             OR NOT EXISTS (SELECT FROM pg_catalog.pg_authid o WHERE o.oid = h.role_oid));
-    -- renames: the OID still exists under another name
+    -- renames: the OID still exists under another name (rows of this
+    -- cluster only: a restored row left by a0 belongs to nobody yet)
     UPDATE pass_policy.role_state s SET role_name = a.rolname
       FROM pg_catalog.pg_authid a
-     WHERE a.oid = s.role_oid AND a.rolname <> s.role_name;
+     WHERE a.oid = s.role_oid AND a.rolname <> s.role_name AND s.cluster_id = v_cluster;
     UPDATE pass_policy.role_profile p SET role_name = a.rolname
       FROM pg_catalog.pg_authid a
-     WHERE a.oid = p.role_oid AND a.rolname <> p.role_name;
+     WHERE a.oid = p.role_oid AND a.rolname <> p.role_name AND p.cluster_id = v_cluster;
     UPDATE pass_policy.password_history h SET role_name = a.rolname
       FROM pg_catalog.pg_authid a
      WHERE a.oid = h.role_oid AND a.rolname <> h.role_name;
 
     ---------------------------------------------------------------- a
+    -- rows of this cluster only: a restored row whose role was not found by
+    -- a0 is kept (a role may be created under its name later, or
+    -- rebind_restored_roles() purges it)
     FOR r IN
         DELETE FROM pass_policy.role_state s
-         WHERE NOT EXISTS (SELECT FROM pg_catalog.pg_authid a WHERE a.oid = s.role_oid)
+         WHERE s.cluster_id = v_cluster
+           AND NOT EXISTS (SELECT FROM pg_catalog.pg_authid a WHERE a.oid = s.role_oid)
         RETURNING s.role_name AS rname
     LOOP
         action := 'purge'; role_name := r.rname; details := '{"table":"role_state"}';
@@ -1781,7 +1907,8 @@ BEGIN
     END LOOP;
     FOR r IN
         DELETE FROM pass_policy.role_profile p
-         WHERE NOT EXISTS (SELECT FROM pg_catalog.pg_authid a WHERE a.oid = p.role_oid)
+         WHERE p.cluster_id = v_cluster
+           AND NOT EXISTS (SELECT FROM pg_catalog.pg_authid a WHERE a.oid = p.role_oid)
         RETURNING p.role_name AS rname
     LOOP
         action := 'purge'; role_name := r.rname; details := '{"table":"role_profile"}';
@@ -1989,10 +2116,10 @@ BEGIN
     END LOOP;
 
     ---------------------------------------------------------------- f
-    -- The shared memory is keyed by the current role name: taken from
-    -- pg_authid (role_state.role_name is refreshed by step a0 too, but the
-    -- name used for the unlock and the audit must never be a stale one).
-    -- Rows of dropped roles were purged by step a.
+    -- The shared memory is keyed by the OID; the audit names the role by its
+    -- current name, taken from pg_authid (role_state.role_name is refreshed
+    -- above too, but it must never be a stale one).  Rows of dropped roles
+    -- were purged by step a.
     -- 'unlock_expired': the shared memory may hold a newer automatic lock
     -- that role_state does not know yet (new failures after the expiry,
     -- before or during this pass): only an expired lock is lifted there.
@@ -2002,12 +2129,12 @@ BEGIN
                role_name = a.rolname
           FROM pg_catalog.pg_authid a
          WHERE a.oid = s.role_oid AND s.locked_until < now()
-        RETURNING a.rolname::text AS rname
+        RETURNING s.role_oid, a.rolname::text AS rname
     -- An unlock refused by the shared memory (active newer lock, false) is
     -- neither audited nor returned: the role is still locked, and the
     -- worker copies the newer lock to role_state at its next cycle.
     LOOP
-        IF pass_policy._shmem('unlock_expired', r.rname) THEN
+        IF pass_policy._shmem('unlock_expired', r.role_oid) THEN
             PERFORM pass_policy._audit('role_unlocked', r.rname, '{"unlocked_by":"auto"}');
             action := 'role_unlocked'; role_name := r.rname; details := '{"unlocked_by":"auto"}';
             v_actions := v_actions + 1;
@@ -2030,11 +2157,15 @@ COMMENT ON FUNCTION run_maintenance() IS 'One maintenance pass (worker or pg_cro
 
 /*
  * rebind_restored_roles(): explicit repair after restoring the extension
- * tables into ANOTHER cluster (pg_dump / pg_restore), where the role OIDs
- * differ.  run_maintenance() step a0 cannot do it: in a live cluster OIDs
- * are stable, so a row whose OID exists under another name is a rename and
- * the OID wins (SPEC §11 S3).  After a restore, the former OID of a role X
- * may belong to another role Y: a0 would relabel the rows of X as rows of Y.
+ * tables into another cluster whose role OIDs differ (pg_dump /
+ * pg_restore).  run_maintenance() step a0 re-maps by name the rows restored
+ * from a cluster of another system identifier (cluster_id) only: a clone of
+ * this cluster (pg_basebackup, file copy) has the same one, its rows look
+ * like rows of this cluster, whose OIDs are stable (a row whose OID exists
+ * under another name is a rename and the OID wins, SPEC §11 S3).  After a
+ * restore into such a clone, the former OID of a role X may belong to
+ * another role Y: only this function, called on purpose, rebinds the rows
+ * of X by name.
  *
  * Every row of role_state, role_profile and password_history whose pair
  * (role_oid, role_name) matches no pg_authid row is rebound BY NAME: the
@@ -2044,7 +2175,9 @@ COMMENT ON FUNCTION run_maintenance() IS 'One maintenance pass (worker or pg_cro
  * wins).  For role_state and role_profile (primary key role_oid), all the
  * mismatched rows are first removed (DELETE ... RETURNING, kept in an
  * array) and then inserted again (INSERT ... ON CONFLICT DO NOTHING), so
- * that two rows exchanging their OIDs are handled whatever the order.
+ * that two rows exchanging their OIDs are handled whatever the order; the
+ * rows inserted again become rows of this cluster (cluster_id), and so do
+ * the restored rows whose pair matches.
  * rotation_pair holds role names only: nothing to rebind (run_maintenance()
  * purges the pairs whose roles do not exist).
  *
@@ -2096,7 +2229,8 @@ BEGIN
         EXECUTE format(
             'WITH i AS (INSERT INTO pass_policy.%1$I'
             '           SELECT (pg_catalog.jsonb_populate_record(NULL::pass_policy.%1$I,'
-            '                   u.j OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_object(''role_oid'', u.j->''new_oid''))).*'
+            '                   u.j OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_object(''role_oid'', u.j->''new_oid'','
+            '                                                                     ''cluster_id'', pass_policy._system_identifier()))).*'
             '             FROM pg_catalog.unnest($1) u(j)'
             '            WHERE u.j->>''new_oid'' IS NOT NULL'
             '           ON CONFLICT (role_oid) DO NOTHING'
@@ -2124,6 +2258,14 @@ BEGIN
             RETURN NEXT;
         END LOOP;
     END LOOP;
+
+    -- restored rows whose pair matches a role: rows of this cluster from now on
+    UPDATE pass_policy.role_state t SET cluster_id = pass_policy._system_identifier()
+     WHERE t.cluster_id <> pass_policy._system_identifier()
+       AND EXISTS (SELECT FROM pg_catalog.pg_authid o WHERE o.oid = t.role_oid AND o.rolname = t.role_name);
+    UPDATE pass_policy.role_profile t SET cluster_id = pass_policy._system_identifier()
+     WHERE t.cluster_id <> pass_policy._system_identifier()
+       AND EXISTS (SELECT FROM pg_catalog.pg_authid o WHERE o.oid = t.role_oid AND o.rolname = t.role_name);
 
     -- password_history: no key on role_oid, plain UPDATE / DELETE
     FOR r IN
@@ -2157,7 +2299,7 @@ BEGIN
         PERFORM pass_policy._audit('maintenance', NULL,
                 jsonb_build_object('rebind_restored_roles',
                                    jsonb_build_object('rebound_rows', v_rebound, 'purged_rows', v_purged)));
-        -- locks and profiles are keyed by name in shared memory
+        -- locks and profiles are keyed by OID in shared memory
         PERFORM pass_policy._shmem('reload');
     END IF;
     RETURN;
@@ -2218,7 +2360,7 @@ SELECT q.role_name, q.profile, q.password_changed_at, q.expires_at, q.grace_unti
                   FROM pg_catalog.pg_roles r
                   JOIN _role_effective_profile e ON e.role_oid = r.oid
                   LEFT JOIN role_state s ON s.role_oid = r.oid
-                  LEFT JOIN failed_attempts() f ON f.role_name = r.rolname
+                  LEFT JOIN failed_attempts() f ON f.role_oid = r.oid
                  WHERE r.rolcanlogin) p) q;
 COMMENT ON VIEW v_role_status IS 'Password and lock status of every login role (status: locked > exempt > expiry_state; is_exempt: listed in exempt_roles; expiry_state: computed regardless of lock and exemption; valid_until: rolvaliduntil; role_oid: join key for role_state)';
 

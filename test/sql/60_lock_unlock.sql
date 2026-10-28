@@ -90,20 +90,42 @@ SELECT pass_policy.shmem_reload();
 SELECT ppp_test.try($$SELECT pass_policy.shmem_lock_role('regress_no_such_role', NULL)$$) AS shmem_lock_missing;
 SELECT count(*) AS missing_tracked FROM pass_policy.failed_attempts()
  WHERE role_name = 'regress_no_such_role';
--- Rôle renommé dans la même transaction : COMMIT accepté, verrou posé sous
--- l'ancien nom avec l'OID capturé à l'appel (vérification 14) ; le nettoyage
--- du worker gère ensuite le renommage
-CREATE ROLE regress_lock_ren;
+-- Rôle renommé dans la même transaction : COMMIT accepté, verrou posé sur
+-- l'OID capturé à l'appel ; la mémoire partagée est indexée par OID
+-- (vérification 15) : le verrou est affiché sous le nom courant, et l'ancien
+-- nom, sans rôle, désigne une pseudo-entrée (déverrouillage sans effet)
+CREATE ROLE regress_lock_ren LOGIN;
 BEGIN;
 SELECT pass_policy.shmem_lock_role('regress_lock_ren', NULL);
 ALTER ROLE regress_lock_ren RENAME TO regress_lock_ren2;
 COMMIT;
-SELECT role_name, locked_until = 'infinity' AS locked FROM pass_policy.failed_attempts()
+SELECT role_name, locked_until = 'infinity' AS locked,
+       role_oid = 'regress_lock_ren2'::regrole::oid AS oid_ok
+  FROM pass_policy.failed_attempts()
  WHERE role_name IN ('regress_lock_ren', 'regress_lock_ren2');
 SELECT pass_policy.shmem_unlock_role('regress_lock_ren', false);
-DROP ROLE regress_lock_ren2;
+SELECT count(*) AS still_locked FROM pass_policy.failed_attempts()
+ WHERE role_name = 'regress_lock_ren2' AND locked_until IS NOT NULL;
+SELECT pass_policy.shmem_unlock_role('regress_lock_ren2', false);
+SELECT count(*) AS unlocked_by_new_name FROM pass_policy.failed_attempts()
+ WHERE role_name = 'regress_lock_ren2' AND locked_until IS NOT NULL;
+-- lock_role() puis renommage : role_state et mémoire partagée suivent l'OID,
+-- unlock_role() sous le nouveau nom lève les deux
+SELECT pass_policy.lock_role('regress_lock_ren2', NULL, 'rename') = 'infinity' AS locked;
+ALTER ROLE regress_lock_ren2 RENAME TO regress_lock_ren3;
+SELECT role_name, locked_until = 'infinity' AS locked FROM pass_policy.failed_attempts()
+ WHERE role_oid = 'regress_lock_ren3'::regrole::oid;
+SELECT status FROM pass_policy.v_role_status WHERE role_name = 'regress_lock_ren3';
+SELECT pass_policy.unlock_role('regress_lock_ren3');
+SELECT count(*) AS shmem_locked FROM pass_policy.failed_attempts()
+ WHERE role_oid = 'regress_lock_ren3'::regrole::oid AND locked_until IS NOT NULL;
+DROP ROLE regress_lock_ren3;
+-- Fonctions internes par OID : un OID sans rôle est refusé (42704)
+SELECT ppp_test.try($$SELECT pass_policy._shmem_lock(4000000001, NULL)$$) AS shmem_lock_bad_oid;
+SELECT count(*) AS bad_oid_tracked FROM pass_policy.failed_attempts() WHERE role_oid = 4000000001;
 
--- failed_attempts() : colonnes attendues
+-- failed_attempts() : colonnes attendues (role_oid ajoutée, vérification 15)
+SELECT pg_get_function_result('pass_policy.failed_attempts()'::regprocedure) AS failed_attempts_columns;
 SELECT count(*) >= 0 AS callable
   FROM pass_policy.failed_attempts() AS f(role_name, failed_count, first_failure_at,
-                                             last_failure_at, locked_until);
+                                             last_failure_at, locked_until, role_oid);

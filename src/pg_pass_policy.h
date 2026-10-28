@@ -69,14 +69,33 @@ extern bool  ppp_enforce_database;
 #define PPP_RESCUE_LOG_SLOTS	16
 
 /* ---- Mémoire partagée (remplie par le worker, lue par le hook auth) ------- */
+/*
+ * Hash key (SPEC 6.3): the OID of an existing role, or, for a user name that
+ * matches no role when the authentication hook meets it (pseudo-entry), the
+ * name itself with roleid InvalidOid.  The OID is the identity of the role:
+ * a rename keeps its entry, a role dropped and created again under the same
+ * name gets another one.  A real key has its name all zero, so that the key
+ * is always compared as a whole (memcmp, see ppp_lockout_shmem_init): every
+ * key is built by ppp_make_key().  68 bytes, no padding.
+ */
 typedef struct pppRoleKey
 {
-	char		rolename[NAMEDATALEN];
+	Oid			roleid;					/* existing role; InvalidOid = pseudo-entry */
+	char		name[NAMEDATALEN];		/* pseudo-entry: user name typed by the
+										 * client; real key: all zero */
 } pppRoleKey;
 
 typedef struct pppRoleEntry
 {
 	pppRoleKey	key;
+
+	/*
+	 * Last known name of the role (pseudo-entry: key.name), for messages
+	 * only: refreshed by the authentication hook, the PRE_COMMIT of a lock
+	 * and the reload.  Read when the OID no longer exists (audit and LOG of
+	 * a dropped role); failed_attempts() looks the current name up by OID.
+	 */
+	char		rolename[NAMEDATALEN];
 
 	/* paramètres copiés depuis le profil effectif par le worker */
 	int32		max_failures;			/* 0 = verrouillage désactivé */
@@ -124,53 +143,6 @@ typedef struct pppRoleEntry
 	TimestampTz audit_lock_set_at;
 
 	/*
-	 * OID of the role that bore this name when the automatic lock
-	 * audit_locked_until was set (authentication hook, InvalidOid if the
-	 * catalog lookup was skipped).  The entry is keyed by the name: the
-	 * worker only persists the lock, or keeps it alive, for that very role,
-	 * not for another role created since under the same name (SPEC 12).
-	 */
-	Oid			audit_role_oid;
-
-	/*
-	 * OID of the role that bore this name when locked_until was last set
-	 * (authentication hook, PRE_COMMIT of shmem_lock_role(), re-injection
-	 * from role_state; InvalidOid if unknown, or for the pseudo-lock of a
-	 * non-existent name).  When in doubt the lock applies: the
-	 * authentication hook only lets it go for a role of another OID, or,
-	 * InvalidOid, for a role created since on the name of a pseudo-lock
-	 * (lock_on_missing); another role that bears the name since never
-	 * inherits it.  Once the lock is fully audited, the worker removes the
-	 * entry when that OID no longer exists, or bears another name and
-	 * role_state holds the lock for it on a primary (it is then reloaded
-	 * under the new name), see ppp_sync_cleanup.
-	 */
-	Oid			lock_role_oid;
-
-	/*
-	 * The lock locked_until was set by the authentication hook on a name
-	 * that had no role at that time (catalog lookup done, role missing):
-	 * a pseudo-lock, lock_role_oid InvalidOid.  Only such a lock yields to
-	 * a role created under the name since; any other lock whose
-	 * lock_role_oid is InvalidOid applies to whoever bears the name
-	 * (fail-closed, SPEC 12).  Cleared wherever locked_until is set
-	 * otherwise.
-	 */
-	bool		lock_on_missing;
-
-	/*
-	 * OID of the role whose failures failed_count / first_failure_at /
-	 * pending_failures hold (authentication hook, at every counted
-	 * failure; InvalidOid for a name without role or when the catalog
-	 * lookup was skipped).  A failure of another role (dropped role
-	 * recreated under the name) restarts a settled entry before it is
-	 * counted, so that the new role never inherits the counter; with
-	 * something pending, the connection is refused until the worker has
-	 * audited it (SPEC 12).
-	 */
-	Oid			owner_oid;
-
-	/*
 	 * When locked_until was last set to a new lock (authentication hook,
 	 * PRE_COMMIT of shmem_lock_role(), re-injection by the worker).  An
 	 * unlock committed afterwards only lifts a lock set before it was
@@ -192,27 +164,21 @@ typedef struct pppRoleEntry
 	/*
 	 * Incarnation number of the entry, given by ppp_init_entry() from
 	 * ppp_shared->entry_generation: an entry evicted and entered again under
-	 * the same name gets another one.  The worker acknowledges what it wrote
+	 * the same key gets another one.  The worker acknowledges what it wrote
 	 * (ppp_ack_pending) only to the incarnation it copied, even when the
 	 * episode numbers of both are equal (0 before any lock).
 	 */
 	uint64		generation;
 
-	/* set by the authentication hook: user name not found in pg_authid */
-	bool		role_missing;
-
 	/*
-	 * Incremented at every update of the entry by the authentication hook
-	 * (success or counted failure, whatever the new value of role_missing),
-	 * and wherever role_missing is cleared (lock_role(), reload).  The
-	 * worker copies it with the name before its catalog lookup, made
-	 * outside the LWLock, and turns the entry into a ghost, or removes a
-	 * lock of a dropped role, only if it has not changed when it comes back
-	 * under the exclusive lock (ppp_sync_cleanup): a role created and
-	 * authenticated in between leaves the flag false and the generation
-	 * unchanged, this counter tells it.
+	 * The OID of a real entry no longer exists (DROP ROLE), found by the
+	 * worker (ppp_sync_cleanup) while something was still pending: the lock
+	 * and the profile no longer apply to anyone, only the audit is kept
+	 * (see ppp_entry_class).  Never cleared: an OID does not come back
+	 * (barring wraparound, SPEC 12).  A settled entry of a dropped role is
+	 * removed at once instead.
 	 */
-	uint32		update_seq;
+	bool		role_dropped;
 
 	/* scratch marks of ppp_sync_reload() */
 	bool		reload_profile_seen;
@@ -226,7 +192,7 @@ typedef struct pppRoleEntry
  */
 typedef enum pppEntryClass
 {
-	PPP_CLASS_GHOST = 0,		/* role_missing: always evictable */
+	PPP_CLASS_GHOST = 0,		/* pseudo-entry: always evictable */
 	PPP_CLASS_INACTIVE,			/* zero counter or elapsed window, nothing
 								 * pending, no lock, no profile; also an
 								 * expired lock whose audit is stale (see
@@ -273,7 +239,7 @@ typedef enum pppEnterMode
 typedef struct pppEviction
 {
 	bool		evicted;
-	bool		ghost;					/* evicted entry was a non-existent role */
+	bool		ghost;					/* evicted entry was a pseudo-entry */
 	bool		scan_skipped;			/* COUNT mode: no room, but no conclusive
 										 * scan (skipped after a recent fruitless
 										 * one, or fruitless window of a cycle
@@ -442,10 +408,11 @@ extern void ppp_policy_init(void);		/* installe check_password_hook */
 
 /* ---- lockout.c --------------------------------------------------------- */
 /*
- * Hash key of a role name, truncated like the server does for
- * port->user_name (plain byte truncation to NAMEDATALEN - 1), zero-padded.
+ * Hash key (see pppRoleKey), zeroed first: {roleid} for an existing role,
+ * {InvalidOid, name} otherwise, the name truncated like the server does for
+ * port->user_name (plain byte truncation to NAMEDATALEN - 1).
  */
-extern void ppp_make_key(pppRoleKey *key, const char *rolename);
+extern void ppp_make_key(pppRoleKey *key, Oid roleid, const char *name);
 extern void ppp_lockout_init(void);		/* installe ClientAuthentication_hook */
 extern void ppp_lockout_shmem_init(void); /* appelé depuis shmem_startup_hook */
 /*
@@ -457,12 +424,13 @@ extern void ppp_note_password_recorded(const char *rolename);
 extern bool ppp_password_recorded(const char *rolename);
 /*
  * Caller holds ppp_shared->lock exclusively; NULL when no room is left.
+ * rolename: name stored in a new entry (pppRoleEntry.rolename).
  * in_recovery: RecoveryInProgress(), read before taking the lock (see
  * PPP_STALE_AUDIT_SECS).
  */
-extern pppRoleEntry *ppp_enter_role(const char *rolename, pppEnterMode mode,
-									TimestampTz now, bool in_recovery,
-									pppEviction *ev);
+extern pppRoleEntry *ppp_enter_role(const pppRoleKey *key, const char *rolename,
+									pppEnterMode mode, TimestampTz now,
+									bool in_recovery, pppEviction *ev);
 extern void ppp_log_eviction(const pppEviction *ev);
 /* worker: LOG the rescue admissions not logged yet (see PPP_RESCUE_LOG_SLOTS) */
 extern void ppp_flush_rescue_log(void);
@@ -476,11 +444,9 @@ extern void *ppp_alloc_hash_copy(MemoryContext cxt, Size rowsize,
 								 int *maxrows, LWLockMode mode);
 /* failure_window_secs > 0 and elapsed since first_failure_at */
 extern bool ppp_window_elapsed(const pppRoleEntry *entry, TimestampTz now);
-/* class of an entry; ppp_entry_real_class() ignores role_missing */
+/* class of an entry (see pppEntryClass) */
 extern pppEntryClass ppp_entry_class(const pppRoleEntry *entry, TimestampTz now,
 									 bool in_recovery);
-extern pppEntryClass ppp_entry_real_class(const pppRoleEntry *entry,
-										  TimestampTz now, bool in_recovery);
 
 /*
  * Forget an expired lock (caller holds ppp_shared->lock exclusively); see
@@ -509,11 +475,9 @@ ppp_is_locked(const pppRoleEntry *entry, TimestampTz now)
 
 /*
  * Nothing at stake in the entry: no lock audit pending or unacknowledged,
- * no failure to audit, no uncommitted lock.  Such pending work belongs to
- * the role that bore the name: the worker audits it itself (role_gone /
- * role_renamed rows, ppp_ack_pending) before the entry may go or start
- * afresh for another role (authentication hook).  Caller holds
- * ppp_shared->lock.
+ * no failure to audit, no uncommitted lock.  The worker removes the entry
+ * of a dropped role at once only when it is settled (ppp_sync_cleanup);
+ * otherwise it audits it first.  Caller holds ppp_shared->lock.
  */
 static inline bool
 ppp_entry_settled(const pppRoleEntry *entry)

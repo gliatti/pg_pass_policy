@@ -102,7 +102,8 @@ SELECT attname, format_type(atttypid, atttypmod) AS type
  must_change         | boolean
  valid_until_synced  | timestamp with time zone
  verifier_pending    | boolean
-(12 rows)
+ cluster_id          | bigint
+(13 rows)
 
 -- Aucun droit pour PUBLIC sur les tables
 SELECT c.relname
