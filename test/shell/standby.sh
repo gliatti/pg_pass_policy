@@ -260,6 +260,13 @@ for n in $(seq -w 1 16); do
 done
 sb_catch_up || fail "F3 : le standby n'a pas rejoué les rôles"
 sleep 3 # rechargement forcé à chaque tour du worker du standby (2 s)
+# Plus aucun tour du worker pendant le scénario : les compteurs des verrous
+# expirés ne sont alors pas remis à zéro par ppp_sync_cleanup() avant la
+# 17e tentative, qui doit pourtant pouvoir les évincer (le SIGHUP déclenche
+# un dernier tour, attendu avant de poser les verrous).
+echo "pg_pass_policy.worker_interval = 3600" >>"$SB_DATA/postgresql.conf"
+sb_admin "SELECT pg_reload_conf()" >/dev/null
+sleep 1
 for n in $(seq -w 1 15); do
 	for i in 1 2; do sb_as "regress_sb_f$n" "$BAD" >/dev/null || true; done
 done
@@ -273,6 +280,8 @@ n=$(grep -c 'cannot track authentication failures of role "regress_sb_f16"' "$PP
 check_eq "F3 : aucun refus de comptage pour le 17e rôle" "0" "$n"
 n=$(grep -c 'evicted before its lock was audited' "$PPP_TMP/standby.log" || true)
 check_eq "F3 : perte d'audit journalisée (LOG)" "1" "$( [ "$n" -ge 1 ] && echo 1 || echo 0)"
+echo "pg_pass_policy.worker_interval = 2" >>"$SB_DATA/postgresql.conf"
+sb_admin "SELECT pg_reload_conf()" >/dev/null
 psql_admin "SELECT pass_policy.alter_profile('default', '{\"max_failures\": 5, \"lock_duration\": \"30 minutes\"}')" >/dev/null
 
 # --- lecture seule : aucune erreur d'écriture du worker du standby -----------

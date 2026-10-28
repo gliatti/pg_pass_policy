@@ -149,6 +149,11 @@ ppp_lock_audit_stale(const pppRoleEntry *entry, TimestampTz now,
  * logged, ppp_log_eviction) if the entry is evicted.  The worker never
  * purges such an entry by itself (ppp_sync_cleanup): it only becomes
  * evictable when the room is needed.
+ *
+ * The failures that led to an expired lock are forgotten (ppp_expire_lock),
+ * but only once the hook meets that role again or the worker runs its next
+ * cycle: until then failed_count still holds them.  They are not a live
+ * counter, so the class must not depend on whether that reset has happened.
  */
 pppEntryClass
 ppp_entry_real_class(const pppRoleEntry *entry, TimestampTz now,
@@ -164,6 +169,10 @@ ppp_entry_real_class(const pppRoleEntry *entry, TimestampTz now,
 	else if (entry->pending_failures > 0)
 		return PPP_CLASS_PENDING_AUDIT;
 	if (entry->failed_count <= 0 || ppp_window_elapsed(entry, now))
+		return PPP_CLASS_INACTIVE;
+	/* expired lock, counters of its episode not reset yet (see above) */
+	if (entry->locked_until != 0 && entry->lock_inflight == 0 &&
+		entry->first_failure_at < entry->locked_until)
 		return PPP_CLASS_INACTIVE;
 	return PPP_CLASS_LIVE_COUNTER;
 }
